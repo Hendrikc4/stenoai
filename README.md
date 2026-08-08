@@ -42,16 +42,18 @@
 If you're looking for a hosted desktop recording API, consider checking out [Recall.ai](https://www.recall.ai/product/desktop-recording-sdk?utm_source=github&utm_medium=sponsorship&utm_campaign=ruzin-stenoai), an API that records Zoom, Google Meet, Microsoft Teams, in-person meetings, and more.
 
 ## 📢 What's New
-- **2026-08-04** 💎 Sync to Obsidian — mirror your notes into an Obsidian vault folder as Markdown. Turn it on in Settings → Integrations and pick a vault folder. One-way (Steno → vault); notes you edit in Obsidian are never overwritten.
-- **2026-08-03** 🔔 One-tap meeting notes — "Take Notes" starts recording instantly, meetings auto-stop when they end, and a single "Summarise?" tap opens the note and generates it. Recordings are transcript-first now — turn on auto-summarise in Settings → AI for automatic notes.
-- **2026-07-26** 🎙️ System audio without Screen Recording — record both sides of a call with no Screen Recording permission. Now requires macOS 14.4 or later.
-- **2026-07-26** ⬇️ Automatic updates — Steno installs a downloaded update while you're idle and relaunches, never mid-recording. Turn it off in Settings to keep the manual prompt.
+- **2026-08-08** 👥 Individual speakers &mdash; Steno now separates people who share the same microphone or call-audio channel, not just `[You]` and `[Others]`. Review the speaker groups on the transcript, rename them, or mark uncertain groups. Optional recognition across meetings is off by default and currently available on macOS.
+- **2026-08-04** 💎 Sync to Obsidian &mdash; mirror your notes into an Obsidian vault folder as Markdown. Turn it on in Settings → Integrations and pick a vault folder. One-way (Steno → vault); notes you edit in Obsidian are never overwritten.
+- **2026-08-03** 🔔 One-tap meeting notes &mdash; "Take Notes" starts recording instantly, meetings auto-stop when they end, and a single "Summarise?" tap opens the note and generates it. Recordings are transcript-first now. Turn on auto-summarise in Settings → AI for automatic notes.
+- **2026-07-26** 🎙️ System audio without Screen Recording &mdash; record both sides of a call with no Screen Recording permission. Now requires macOS 14.4 or later.
 
 
 ## Features
 
 - **Privacy-first** — 100% on-device; your recordings, transcripts, and summaries never leave your Mac.
-- **Live transcription with speaker labels** — Real-time on-screen text as you speak via Parakeet TDT v3 on Apple Silicon (MLX). Granola-style chat-bubble view with `[You]` vs `[Others]` attribution live during the recording and on the final transcript.
+- **Live transcription with channel labels** - Real-time on-screen text as you speak via Parakeet TDT v3 on Apple Silicon (MLX), with `[You]` for microphone audio and `[Others]` for system audio.
+- **Individual speaker separation** - On macOS, Steno separates up to four voices within each audio channel, including people sharing one microphone in an in-person meeting. Review the groups on the transcript, rename them, keep a generic label, or mark a group as containing more than one person. Windows currently keeps `[You]` and `[Others]` channel labels without individual separation.
+- **Optional named people** - Speaker identification across meetings is off by default. When you enable it in Settings → AI, confirmed excerpts create numerical biometric voice profiles that stay on your device and can suggest names in later meetings. Suggestions can be wrong and always need review. Existing installations are switched off once on upgrade, including installations where speaker identification was previously enabled. Manage or delete profiles in Settings → People, where a representative sample can be played while suitable source audio is retained. Deleting a profile does not delete recordings or transcripts.
 - **Auto start/stop meetings** — Steno notices when a meeting starts and offers to take notes, then offers to summarise when it ends. Granola-style frictionless capture.
 - **System audio capture** — Record both sides of virtual meetings, headphones on, no extra setup or virtual cable. Native Core Audio Tap on macOS 14.4+, with selectable microphone input.
 - **Recording that coexists** — A compact transcription pill docks beside the app instead of taking over; Stop lands you on the note instantly and you can resume recording into an existing note (it appends and re-generates on demand).
@@ -180,10 +182,8 @@ Have questions or suggestions? [Join our Discord](https://discord.gg/DZ6vcQnxxu)
 ## Future Roadmap
 
 ### Enhanced Features
-- Live transcription during recording
-- NVIDIA Parakeet as a transcription engine option
-- Editing notes after processing
 - Windows: GA hardening (alpha already ships on Windows 10/11 x64)
+- Windows: individual speaker separation and optional named voice profiles
 
 ## Installation
 
@@ -210,7 +210,7 @@ You can run it locally as well (see below) if you don't want to install a DMG.
 
 ### Windows (alpha)
 
-Windows 10/11 (x64) is supported in **alpha**, with the full pipeline verified working: record → live Parakeet transcription → batch transcript → Ollama summary, **including system-audio loopback capture with `[You]`/`[Others]` diarisation**.
+Windows 10/11 (x64) is supported in **alpha**, with the full pipeline verified working: record → live Parakeet transcription → batch transcript → Ollama summary, **including system-audio loopback capture with `[You]`/`[Others]` channel labels**. Individual speaker separation and named voice profiles are currently macOS-only.
 
 **Install:** download **`stenoAI-windows-x64.exe`** from the [latest release](https://github.com/stenolabs/stenoai/releases/latest) and run it — it installs per-user (no admin needed) and creates Start-menu/desktop shortcuts. On first launch, Windows SmartScreen warns because the alpha is unsigned — click **More info → Run anyway**. The first-run setup wizard then downloads the transcription model (~670 MB) and the default summarisation model, Gemma 4 E2B (~4.3 GB).
 
@@ -243,6 +243,9 @@ pip install -r requirements.txt
 
 # Download bundled binaries (Ollama, ffmpeg)
 ./scripts/download-ollama.sh
+
+# macOS only: build the helper for individual speaker separation
+./scripts/build-diarize-sidecar.sh
 
 # Build the Python backend
 pip install pyinstaller
