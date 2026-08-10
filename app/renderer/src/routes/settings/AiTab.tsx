@@ -49,9 +49,11 @@ import {
 } from '@/hooks/useModels';
 import {
   useAutoSummarizeSetting,
+  useIdentityMatchingEnabledSetting,
   useKeepRecordingsSetting,
   useLanguageSetting,
   useSetAutoSummarize,
+  useSetIdentityMatchingEnabled,
   useSetKeepRecordings,
   useSetLanguage,
 } from '@/hooks/useSettings';
@@ -93,6 +95,8 @@ function TranscriptionSection() {
   const setLanguage = useSetLanguage();
   const keepRecordings = useKeepRecordingsSetting();
   const setKeepRecordings = useSetKeepRecordings();
+  const identityMatchingEnabled = useIdentityMatchingEnabledSetting();
+  const setIdentityMatchingEnabled = useSetIdentityMatchingEnabled();
   const engineQuery = useTranscriptionEngine();
 
   const engine = engineQuery.data ?? 'parakeet';
@@ -143,6 +147,17 @@ function TranscriptionSection() {
           checked={keepRecordings.data ?? false}
           onCheckedChange={(v) => setKeepRecordings.mutate(v)}
           disabled={keepRecordings.data === undefined}
+        />
+      </SettingRow>
+
+      <SettingRow
+        label="Speaker identification"
+        description="Optional and off by default. When enabled, Steno stores numerical biometric voice profiles on this device to suggest people across meetings. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
+      >
+        <Switch
+          checked={identityMatchingEnabled.data ?? false}
+          onCheckedChange={(v) => setIdentityMatchingEnabled.mutate(v)}
+          disabled={identityMatchingEnabled.data === undefined}
         />
       </SettingRow>
 
