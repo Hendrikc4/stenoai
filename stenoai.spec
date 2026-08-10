@@ -29,6 +29,13 @@ import os
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs, copy_metadata
+
+# PyInstaller does not consistently put the spec directory on sys.path when
+# evaluating a spec on Windows runners. Make the local build guard importable
+# explicitly on every platform.
+if SPECPATH not in sys.path:
+    sys.path.insert(0, SPECPATH)
+
 from scripts.diarize_bundle_guard import require_diarize_sidecar
 
 # Apple Silicon uses parakeet-mlx for ASR; Windows / Linux use onnx-asr via
