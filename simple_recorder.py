@@ -5057,10 +5057,19 @@ def get_person_sample_audio(person_id):
 def create_person_profile(display_name):
     """Create a new, empty named person profile."""
     from src.config import get_config
+    config = get_config()
+    config.begin_transaction()
     try:
-        profile = get_config().create_person_profile(display_name)
+        profile = config.create_person_profile(display_name)
     except ValueError as e:
+        config.rollback_transaction()
         print(json.dumps({"success": False, "error": str(e)}))
+        sys.exit(1)
+    if not config.commit_transaction():
+        print(json.dumps({
+            "success": False,
+            "error": "Could not save the person profile.",
+        }))
         sys.exit(1)
     print(json.dumps({"success": True, "person_id": profile["person_id"], "display_name": profile["display_name"]}))
 
@@ -5182,6 +5191,14 @@ def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, ne
         print(json.dumps({"success": False, "error": "Specify exactly one of --person-id or --new-person"}))
         sys.exit(1)
 
+    config = get_config()
+    if not config.get_identity_matching_enabled():
+        print(json.dumps({
+            "success": False,
+            "error": "Speaker identification is disabled in settings.",
+        }))
+        sys.exit(1)
+
     output_dir = get_data_dirs()["output"]
     sidecar = read_speakers_sidecar(output_dir, meeting_stem)
     if sidecar is None:
@@ -5235,16 +5252,18 @@ def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, ne
         }))
         sys.exit(1)
 
-    config = get_config()
+    config.begin_transaction()
     if new_person:
         try:
             person = config.create_person_profile(new_person)
         except ValueError as e:
+            config.rollback_transaction()
             print(json.dumps({"success": False, "error": str(e)}))
             sys.exit(1)
     else:
         person = config.get_person_profile(person_id)
         if person is None:
+            config.rollback_transaction()
             print(json.dumps({"success": False, "error": f"No person profile with id {person_id!r}"}))
             sys.exit(1)
 
@@ -5435,6 +5454,13 @@ def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, ne
             channel=channel, diarization_run_id=run_id,
         )
         hard_negatives_added.append(other_person["display_name"])
+
+    if not config.commit_transaction():
+        print(json.dumps({
+            "success": False,
+            "error": "Could not save the speaker profile.",
+        }))
+        sys.exit(1)
 
     relabeled_lines = 0
     if relabel_transcript:
@@ -5642,15 +5668,19 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
         merge_same_channel_fragments,
         clusters_from_sidecar_channel,
         minimum_speaker_count,
+        read_speakers_sidecar,
         restore_transcript_labels,
         set_cluster_multi_speaker,
     )
 
     output_dir = get_data_dirs()["output"]
-    sidecar = set_cluster_multi_speaker(
-        output_dir, meeting_stem, channel, diarization_speaker_id, multiple,
-    )
-    if sidecar is None:
+    sidecar = read_speakers_sidecar(output_dir, meeting_stem)
+    channels = sidecar.get("channels") if isinstance(sidecar, dict) else None
+    channel_data = channels.get(channel) if isinstance(channels, dict) else None
+    raw_clusters = channel_data.get("clusters") if isinstance(channel_data, dict) else None
+    if not isinstance(raw_clusters, dict) or not isinstance(
+        raw_clusters.get(diarization_speaker_id), dict,
+    ):
         print(json.dumps({
             "success": False,
             "error": f"No cluster {diarization_speaker_id!r} in {channel!r} channel of {meeting_stem!r}",
@@ -5662,7 +5692,6 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     # reviewed and displayed under its primary's id, so marking any
     # fragment withholds the whole merged cluster. Saying so here keeps
     # the CLI honest about what just happened.
-    channel_data = (sidecar.get("channels") or {}).get(channel) or {}
     channel_recording_type = channel_data.get("recording_type")
     # From the rewritten document set_cluster_multi_speaker returned, which
     # carries the existing run forward -- marking a cluster is an annotation
@@ -5673,13 +5702,11 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
             clusters_from_sidecar_channel(meeting_stem, channel_data)
         )
     except (KeyError, TypeError, ValueError):
-        # Same as set-cluster-review-state: the marking already landed, and
-        # only the reach computation can still fail -- on any OTHER cluster
-        # in this channel with no usable embedding. A traceback here would
-        # claim a marking failed that did not.
+        # Another malformed cluster can prevent merged-reach computation.
+        # The raw target remains safe to withdraw and mark.
         clusters, id_resolution = {}, {}
     resolved_id = id_resolution.get(diarization_speaker_id, diarization_speaker_id)
-    fragment_ids = set()
+    fragment_ids = {diarization_speaker_id}
     if resolved_id in clusters:
         fragment_ids = {resolved_id, *clusters[resolved_id][1].merged_from}
 
@@ -5702,12 +5729,7 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     cleared_from = []
     restored_lines = 0
     if multiple and fragment_ids:
-        # "A human kept this generic" is superseded by "a human says it is
-        # several people" -- the second is a stronger statement about the
-        # same cluster. Swept across every fragment, because the merged row
-        # reads generic when ANY member carries the key, so a leftover on a
-        # fragment would keep marking a row nobody can click.
-        clear_cluster_review_state(output_dir, meeting_stem, channel, fragment_ids)
+        config.begin_transaction()
         # Run-scoped for the same reason the confirm path is: the cluster
         # this marking describes exists only within this run, so an entry
         # from a superseded run shares nothing with it but a reused id.
@@ -5739,6 +5761,33 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
                     channel=channel, channel_recording_type=channel_recording_type,
                     sids=fragment_ids, negative=True, diarization_run_id=run_id,
                 )
+        if not config.commit_transaction():
+            print(json.dumps({
+                "success": False,
+                "error": "Could not update the speaker profiles.",
+            }))
+            sys.exit(1)
+
+    # Persist the marking only after the profile cleanup is durable. If the
+    # config write fails, leaving the cluster unmarked is recoverable by a
+    # retry; leaving a poisoned biometric prototype active is not.
+    try:
+        sidecar = set_cluster_multi_speaker(
+            output_dir, meeting_stem, channel, diarization_speaker_id, multiple,
+        )
+    except OSError:
+        sidecar = None
+    if sidecar is None:
+        print(json.dumps({
+            "success": False,
+            "error": "Could not save the speaker marking.",
+        }))
+        sys.exit(1)
+
+    if multiple and fragment_ids:
+        # "A human kept this generic" is superseded by "a human says it is
+        # several people". Clear it only after the stronger marking is safe.
+        clear_cluster_review_state(output_dir, meeting_stem, channel, fragment_ids)
         if cleared_from:
             # The transcript is the artefact a human reads, and the one the
             # summary and every export are built from. Withdrawing the
@@ -5819,6 +5868,14 @@ def speaker_naming_status(meeting_stem):
         read_speakers_sidecar,
     )
 
+    config = get_config()
+    if not config.get_identity_matching_enabled():
+        print(json.dumps({
+            "success": True, "meeting_id": meeting_stem, "has_sidecar": False,
+            "total_clusters": 0, "named_clusters": 0, "unnamed_clusters": 0,
+        }))
+        return
+
     dirs = get_data_dirs()
     sidecar = read_speakers_sidecar(dirs["output"], meeting_stem)
     if sidecar is None:
@@ -5835,7 +5892,7 @@ def speaker_naming_status(meeting_stem):
     # unnamed cluster from the delete warning, and an unnamed cluster cannot
     # be named again once the audio is gone.
     run_id = (sidecar.get("diarization_run") or {}).get("run_id")
-    profiles = get_config().get_person_profiles()
+    profiles = config.get_person_profiles()
     total = 0
     named = 0
     for channel_name, channel_data in (sidecar.get("channels") or {}).items():
@@ -5907,6 +5964,17 @@ def suggest_speakers(meeting_stem):
     from src.config import get_data_dirs
     from src.transcriber import _format_timestamp
 
+    config = get_config()
+    if not config.get_identity_matching_enabled():
+        print(json.dumps({
+            "success": True,
+            "meeting_id": meeting_stem,
+            "recording_available": False,
+            "minimum_speaker_count": 0,
+            "channels": {},
+        }))
+        return
+
     dirs = get_data_dirs()
     sidecar = read_speakers_sidecar(dirs["output"], meeting_stem)
     if sidecar is None:
@@ -5945,7 +6013,7 @@ def suggest_speakers(meeting_stem):
     # both-absent rule keeps every existing confirmation current.
     run_id = (sidecar.get("diarization_run") or {}).get("run_id")
 
-    profiles = get_config().get_person_profiles()
+    profiles = config.get_person_profiles()
     # Merge fragments per channel first, then suggest for ALL channels in
     # one call -- used-person exclusivity is meeting-wide (a person can't
     # be the confirmed suggestion on both mic and system), so suggestion
@@ -6239,26 +6307,26 @@ def get_speaker_sample_audio(meeting_stem, channel, diarization_speaker_id, segm
         Path(tempfile.gettempdir())
         / f"steno_sample_{meeting_stem}_{channel}_{resolved_id}{suffix}.wav"
     )
-    ok = extract_speaker_sample_audio(
-        recording_path, channel, pooled_segments, output_path,
-        segment_index=target,
-    )
-    if not ok:
-        print(json.dumps({"success": False, "error": "could not extract audio sample"}))
-        return
+    try:
+        ok = extract_speaker_sample_audio(
+            recording_path, channel, pooled_segments, output_path,
+            segment_index=target,
+        )
+        if not ok:
+            print(json.dumps({"success": False, "error": "could not extract audio sample"}))
+            return
 
-    # Return the clip's bytes inline (base64), not a filesystem path: the
-    # renderer's strict CSP (media-src 'self' blob:) has no file: allowance,
-    # so a raw path could never actually play in the packaged app -- the
-    # renderer builds a blob: URL from these bytes instead. Clips are short
-    # (a few seconds of 16kHz mono PCM), safely small enough to inline.
-    import base64
-    audio_bytes = output_path.read_bytes()
-    output_path.unlink(missing_ok=True)
-    print(json.dumps({
-        "success": True,
-        "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
-    }))
+        # Return the clip's bytes inline (base64), not a filesystem path: the
+        # renderer's strict CSP (media-src 'self' blob:) has no file: allowance,
+        # so a raw path could never actually play in the packaged app.
+        import base64
+        audio_bytes = output_path.read_bytes()
+        print(json.dumps({
+            "success": True,
+            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+        }))
+    finally:
+        output_path.unlink(missing_ok=True)
 
 
 def _find_recording_file(recordings_dir, stem, extension=None):

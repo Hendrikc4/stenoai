@@ -346,6 +346,12 @@ class Config:
         # back ONLY the keys this process actually changed, so a concurrent
         # writer's unrelated keys aren't clobbered (the lost-update fix).
         self._snapshot: Dict[str, Any] = copy.deepcopy(self._config)
+        # A confirm-speaker operation updates several related profile entries.
+        # Batch their otherwise-independent _save() calls into one atomic
+        # config write so a failed final save cannot leave half a reassignment
+        # on disk or relabel a transcript without the matching profile.
+        self._transaction_backup: Optional[tuple[Dict[str, Any], Dict[str, Any]]] = None
+        self._transaction_dirty = False
         self._migrate_cloud_model_map()
         self._migrate_whisper_model()
         self._migrate_summary_model()
@@ -749,6 +755,10 @@ class Config:
         changed. On lock timeout, degrade to a plain unlocked atomic write of
         our own config — a stuck lock must never block saves or raise.
         """
+        if self._transaction_backup is not None:
+            self._transaction_dirty = True
+            return True
+
         lock_path = str(self.config_path) + ".lock"
         try:
             # filelock is NOT reentrant: _save() must never be called while
@@ -779,6 +789,38 @@ class Config:
         except Exception as e:
             logger.error(f"Error saving config: {e}")
             return False
+
+    def begin_transaction(self) -> None:
+        """Defer saves until ``commit_transaction`` writes once atomically."""
+        if self._transaction_backup is not None:
+            raise RuntimeError("Config transaction already active")
+        self._transaction_backup = (
+            copy.deepcopy(self._config),
+            copy.deepcopy(self._snapshot),
+        )
+        self._transaction_dirty = False
+
+    def commit_transaction(self) -> bool:
+        """Commit a deferred batch, restoring in-memory state on failure."""
+        if self._transaction_backup is None:
+            raise RuntimeError("No Config transaction active")
+        old_config, old_snapshot = self._transaction_backup
+        dirty = self._transaction_dirty
+        self._transaction_backup = None
+        self._transaction_dirty = False
+        if not dirty or self._save():
+            return True
+        self._config = old_config
+        self._snapshot = old_snapshot
+        return False
+
+    def rollback_transaction(self) -> None:
+        """Discard a deferred batch without touching the on-disk config."""
+        if self._transaction_backup is None:
+            return
+        self._config, self._snapshot = self._transaction_backup
+        self._transaction_backup = None
+        self._transaction_dirty = False
 
     def _get_default_config(self) -> Dict[str, Any]:
         """Get default configuration."""

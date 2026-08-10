@@ -49,6 +49,27 @@ class PersonProfileCliTests(unittest.TestCase):
             self.assertIn("already exists", data["error"])
             self.assertEqual(len(cfg.get_person_profiles()), 1)
 
+    def test_create_person_profile_reports_config_save_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            with mock.patch(
+                "src.config._atomic_write_json",
+                side_effect=OSError("disk full"),
+            ):
+                result, cfg = self._run(
+                    simple_recorder.create_person_profile,
+                    ["Person Gamma"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(_last_json(result.output), {
+                "success": False,
+                "error": "Could not save the person profile.",
+            })
+            self.assertEqual(cfg.get_person_profiles(), [])
+
     def test_rename_person_profile_rejects_collision(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Config(config_path=Path(tmp) / "config.json")

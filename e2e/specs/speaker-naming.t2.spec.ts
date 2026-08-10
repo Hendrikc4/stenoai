@@ -1,6 +1,11 @@
 import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
-import { writeSpeakersSidecar, writeTranscriptFile } from '../fixtures/user-config';
+import {
+  enableSpeakerIdentification,
+  readUserConfig,
+  writeSpeakersSidecar,
+  writeTranscriptFile,
+} from '../fixtures/user-config';
 import { makeWav } from '../fixtures/make-wav';
 import { readFileSync, mkdirSync } from 'fs';
 import path from 'path';
@@ -92,6 +97,41 @@ test('a meeting without a speaker sidecar returns an empty result without backen
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
 });
 
+test('speaker identification stays unavailable until the user opts in', async ({
+  launchApp,
+  userDataDir,
+}) => {
+  const stem = 'e2e-speaker-opt-out';
+  writeSpeakersSidecar(userDataDir, stem, {
+    mic: {
+      recording_type: 'in_person',
+      clusters: {
+        SPEAKER_0: {
+          embedding: [1.0, 0.0], speech_duration_seconds: 30.0, segment_count: 5,
+          segments: [{ start: 5.0, end: 7.0 }],
+        },
+      },
+    },
+  });
+
+  const { page } = await launchApp();
+  const suggestions = await page.evaluate(
+    (meetingStem) => (window as StenoWindow).stenoai.speakers.suggestForMeeting(meetingStem),
+    stem,
+  );
+  expect(suggestions).toMatchObject({ success: true, channels: {} });
+
+  const confirm = await page.evaluate(
+    (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
+    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Alpha' },
+  );
+  expect(confirm).toMatchObject({
+    success: false,
+    error: 'Speaker identification is disabled in settings.',
+  });
+  expect(readUserConfig(userDataDir).person_profiles ?? []).toEqual([]);
+});
+
 test('confirm-speaker --relabel-transcript persists a PersonProfile and relabels the saved transcript', async ({
   launchApp,
   userDataDir,
@@ -117,6 +157,8 @@ test('confirm-speaker --relabel-transcript persists a PersonProfile and relabels
     stem,
     '[00:05] [Speaker 2] hello there\n\n[00:20] [You] hi back',
   );
+
+  enableSpeakerIdentification(userDataDir);
 
   const { page } = await launchApp();
 
@@ -249,6 +291,8 @@ test('identification aids: sample_text/is_likely_artifact/recording_available an
   // is safely within range (unlike 0s, which would be just outside).
   writeTranscriptFile(userDataDir, stem, '[00:01] [Speaker 2] this is a real substantial turn');
 
+  enableSpeakerIdentification(userDataDir);
+
   const { page } = await launchApp();
 
   const suggestions = await page.evaluate(
@@ -300,6 +344,8 @@ test('duplicate person names are rejected, and delete-person-profile removes a p
       },
     },
   });
+
+  enableSpeakerIdentification(userDataDir);
 
   const { page } = await launchApp();
 

@@ -1047,6 +1047,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
 
     def _run(self, command, args, tmp, cfg=None):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(True)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             return CliRunner().invoke(command, args)
@@ -1263,6 +1264,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 ],
             )
             cfg = Config(config_path=Path(tmp) / "config.json")
+            cfg.set_identity_matching_enabled(True)
             with mock.patch("src.config.get_config", return_value=cfg), \
                  mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
                 confirmed = CliRunner().invoke(simple_recorder.confirm_speaker, [
@@ -1441,6 +1443,42 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 "a blended two-voice embedding must not stay enrolled as a person",
             )
 
+    def test_config_save_failure_keeps_profile_and_sidecar_unmarked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = self._seed(tmp)
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            cfg.set_identity_matching_enabled(True)
+            person = cfg.create_person_profile("Person Alpha")
+            cfg.add_speaker_prototype(
+                person["person_id"], [1.0, 0.0], recording_type="remote",
+                meeting_id="mtg001", diarization_speaker_id="SPEAKER_0",
+                speech_duration_seconds=60.0, segment_count=10,
+                created_from="user_confirmed", channel="system",
+                diarization_run_id=self._seeded_run_id(tmp),
+            )
+
+            with mock.patch(
+                "src.config._atomic_write_json",
+                side_effect=OSError("disk full"),
+            ), mock.patch("src.config.get_config", return_value=cfg), \
+                 mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
+                result = CliRunner().invoke(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "system", "SPEAKER_0"],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertFalse(_last_json(result.output)["success"])
+            stored_cluster = read_speakers_sidecar(
+                output_dir, "mtg001",
+            )["channels"]["system"]["clusters"]["SPEAKER_0"]
+            self.assertNotIn(MULTI_SPEAKER_KEY, stored_cluster)
+            reloaded = Config(config_path=Path(tmp) / "config.json")
+            self.assertEqual(
+                len(reloaded.get_person_profile(person["person_id"])["prototypes"]),
+                1,
+            )
+
     def test_a_marked_cluster_is_not_used_as_hard_negative_evidence(self):
         # "Speaker B is not the person in cluster A" is only meaningful when
         # A is one person. If A is a blend of two voices, the negative is
@@ -1503,8 +1541,9 @@ class SpeakerNamingStatusCliTests(unittest.TestCase):
     meeting); an UNNAMED cluster does not, and cannot be recovered by any
     means once the audio is gone -- naming a voice requires hearing it."""
 
-    def _run(self, args, tmp, cfg=None):
+    def _run(self, args, tmp, cfg=None, *, identity_enabled=True):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(identity_enabled)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             return CliRunner().invoke(simple_recorder.speaker_naming_status, args)
@@ -1535,6 +1574,21 @@ class SpeakerNamingStatusCliTests(unittest.TestCase):
             self.assertTrue(data["has_sidecar"])
             self.assertEqual(data["total_clusters"], 2)
             self.assertEqual(data["unnamed_clusters"], 2)
+
+    def test_disabled_identity_matching_reports_nothing_to_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            data = _last_json(
+                self._run(["mtg001"], tmp, identity_enabled=False).output
+            )
+            self.assertEqual(data, {
+                "success": True,
+                "meeting_id": "mtg001",
+                "has_sidecar": False,
+                "total_clusters": 0,
+                "named_clusters": 0,
+                "unnamed_clusters": 0,
+            })
 
     def test_a_confirmed_cluster_no_longer_counts_as_unnamed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1738,6 +1792,7 @@ class SetClusterReviewStateCliTests(unittest.TestCase):
 
     def _run(self, command, args, tmp, cfg=None):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(True)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             return CliRunner().invoke(command, args)

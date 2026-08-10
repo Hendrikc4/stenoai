@@ -227,8 +227,16 @@ jobs:
           chmod +x scripts/download-ollama.sh
           ./scripts/download-ollama.sh
 
+      - name: Build speaker-diarization sidecar (Swift/Core ML)
+        run: |
+          chmod +x scripts/build-diarize-sidecar.sh
+          ./scripts/build-diarize-sidecar.sh "$(uname -m)"
+          test -x bin/steno-diarize
+
       - name: Build backend with PyInstaller
-        run: pyinstaller stenoai.spec --noconfirm
+        run: |
+          pyinstaller stenoai.spec --noconfirm
+          test -x dist/stenoai/_internal/steno-diarize
 
       # Guards the Ollama/pip-mlx libmlx.dylib ABI collision (see
       # scripts/verify_mlx_bundle.py). dlopen probes run here too - GitHub's

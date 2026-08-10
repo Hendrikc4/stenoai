@@ -37,6 +37,7 @@ from src.transcriber import (
     _cluster_channel_label_plan,
     _diarised_split_timeout,
     _format_timestamp,
+    _identity_matching_enabled,
     _merge_close_diar_segments,
     _parse_channels_from_ffmpeg_stderr,
     _parse_duration_from_ffmpeg_stderr,
@@ -47,6 +48,12 @@ from src.transcriber import (
     _voiceprint_distance,
     _worst_window_coverage,
 )
+
+
+class IdentityMatchingSettingTests(unittest.TestCase):
+    def test_config_read_failure_disables_identity_matching(self):
+        with patch("src.config.get_config", side_effect=OSError("unreadable config")):
+            self.assertFalse(_identity_matching_enabled())
 
 
 class FormatTimestampTests(unittest.TestCase):
@@ -2015,6 +2022,24 @@ class RunStenoDiarizeTests(unittest.TestCase):
             segments, embeddings = _run_steno_diarize(Path("/fake/mic.wav"), 60)
         self.assertEqual(segments, [{"start": 0.0, "end": 0.9, "speaker": "SPEAKER_0"}])
         self.assertEqual(embeddings, {})
+
+    def test_invalid_segment_shape_falls_back_instead_of_raising(self):
+        payload = json.dumps({
+            "segments": [{"speakerId": "SPEAKER_0", "start": "bad", "end": 0.9}],
+            "speakers": {},
+        }).encode()
+        with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
+             _patch_popen(stdout=payload, stderr=b"", returncode=0):
+            self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
+
+    def test_invalid_embedding_shape_falls_back_instead_of_raising(self):
+        payload = json.dumps({
+            "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
+            "speakers": {"SPEAKER_0": "not-a-vector"},
+        }).encode()
+        with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
+             _patch_popen(stdout=payload, stderr=b"", returncode=0):
+            self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
 
     def test_nonzero_exit_returns_none(self):
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \

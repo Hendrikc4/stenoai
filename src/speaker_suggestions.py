@@ -654,7 +654,7 @@ def write_speakers_sidecar(
     if turn_manifest:
         payload["transcript_lines"] = turn_manifest
     path = speakers_sidecar_path(output_dir, meeting_stem)
-    path.write_text(json.dumps(payload, indent=2))
+    write_sidecar_document(output_dir, meeting_stem, payload)
     return path
 
 
