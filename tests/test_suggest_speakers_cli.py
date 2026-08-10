@@ -34,12 +34,41 @@ class SuggestSpeakersCliTests(unittest.TestCase):
     go find and listen to that speaker in the recording to figure out who
     they actually are."""
 
-    def _run(self, args, tmp, cfg=None):
+    def _run(self, args, tmp, cfg=None, *, identity_enabled=True):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(identity_enabled)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             result = CliRunner().invoke(simple_recorder.suggest_speakers, args)
         return result
+
+    def test_disabled_identity_matching_hides_retained_speaker_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_0": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                        },
+                    },
+                },
+            })
+
+            result = self._run(["mtg001"], tmp, identity_enabled=False)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(_last_json(result.output), {
+                "success": True,
+                "meeting_id": "mtg001",
+                "recording_available": False,
+                "minimum_speaker_count": 0,
+                "channels": {},
+            })
 
     def test_missing_sidecar_is_an_empty_successful_result(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -419,6 +448,24 @@ class GetSpeakerSampleAudioCliTests(unittest.TestCase):
             self.assertNotIn("audio_path", data)
             self.assertEqual(base64.b64decode(data["audio_base64"]), b"wav-stub-bytes")
 
+    def test_failed_extraction_removes_partial_temp_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_sidecar_and_recording(tmp)
+
+            def leave_partial(_audio_path, _channel, _segments, output_path, segment_index=None):
+                output_path.write_bytes(b"private meeting audio")
+                return False
+
+            with mock.patch("tempfile.gettempdir", return_value=tmp), \
+                 mock.patch(
+                     "src.speaker_suggestions.extract_speaker_sample_audio",
+                     side_effect=leave_partial,
+                 ):
+                result = self._run(["mtg001", "system", "SPEAKER_0"], tmp)
+
+            self.assertFalse(_last_json(result.output)["success"])
+            self.assertEqual(list(Path(tmp).glob("steno_sample_*.wav")), [])
+
     def test_temp_extraction_file_is_cleaned_up_after_reading(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._seed_sidecar_and_recording(tmp)
@@ -526,6 +573,7 @@ class SuggestSpeakersReviewStateTests(unittest.TestCase):
 
     def _run(self, args, tmp, cfg=None):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(True)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             return CliRunner().invoke(simple_recorder.suggest_speakers, args)
@@ -588,6 +636,7 @@ class SuggestSpeakersRunScopeTests(unittest.TestCase):
 
     def _run(self, args, tmp, cfg=None):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(True)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             return CliRunner().invoke(simple_recorder.suggest_speakers, args)

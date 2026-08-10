@@ -18,8 +18,9 @@ def _last_json(output):
 
 
 class ConfirmSpeakerCliTests(unittest.TestCase):
-    def _run(self, args, tmp, cfg=None):
+    def _run(self, args, tmp, cfg=None, *, identity_enabled=True):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(identity_enabled)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             result = CliRunner().invoke(simple_recorder.confirm_speaker, args)
@@ -44,6 +45,49 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             result, _ = self._run(["mtg001", "mic", "SPEAKER_00"], tmp)
             self.assertNotEqual(result.exit_code, 0)
             self.assertFalse(_last_json(result.output)["success"])
+
+    def test_disabled_identity_matching_refuses_to_persist_a_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_sidecar(tmp)
+            result, cfg = self._run(
+                ["mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma"],
+                tmp,
+                identity_enabled=False,
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(_last_json(result.output), {
+                "success": False,
+                "error": "Speaker identification is disabled in settings.",
+            })
+            self.assertEqual(cfg.get_person_profiles(), [])
+
+    def test_config_save_failure_does_not_relabel_or_report_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_sidecar(tmp)
+            transcript_dir = Path(tmp) / "transcripts"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = transcript_dir / "mtg001_transcript.txt"
+            original = "[00:00] [You] hello\n"
+            transcript_path.write_text(original)
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            cfg.set_identity_matching_enabled(True)
+
+            with mock.patch("src.config._atomic_write_json", side_effect=OSError("disk full")), \
+                 mock.patch("src.config.get_config", return_value=cfg), \
+                 mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
+                result = CliRunner().invoke(
+                    simple_recorder.confirm_speaker,
+                    [
+                        "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
+                        "--relabel-transcript",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertFalse(_last_json(result.output)["success"])
+            self.assertEqual(transcript_path.read_text(), original)
+            self.assertEqual(cfg.get_person_profiles(), [])
 
     def test_rejects_both_person_id_and_new_person(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -828,6 +872,7 @@ class ConfirmSpeakerUpdatesParticipantsTests(unittest.TestCase):
 
     def _run(self, args, tmp, cfg=None):
         cfg = cfg or Config(config_path=Path(tmp) / "config.json")
+        cfg.set_identity_matching_enabled(True)
         with mock.patch("src.config.get_config", return_value=cfg), \
              mock.patch.dict("os.environ", {"STENOAI_USER_DATA_DIR": tmp}):
             result = CliRunner().invoke(simple_recorder.confirm_speaker, args)

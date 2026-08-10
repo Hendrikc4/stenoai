@@ -628,6 +628,22 @@ class SpeakersSidecarTests(unittest.TestCase):
             second_run_id = read_speakers_sidecar(output_dir, "mtg001")["diarization_run"]["run_id"]
             self.assertNotEqual(first_run_id, second_run_id)
 
+    def test_failed_replacement_preserves_the_previous_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            path = output_dir / "mtg001_speakers.json"
+            path.write_text('{"old": true}')
+
+            with mock.patch(
+                "src.speaker_suggestions.os.fsync",
+                side_effect=OSError("disk full"),
+            ):
+                with self.assertRaises(OSError):
+                    write_speakers_sidecar(output_dir, "mtg001", {"mic": {}})
+
+            self.assertEqual(path.read_text(), '{"old": true}')
+            self.assertEqual([p.name for p in output_dir.iterdir()], [path.name])
+
     def test_legacy_sidecar_without_diarization_run_round_trips_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir)

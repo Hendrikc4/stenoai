@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import { makeWav } from '../fixtures/make-wav';
-import { writeSpeakersSidecar } from '../fixtures/user-config';
+import { enableSpeakerIdentification, writeSpeakersSidecar } from '../fixtures/user-config';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import path from 'path';
 
@@ -126,6 +126,7 @@ test('People sample playback extracts a current confirmed voice through the bund
   const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
   sidecar.diarization_run = { run_id: 'e2e-person-sample-run', created_at: 1_700_000_000 };
   writeFileSync(sidecarPath, JSON.stringify(sidecar, null, 2));
+  enableSpeakerIdentification(userDataDir);
 
   const { page } = await launchApp();
   const confirmed = await page.evaluate(

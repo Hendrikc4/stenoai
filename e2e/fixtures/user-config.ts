@@ -35,6 +35,14 @@ export function writeUserConfig(
   writeFileSync(cfgPath, JSON.stringify({ ...cfg, ...partial }, null, 2));
 }
 
+/** Explicitly opt a test user into local biometric speaker identification. */
+export function enableSpeakerIdentification(userDataDir: string): void {
+  writeUserConfig(userDataDir, {
+    identity_matching_enabled: true,
+    identity_matching_privacy_default_version: 1,
+  });
+}
+
 /**
  * Configure the app for the renderer-driven capture path (system audio ON) with
  * the Whisper engine, so no Parakeet live-transcribe sidecar spawns. The

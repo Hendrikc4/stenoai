@@ -1,6 +1,11 @@
 import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
-import { writeSpeakersSidecar, writeTranscriptFile, writeMeetingMarkdown } from '../fixtures/user-config';
+import {
+  enableSpeakerIdentification,
+  writeSpeakersSidecar,
+  writeTranscriptFile,
+  writeMeetingMarkdown,
+} from '../fixtures/user-config';
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import path from 'path';
 
@@ -96,6 +101,7 @@ const readJson = (file: string) => JSON.parse(readFileSync(file, 'utf8'));
  * lengths and out of chronological order in the file, so the samples list
  * proves it sorts rather than echoing input order. */
 function seedMeeting(userDataDir: string, stem: string) {
+  enableSpeakerIdentification(userDataDir);
   writeSpeakersSidecar(userDataDir, stem, {
     system: {
       recording_type: 'remote',

@@ -924,29 +924,45 @@ def _run_steno_diarize(
         logger.warning("steno-diarize failed: %s", e)
         return None
 
-    segments = sorted(
-        (
-            {
-                "start": float(s["start"]),
-                "end": float(s["end"]),
-                "speaker": str(s["speakerId"]),
-            }
-            for s in raw_segments
-        ),
-        key=lambda s: s["start"],
-    )
-    # Merge first so a same-speaker overlap (the flicker case) collapses into
-    # one turn instead of being clamped into two touching ones; then clamp
-    # what is left, which is overlap between DIFFERENT speakers; then merge
-    # again, since clamping can leave two same-speaker segments flush.
-    # Clamping only ever moves a start forward, so re-sort before the second
-    # merge -- a segment nested inside a longer one keeps its original start
-    # and can end up out of order.
-    merged = _merge_close_diar_segments(segments, STENO_DIARIZE_MERGE_GAP_S)
-    clamped = sorted(_clamp_overlapping_diar_segments(merged), key=lambda s: s["start"])
-    merged = _merge_close_diar_segments(clamped, STENO_DIARIZE_MERGE_GAP_S)
-    embeddings = {str(k): [float(x) for x in v] for k, v in raw_embeddings.items()}
-    return merged, embeddings
+    try:
+        if not isinstance(raw_segments, list) or not isinstance(raw_embeddings, dict):
+            raise TypeError("segments must be a list and speakers must be an object")
+        segments = []
+        for raw_segment in raw_segments:
+            if not isinstance(raw_segment, dict):
+                raise TypeError("each segment must be an object")
+            start = float(raw_segment["start"])
+            end = float(raw_segment["end"])
+            speaker = raw_segment["speakerId"]
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or end < start
+                or not isinstance(speaker, str)
+                or not speaker
+            ):
+                raise ValueError("invalid segment values")
+            segments.append({"start": start, "end": end, "speaker": speaker})
+        segments.sort(key=lambda segment: segment["start"])
+
+        embeddings = {}
+        for speaker, raw_embedding in raw_embeddings.items():
+            if not isinstance(raw_embedding, list) or not raw_embedding:
+                raise TypeError("each speaker embedding must be a non-empty list")
+            embedding = [float(value) for value in raw_embedding]
+            if not all(math.isfinite(value) for value in embedding):
+                raise ValueError("speaker embedding contains a non-finite value")
+            embeddings[str(speaker)] = embedding
+
+        # Merge first so a same-speaker overlap (the flicker case) collapses
+        # into one turn instead of being clamped into two touching ones.
+        merged = _merge_close_diar_segments(segments, STENO_DIARIZE_MERGE_GAP_S)
+        clamped = sorted(_clamp_overlapping_diar_segments(merged), key=lambda s: s["start"])
+        merged = _merge_close_diar_segments(clamped, STENO_DIARIZE_MERGE_GAP_S)
+        return merged, embeddings
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
+        logger.warning("steno-diarize produced an invalid payload: %s", e)
+        return None
 
 
 def _worst_window_coverage(*results: Optional[dict]) -> Optional[float]:
@@ -1144,19 +1160,18 @@ def _apply_voiceprint_matches(
 
 def _identity_matching_enabled() -> bool:
     """Whether cross-recording speaker identification is enabled (default
-    on, user-configurable). Independent of diarization itself: disabling
+    off, user-configurable). Independent of diarization itself: disabling
     this stops self-voiceprint matching (_apply_voiceprint_matches) and
     per-meeting speaker-embedding persistence (clusters_out), but "Speaker
     N" splitting within a meeting is unaffected, since that only depends on
-    diarizer segments, not embeddings. Defaults to enabled on any
-    config-read failure, matching this file's "never fail a meeting"
-    pattern elsewhere.
+    diarizer segments, not embeddings. A config-read failure must fail
+    closed because no reliable opt-in can be established.
     """
     try:
         from src.config import get_config
         return get_config().get_identity_matching_enabled()
     except Exception:
-        return True
+        return False
 
 
 def _has_spoken_content(text: Optional[str]) -> bool:
