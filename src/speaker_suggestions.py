@@ -1090,8 +1090,6 @@ def minimum_speaker_count(channels: dict) -> int:
             continue
         try:
             parsed = clusters_from_sidecar_channel("", channel_data)
-            if len(parsed) != len(raw):
-                raise ValueError("Some speaker clusters have no usable embedding.")
             merged, _id_resolution = merge_same_channel_fragments(
                 parsed
             )

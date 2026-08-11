@@ -862,7 +862,14 @@ class ConfigPersonProfileTests(unittest.TestCase):
                 "quality_score": "not-a-number",
                 "created_at": 10**10000,
             }
-            mutable["prototypes"] = [dict(malformed) for _ in range(10)]
+            mutable["prototypes"] = [
+                {**malformed, "prototype_id": f"damaged-{index}"}
+                for index in range(Config.MAX_PROTOTYPES_PER_CONTEXT + 6)
+            ]
+            self.assertGreater(
+                len(mutable["prototypes"]),
+                Config.MAX_PROTOTYPES_PER_CONTEXT,
+            )
 
             result = config.add_speaker_prototype(
                 person["person_id"], [1.0, 0.0], recording_type="in_person",
@@ -872,6 +879,13 @@ class ConfigPersonProfileTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(result)
+            retained = config._get_person_profile_mutable(
+                person["person_id"]
+            )["prototypes"]
+            self.assertEqual(
+                [entry["prototype_id"] for entry in retained],
+                [result["prototype_id"]],
+            )
 
     def test_get_person_profiles_persists_across_reload(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

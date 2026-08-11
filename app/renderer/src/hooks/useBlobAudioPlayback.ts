@@ -119,7 +119,12 @@ export function useBlobAudioPlayback<Key extends string>(
     } catch {
       if (resourceRef.current === resource) resourceRef.current = null;
       releaseResource(resource);
-      if (activePlayback?.owner === ownerRef.current) activePlayback = null;
+      if (
+        generation === generationRef.current
+        && activePlayback?.owner === ownerRef.current
+      ) {
+        activePlayback = null;
+      }
       if (mountedRef.current && generation === generationRef.current) {
         setPlayingKey(null);
         setErrorKey(key);

@@ -135,4 +135,40 @@ describe('useBlobAudioPlayback', () => {
     expect(first.result.current.playingKey).toBeNull();
     expect(second.result.current.playingKey).toBe('excerpt-2');
   });
+
+  it('keeps newer playback registered when an older play request rejects', async () => {
+    const firstPlay = deferred<void>();
+    let playCalls = 0;
+    FakeAudio.playResult = () => {
+      playCalls += 1;
+      return playCalls === 1 ? firstPlay.promise : Promise.resolve();
+    };
+    const first = renderHook(() =>
+      useBlobAudioPlayback(async () => 'UklGRg=='),
+    );
+    const second = renderHook(() =>
+      useBlobAudioPlayback(async () => 'UklGRg=='),
+    );
+
+    let staleToggle!: Promise<void>;
+    act(() => {
+      staleToggle = first.result.current.toggle('cluster-1');
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(FakeAudio.instances).toHaveLength(1);
+
+    await act(() => first.result.current.toggle('cluster-2'));
+    expect(first.result.current.playingKey).toBe('cluster-2');
+
+    firstPlay.reject(new Error('stale failure'));
+    await act(() => staleToggle);
+    await act(() => second.result.current.toggle('excerpt-3'));
+
+    expect(FakeAudio.instances).toHaveLength(3);
+    expect(FakeAudio.instances[1].pause).toHaveBeenCalledOnce();
+    expect(first.result.current.playingKey).toBeNull();
+    expect(second.result.current.playingKey).toBe('excerpt-3');
+  });
 });
