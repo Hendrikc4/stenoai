@@ -140,14 +140,7 @@ test('New person creates and confirms a brand-new profile', async ({ launchApp }
   await expect(page.getByText('numerical biometric voice profile')).toBeVisible();
   await expect(page.getByText('stays on this device')).toBeVisible();
   await page.getByTestId('speaker-new-person-input').fill('Person Gamma');
-  await expect(page.getByTestId('speaker-new-person-submit')).toBeDisabled();
-
-  // Pressing Enter must not bypass the same authorisation gate as the button.
-  await page.getByTestId('speaker-new-person-input').press('Enter');
-  await expect(page.getByRole('dialog')).toBeVisible();
-  await expect(row).toContainText('Unidentified speaker');
-
-  await page.getByTestId('speaker-profile-authorized').check();
+  await expect(page.getByTestId('speaker-profile-authorized')).toHaveCount(0);
   await expect(page.getByTestId('speaker-new-person-submit')).toBeEnabled();
   await page.getByTestId('speaker-new-person-submit').click();
 
@@ -173,7 +166,6 @@ test('New person stays open and shows a safe error when creation fails', async (
   const row = page.getByTestId('speaker-row-mic:SPEAKER_2');
   await row.getByRole('button', { name: 'New person' }).click();
   await page.getByTestId('speaker-new-person-input').fill('Person Gamma');
-  await page.getByTestId('speaker-profile-authorized').check();
   await page.getByTestId('speaker-new-person-submit').click();
 
   await expect(page.getByRole('dialog')).toBeVisible();
@@ -196,7 +188,6 @@ test('a stale New person attempt closes the old row before refreshing', async ({
   const row = page.getByTestId('speaker-row-mic:SPEAKER_2');
   await row.getByRole('button', { name: 'New person' }).click();
   await page.getByTestId('speaker-new-person-input').fill('Person Gamma');
-  await page.getByTestId('speaker-profile-authorized').check();
   await page.getByTestId('speaker-new-person-submit').click();
 
   // The dialog held a row object from the old run. It must disappear before
@@ -208,10 +199,10 @@ test('a stale New person attempt closes the old row before refreshing', async ({
   );
   await expect(row).toContainText('refreshed after new analysis');
 
-  // A retry starts from a newly selected row and requires fresh consent.
+  // A retry starts from a newly selected row with a fresh name.
   await row.getByRole('button', { name: 'New person' }).click();
   await expect(page.getByTestId('speaker-new-person-input')).toHaveValue('');
-  await expect(page.getByTestId('speaker-profile-authorized')).not.toBeChecked();
+  await expect(page.getByTestId('speaker-profile-authorized')).toHaveCount(0);
   await expect(page.getByTestId('speaker-new-person-submit')).toBeDisabled();
 });
 
@@ -236,8 +227,7 @@ test('New person blocks creating a duplicate of an existing person', async ({ la
   // A genuinely new name clears the warning and re-enables Create.
   await page.getByTestId('speaker-new-person-input').fill('Someone New');
   await expect(page.getByTestId('speaker-new-person-duplicate')).toHaveCount(0);
-  await expect(page.getByTestId('speaker-new-person-submit')).toBeDisabled();
-  await page.getByTestId('speaker-profile-authorized').check();
+  await expect(page.getByTestId('speaker-profile-authorized')).toHaveCount(0);
   await expect(page.getByTestId('speaker-new-person-submit')).toBeEnabled();
 });
 

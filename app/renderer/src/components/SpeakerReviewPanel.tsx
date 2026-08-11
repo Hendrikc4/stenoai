@@ -376,7 +376,6 @@ export function SpeakerReviewPanel({
   const [personQuery, setPersonQuery] = React.useState('');
   const [newPersonRow, setNewPersonRow] = React.useState<Row | null>(null);
   const [newPersonName, setNewPersonName] = React.useState('');
-  const [newPersonAuthorized, setNewPersonAuthorized] = React.useState(false);
   const [newPersonError, setNewPersonError] = React.useState<string | null>(null);
   const [showFiltered, setShowFiltered] = React.useState(false);
   // Error acknowledgment only -- a SUCCESSFUL confirm needs no separate
@@ -560,7 +559,6 @@ export function SpeakerReviewPanel({
       !newPersonRow
       || !newPersonName.trim()
       || duplicateProfile
-      || !newPersonAuthorized
       || confirmSpeaker.isPending
     ) return;
     setNewPersonError(null);
@@ -574,7 +572,6 @@ export function SpeakerReviewPanel({
         summaryFile,
       });
       setNewPersonRow(null);
-      setNewPersonAuthorized(false);
     } catch (error) {
       if (isStaleDiarizationError(error)) {
         // This dialog holds a row object from the run that just became
@@ -584,7 +581,6 @@ export function SpeakerReviewPanel({
         const staleRow = newPersonRow;
         setNewPersonRow(null);
         setNewPersonName('');
-        setNewPersonAuthorized(false);
         setNewPersonError(null);
         reportMutationFailure(rowKey(staleRow), error);
       } else {
@@ -882,7 +878,6 @@ export function SpeakerReviewPanel({
                   disabled={anyConfirmPending}
                   onClick={() => {
                     setNewPersonName('');
-                    setNewPersonAuthorized(false);
                     setNewPersonError(null);
                     setNewPersonRow(row);
                   }}
@@ -1058,7 +1053,6 @@ export function SpeakerReviewPanel({
         onOpenChange={(open) => {
           if (!open && !confirmSpeaker.isPending) {
             setNewPersonRow(null);
-            setNewPersonAuthorized(false);
             setNewPersonError(null);
           }
         }}
@@ -1090,7 +1084,6 @@ export function SpeakerReviewPanel({
                 && newPersonRow
                 && newPersonName.trim()
                 && !duplicateProfile
-                && newPersonAuthorized
               ) {
                 void submitNewPerson();
               }
@@ -1107,23 +1100,6 @@ export function SpeakerReviewPanel({
               {newPersonError}
             </p>
           )}
-          <label
-            className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-border p-3 text-[13px] leading-[1.4]"
-            style={{ color: 'var(--fg-1)' }}
-          >
-            <input
-              type="checkbox"
-              checked={newPersonAuthorized}
-              onChange={(event) => setNewPersonAuthorized(event.target.checked)}
-              disabled={confirmSpeaker.isPending}
-              className="mt-0.5 size-4 shrink-0 accent-[color:var(--fg-1)]"
-              data-testid="speaker-profile-authorized"
-            />
-            <span>
-              I confirm that I have informed this person and am authorised to create and use their
-              voice profile.
-            </span>
-          </label>
           <DialogFooter>
             <DialogClose asChild>
               <Button variant="outline" disabled={confirmSpeaker.isPending}>Cancel</Button>
@@ -1132,7 +1108,6 @@ export function SpeakerReviewPanel({
               disabled={
                 !newPersonName.trim()
                 || Boolean(duplicateProfile)
-                || !newPersonAuthorized
                 || confirmSpeaker.isPending
               }
               onClick={() => void submitNewPerson()}

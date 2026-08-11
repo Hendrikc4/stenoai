@@ -163,7 +163,7 @@ function SpeakerIdentificationSetting() {
   return (
     <SettingRow
       label="Speaker identification"
-      description="Optional and off by default. When enabled, Steno stores numerical biometric voice profiles on this device to suggest people across meetings. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
+      description="Optional and off by default. By enabling this, you confirm that you have informed the people you record and are authorised to create and use their numerical biometric voice profiles. Profiles stay on this device and are used only to suggest people across meetings. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
     >
       <Switch
         checked={enabled.data ?? false}
