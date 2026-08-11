@@ -165,8 +165,9 @@ overrides an agent's own test-level defaults.
   so a test can never read/write the real `~/Library/Application Support/stenoai`. The
   launch fixture (`e2e/fixtures/electron.ts`) waits on `[data-app-ready]` (no fixed timeouts)
   and force-kills the app process tree if a graceful close hangs on teardown (Windows).
-- **CI:** `.github/workflows/e2e.yml` (T1 on Ubuntu/xvfb, macOS + Windows T2; non-blocking,
-  runs per-PR). `.github/workflows/e2e-nightly.yml` (scheduled) reuses that suite via
+- **CI:** `.github/workflows/e2e.yml` runs per PR. T1 on Ubuntu/xvfb plus the macOS T2 and
+  pipeline jobs are required checks for `main`; Windows T2 remains advisory.
+  `.github/workflows/e2e-nightly.yml` (scheduled) reuses that suite via
   `workflow_call` for flake/drift detection and adds the T3 long-meeting job. A CI-only
   Playwright `globalSetup` kills a stray Ollama + waits for a clean 11434 before the run.
 
