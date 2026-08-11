@@ -42,11 +42,13 @@
 If you're looking for a hosted desktop recording API, consider checking out [Recall.ai](https://www.recall.ai/product/desktop-recording-sdk?utm_source=github&utm_medium=sponsorship&utm_campaign=ruzin-stenoai), an API that records Zoom, Google Meet, Microsoft Teams, in-person meetings, and more.
 
 ## 📢 What's New
-- **2026-08-08** 👥 Individual speakers — Steno now separates people who share the same microphone or call-audio channel, not just `[You]` and `[Others]`. Review the speaker groups on the transcript, rename them, or mark uncertain groups. Optional recognition across meetings is off by default and currently available on macOS.
+- **Coming in the next release** 👥 Individual speakers - Steno separates people who share the same microphone or call-audio channel, not just `[You]` and `[Others]`. Review the speaker groups on the transcript, rename them, or mark uncertain groups. Optional recognition across meetings is off by default and macOS-only.
+
+> Individual speaker separation and optional named people are available on `main` and will ship in the next release. The current v0.6.7 download does not include them.
+
 - **2026-08-04** 💎 Sync to Obsidian — mirror your notes into an Obsidian vault folder as Markdown. Turn it on in Settings → Integrations and pick a vault folder. One-way (Steno → vault); notes you edit in Obsidian are never overwritten.
 - **2026-08-03** 🔔 One-tap meeting notes — "Take Notes" starts recording instantly, meetings auto-stop when they end, and a single "Summarise?" tap opens the note and generates it. Recordings are transcript-first now. Turn on auto-summarise in Settings → AI for automatic notes.
 - **2026-07-26** 🎙️ System audio without Screen Recording — record both sides of a call with no Screen Recording permission. Now requires macOS 14.4 or later.
-
 
 ## Features
 
