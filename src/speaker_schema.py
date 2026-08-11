@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import unicodedata
 from pathlib import Path
+from typing import Optional
 
 
 EMBEDDING_DIMENSION = 256
@@ -38,12 +39,18 @@ def validate_display_name(value: str) -> str:
     return normalized
 
 
-def validate_embedding(value) -> list[float]:
-    if not isinstance(value, list) or len(value) != EMBEDDING_DIMENSION:
-        raise ValueError("Speaker embedding must contain 256 values.")
+def validate_embedding(
+    value,
+    *,
+    expected_dimension: Optional[int] = EMBEDDING_DIMENSION,
+) -> list[float]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("Speaker embedding must be a non-empty vector.")
+    if expected_dimension is not None and len(value) != expected_dimension:
+        raise ValueError(f"Speaker embedding must contain {expected_dimension} values.")
     try:
         embedding = [float(item) for item in value]
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, OverflowError) as error:
         raise ValueError("Speaker embedding must be numeric.") from error
     if not all(math.isfinite(item) for item in embedding):
         raise ValueError("Speaker embedding must contain finite values.")

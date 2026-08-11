@@ -53,7 +53,12 @@ export function ConfirmDialog({
         onOpenChange(nextOpen);
       }}
     >
-      <DialogContent data-confirm-dialog className="max-w-md">
+      <DialogContent
+        data-confirm-dialog
+        data-pending={pending || undefined}
+        closeDisabled={pending}
+        className="max-w-md"
+      >
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           {description && <DialogDescription>{description}</DialogDescription>}

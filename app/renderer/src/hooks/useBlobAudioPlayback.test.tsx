@@ -58,6 +58,24 @@ describe('useBlobAudioPlayback', () => {
     expect(FakeAudio.instances).toHaveLength(0);
   });
 
+  it('does not claim the global playback slot through a stale callback after unmount', async () => {
+    const first = renderHook(() =>
+      useBlobAudioPlayback(async () => 'UklGRg=='),
+    );
+    const staleToggle = first.result.current.toggle;
+    first.unmount();
+
+    await staleToggle('person-1');
+
+    const second = renderHook(() =>
+      useBlobAudioPlayback(async () => 'UklGRg=='),
+    );
+    await act(() => second.result.current.toggle('person-2'));
+
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(second.result.current.playingKey).toBe('person-2');
+  });
+
   it('revokes the active blob URL when playback stops', async () => {
     const { result } = renderHook(() =>
       useBlobAudioPlayback(async () => 'UklGRg=='),
@@ -99,5 +117,22 @@ describe('useBlobAudioPlayback', () => {
 
     expect(FakeAudio.instances).toHaveLength(1);
     expect(result.current.playingKey).toBe('person-1');
+  });
+
+  it('stops playback owned by another hook before starting a new clip', async () => {
+    const first = renderHook(() =>
+      useBlobAudioPlayback(async () => 'UklGRg=='),
+    );
+    const second = renderHook(() =>
+      useBlobAudioPlayback(async () => 'UklGRg=='),
+    );
+
+    await act(() => first.result.current.toggle('cluster-1'));
+    await act(() => second.result.current.toggle('excerpt-2'));
+
+    expect(FakeAudio.instances).toHaveLength(2);
+    expect(FakeAudio.instances[0].pause).toHaveBeenCalledOnce();
+    expect(first.result.current.playingKey).toBeNull();
+    expect(second.result.current.playingKey).toBe('excerpt-2');
   });
 });

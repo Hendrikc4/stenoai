@@ -986,14 +986,11 @@ def _run_steno_diarize(
             segments.append({"start": start, "end": end, "speaker": speaker})
         segments.sort(key=lambda segment: segment["start"])
 
+        from src.speaker_schema import validate_embedding
+
         embeddings = {}
         for speaker, raw_embedding in raw_embeddings.items():
-            if not isinstance(raw_embedding, list) or not raw_embedding:
-                raise TypeError("each speaker embedding must be a non-empty list")
-            embedding = [float(value) for value in raw_embedding]
-            if not all(math.isfinite(value) for value in embedding):
-                raise ValueError("speaker embedding contains a non-finite value")
-            embeddings[str(speaker)] = embedding
+            embeddings[str(speaker)] = validate_embedding(raw_embedding)
 
         # Merge first so a same-speaker overlap (the flicker case) collapses
         # into one turn instead of being clamped into two touching ones.
@@ -1110,9 +1107,13 @@ def _voiceprint_distance(embedding: list, voiceprint: dict) -> float:
     centroid = voiceprint.get("centroid")
     if centroid:
         anchors.append(centroid)
-    if not anchors:
-        return float("inf")
-    return min(cosine_distance(embedding, a) for a in anchors)
+    distances = []
+    for anchor in anchors:
+        try:
+            distances.append(cosine_distance(embedding, anchor))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return min(distances, default=float("inf"))
 
 
 def _apply_voiceprint_matches(

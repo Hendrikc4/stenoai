@@ -23,7 +23,17 @@ function validateMeetingStem(value) {
 }
 
 function validateOpaqueId(value, label) {
-  if (typeof value !== 'string' || !value || value.includes('/') || value.includes('\\')) {
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.length > 128
+    || value === '.'
+    || value === '..'
+    || value.startsWith('-')
+    || value.includes('/')
+    || value.includes('\\')
+    || /\p{C}/u.test(value)
+  ) {
     invalid(`Invalid ${label}.`);
   }
   return value;

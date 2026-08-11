@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from src.speaker_sidecar_store import SpeakerSidecarStore
 from src.speaker_suggestions import (
     ClusterContext,
     REVIEW_STATE_GENERIC,
@@ -690,7 +691,10 @@ class SpeakersSidecarTests(unittest.TestCase):
                     write_speakers_sidecar(output_dir, "mtg001", {"mic": {}})
 
             self.assertEqual(path.read_text(), '{"old": true}')
-            self.assertEqual([p.name for p in output_dir.iterdir()], [path.name])
+            self.assertEqual(
+                {p.name for p in output_dir.iterdir()},
+                {path.name, SpeakerSidecarStore(output_dir).lock_path("mtg001").name},
+            )
 
     def test_legacy_sidecar_without_diarization_run_round_trips_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1587,6 +1591,16 @@ class ReviewStateTests(unittest.TestCase):
             clusters = clusters_from_sidecar_channel("mtg001", sidecar["channels"]["system"])
             self.assertIsNone(clusters["SPEAKER_0"][1].review_state)
 
+    def test_an_invalid_cluster_rejects_the_whole_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = self._seed(tmp, clusters={
+                "SPEAKER_0": {"embedding": [1.0, 0.0]},
+                "SPEAKER_1": {"embedding": [0.0, 0.0]},
+            })
+            sidecar = read_speakers_sidecar(output_dir, "mtg001")
+            with self.assertRaisesRegex(ValueError, "invalid cluster embedding"):
+                clusters_from_sidecar_channel("mtg001", sidecar["channels"]["system"])
+
     def test_clearing_sweeps_every_fragment_of_a_merged_row(self):
         # A key left on a non-primary fragment would keep the merged row
         # reading generic after a confirm, because the merged view is an
@@ -1680,7 +1694,10 @@ class SidecarDurabilityTests(unittest.TestCase):
             with mock.patch("src.speaker_suggestions.os.fsync", side_effect=OSError("disk gone")):
                 with self.assertRaises(OSError):
                     write_sidecar_document(output_dir, "mtg001", doc)
-            leftovers = [p.name for p in output_dir.iterdir()]
+            # The shared FileLock deliberately keeps its stable lock path.
+            # Deleting it after release could split waiters across two
+            # different inodes. Only unique write-temporary files are leaks.
+            leftovers = [p.name for p in output_dir.iterdir() if p.suffix == ".tmp"]
             self.assertEqual(leftovers, [], f"temp file left behind: {leftovers}")
 
 

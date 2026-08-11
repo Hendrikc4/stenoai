@@ -44,8 +44,21 @@ class SpeakerSidecarStore:
 
         return read_speakers_sidecar(self.output_dir, validate_meeting_stem(meeting_stem))
 
+    def lock_path(self, meeting_stem: str) -> Path:
+        """Return a stable lock path without retaining the meeting title."""
+        stem = validate_meeting_stem(meeting_stem)
+        digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()
+        return self.output_dir / f".speaker-{digest}.lock"
+
+    def lock(self, meeting_stem: str) -> filelock.FileLock:
+        return filelock.FileLock(
+            str(self.lock_path(meeting_stem)), timeout=self.lock_timeout,
+        )
+
     def assert_current(self, meeting_stem: str, expected_run_id: Optional[str]) -> dict:
         document = self.read(meeting_stem)
+        if document is not None and not isinstance(document, dict):
+            raise ValueError("Invalid speaker sidecar document.")
         actual = self.run_token(document)
         if actual != expected_run_id:
             raise StaleDiarizationRun(expected_run_id, actual)
@@ -57,20 +70,35 @@ class SpeakerSidecarStore:
         expected_run_id: Optional[str],
         mutation: Callable[[dict], T],
     ) -> dict:
-        path = self.path(meeting_stem)
-        lock = filelock.FileLock(str(path) + ".lock", timeout=self.lock_timeout)
-        with lock:
-            document = self.read(meeting_stem)
-            if document is None:
-                raise FileNotFoundError(path)
-            actual = self.run_token(document)
-            if actual != expected_run_id:
-                raise StaleDiarizationRun(expected_run_id, actual)
-            mutation(document)
-            from src.speaker_suggestions import write_sidecar_document
+        with self.lock(meeting_stem):
+            return self.mutate_locked(meeting_stem, expected_run_id, mutation)
 
-            write_sidecar_document(self.output_dir, meeting_stem, document)
-            return document
+    def mutate_locked(
+        self,
+        meeting_stem: str,
+        expected_run_id: Optional[str],
+        mutation: Callable[[dict], T],
+    ) -> dict:
+        """Mutate while the caller already holds ``lock(meeting_stem)``."""
+        path = self.path(meeting_stem)
+        document = self.read(meeting_stem)
+        if document is None:
+            raise FileNotFoundError(path)
+        if not isinstance(document, dict):
+            raise ValueError("Invalid speaker sidecar document.")
+        actual = self.run_token(document)
+        if actual != expected_run_id:
+            raise StaleDiarizationRun(expected_run_id, actual)
+        mutation(document)
+        from src.speaker_suggestions import write_sidecar_document
+
+        write_sidecar_document(
+            self.output_dir,
+            meeting_stem,
+            document,
+            acquire_lock=False,
+        )
+        return document
 
     @staticmethod
     def _run_id(document: Optional[dict]) -> Optional[str]:

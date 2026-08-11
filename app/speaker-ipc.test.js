@@ -28,6 +28,12 @@ test('parseSpeakerMutation rejects invalid channels, ids, booleans, and stale-ru
     { channel: 'left' },
     { diarizationSpeakerId: '../SPEAKER_0' },
     { expectedRunId: '' },
+    { expectedRunId: 'run\u0000one' },
+    { expectedRunId: '--relabel-transcript' },
+    { expectedRunId: 'x'.repeat(129) },
+    { personId: 'person\u001fone' },
+    { personId: '..' },
+    { personId: '-person' },
     { containsMultipleSpeakers: 'true' },
   ]) {
     assert.throws(() => parseSpeakerMutation({ ...valid, ...patch }), { name: 'TypeError' });

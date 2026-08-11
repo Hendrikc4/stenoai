@@ -1,6 +1,8 @@
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -515,19 +517,35 @@ class GetSpeakerSampleAudioCliTests(unittest.TestCase):
     def test_parallel_sample_requests_get_unique_temp_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._seed_sidecar_and_recording(tmp)
+            dirs = {
+                "recordings": Path(tmp) / "recordings",
+                "transcripts": Path(tmp) / "transcripts",
+                "output": Path(tmp) / "output",
+            }
             captured_paths = []
+            extraction_barrier = threading.Barrier(2)
+            capture_lock = threading.Lock()
 
             def fake_extract(audio_path, channel, segments, output_path, segment_index=None):
-                captured_paths.append(output_path)
+                with capture_lock:
+                    captured_paths.append(output_path)
+                extraction_barrier.wait(timeout=2.0)
                 output_path.write_bytes(b"stub")
                 return True
 
             with mock.patch(
                 "src.speaker_suggestions.extract_speaker_sample_audio",
                 side_effect=fake_extract,
-            ):
-                self._run(["mtg001", "system", "SPEAKER_0"], tmp)
-                self._run(["mtg001", "system", "SPEAKER_0"], tmp)
+            ), mock.patch(
+                "src.config.get_data_dirs", return_value=dirs,
+            ), mock.patch("builtins.print"):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    list(executor.map(
+                        lambda _index: simple_recorder.get_speaker_sample_audio.callback(
+                            "mtg001", "system", "SPEAKER_0", None, None,
+                        ),
+                        range(2),
+                    ))
 
             self.assertEqual(len(captured_paths), 2)
             self.assertNotEqual(captured_paths[0], captured_paths[1])

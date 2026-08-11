@@ -835,7 +835,7 @@ class ConfigPersonProfileTests(unittest.TestCase):
     def test_create_person_profile_reports_a_write_failure(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
-            with patch.object(config, "_save", return_value=False):
+            with patch.object(config, "commit_transaction", return_value=False):
                 with self.assertRaises(OSError):
                     config.create_person_profile("Person Gamma")
             self.assertEqual(config.get_person_profiles(), [])
@@ -846,6 +846,32 @@ class ConfigPersonProfileTests(unittest.TestCase):
             with patch.object(config, "_save", return_value=False):
                 self.assertIsNone(config.save_voiceprint("Person Gamma", [1.0, 0.0]))
             self.assertEqual(config.get_voiceprints(), [])
+
+    def test_pruning_tolerates_malformed_persisted_rank_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            person = config.create_person_profile("Person Gamma")
+            mutable = config._get_person_profile_mutable(person["person_id"])
+            malformed = {
+                "prototype_id": "damaged",
+                "person_id": person["person_id"],
+                "embedding_mean": [1.0, 0.0],
+                "recording_type": "in_person",
+                "channel": "mic",
+                "meeting_id": "old-meeting",
+                "quality_score": "not-a-number",
+                "created_at": 10**10000,
+            }
+            mutable["prototypes"] = [dict(malformed) for _ in range(10)]
+
+            result = config.add_speaker_prototype(
+                person["person_id"], [1.0, 0.0], recording_type="in_person",
+                meeting_id="new-meeting", diarization_speaker_id="SPEAKER_0",
+                speech_duration_seconds=30.0, segment_count=4,
+                created_from="user_confirmed", channel="mic",
+            )
+
+            self.assertIsNotNone(result)
 
     def test_get_person_profiles_persists_across_reload(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

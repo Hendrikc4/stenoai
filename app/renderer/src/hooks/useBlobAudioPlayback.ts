@@ -6,6 +6,13 @@ interface AudioResource {
   released: boolean;
 }
 
+interface ActivePlayback {
+  owner: object;
+  stop: () => void;
+}
+
+let activePlayback: ActivePlayback | null = null;
+
 function audioBlobUrl(base64: string, mimeType = 'audio/wav'): string {
   const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
@@ -29,6 +36,7 @@ export function useBlobAudioPlayback<Key extends string>(
     loaderRef.current = loadBase64;
   }, [loadBase64]);
   const resourceRef = React.useRef<AudioResource | null>(null);
+  const ownerRef = React.useRef<object>({});
   const generationRef = React.useRef(0);
   const mountedRef = React.useRef(true);
   const [pendingKey, setPendingKey] = React.useState<Key | null>(null);
@@ -44,6 +52,7 @@ export function useBlobAudioPlayback<Key extends string>(
   const stop = React.useCallback(() => {
     generationRef.current += 1;
     releaseCurrent();
+    if (activePlayback?.owner === ownerRef.current) activePlayback = null;
     if (mountedRef.current) {
       setPendingKey(null);
       setPlayingKey(null);
@@ -51,22 +60,29 @@ export function useBlobAudioPlayback<Key extends string>(
   }, [releaseCurrent]);
 
   React.useEffect(() => {
+    const owner = ownerRef.current;
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       generationRef.current += 1;
       releaseCurrent();
+      if (activePlayback?.owner === owner) activePlayback = null;
     };
   }, [releaseCurrent]);
 
   const toggle = React.useCallback(async (key: Key) => {
+    if (!mountedRef.current) return;
     if (playingKey === key) {
       stop();
       return;
     }
 
     stop();
-    if (!mountedRef.current) return;
+    const previousPlayback = activePlayback;
+    if (previousPlayback && previousPlayback.owner !== ownerRef.current) {
+      previousPlayback.stop();
+    }
+    activePlayback = { owner: ownerRef.current, stop };
     setErrorKey(null);
     setPendingKey(key);
     const generation = generationRef.current;
@@ -85,6 +101,7 @@ export function useBlobAudioPlayback<Key extends string>(
         if (generation !== generationRef.current || resourceRef.current !== resource) return;
         resourceRef.current = null;
         releaseResource(resource);
+        if (activePlayback?.owner === ownerRef.current) activePlayback = null;
         if (!mountedRef.current) return;
         setPendingKey(null);
         setPlayingKey(null);
@@ -102,6 +119,7 @@ export function useBlobAudioPlayback<Key extends string>(
     } catch {
       if (resourceRef.current === resource) resourceRef.current = null;
       releaseResource(resource);
+      if (activePlayback?.owner === ownerRef.current) activePlayback = null;
       if (mountedRef.current && generation === generationRef.current) {
         setPlayingKey(null);
         setErrorKey(key);

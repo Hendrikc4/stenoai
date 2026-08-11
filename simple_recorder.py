@@ -17,6 +17,7 @@ transcribes/summarizes the resulting file. Usage (called by Electron):
 
 import click
 import asyncio
+import filelock
 import logging
 import json
 import os
@@ -374,10 +375,17 @@ def _persist_speaker_sidecar(output_dir, meeting_stem: str, transcript_data: dic
         )
         logger.warning("Speaker markings lost: %s", message)
         print(f"LOST_SPEAKER_MARKINGS: {message}", flush=True)
-    write_speakers_sidecar(
-        output_dir, meeting_stem, speaker_clusters,
-        turn_manifest=transcript_data.get("turn_manifest"),
-    )
+    try:
+        write_speakers_sidecar(
+            output_dir, meeting_stem, speaker_clusters,
+            turn_manifest=transcript_data.get("turn_manifest"),
+        )
+    except (OSError, ValueError):
+        # Speaker review is optional. A concurrent review can hold the
+        # sidecar lock, and malformed internal channel data must not turn an
+        # otherwise valid transcription into a failed meeting.
+        logger.warning("Could not persist the optional speaker analysis.")
+        return False
     return True
 
 
@@ -4277,23 +4285,30 @@ def _run_speaker_model_command(command: str, timeout: int) -> dict:
         }
 
     payload = None
-    for line in reversed(result.stdout.splitlines()):
+    decoder = json.JSONDecoder()
+    # CoreML can write native E5RT diagnostics to stdout without a trailing
+    # newline, directly before the sidecar's JSON response. Decode each object
+    # start and keep the last complete model-status object. Native libraries
+    # may also print teardown diagnostics after the JSON, so neither prefix
+    # nor suffix noise is part of the response contract.
+    for offset, character in enumerate(result.stdout):
+        if character != "{":
+            continue
         try:
-            candidate = json.loads(line)
+            candidate, _end = decoder.raw_decode(result.stdout, offset)
         except json.JSONDecodeError:
             continue
-        if isinstance(candidate, dict) and isinstance(candidate.get("ready"), bool):
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("ready"), bool)
+            and isinstance(candidate.get("required_models"), list)
+            and isinstance(candidate.get("missing_models"), list)
+            and isinstance(candidate.get("cache_directory"), str)
+        ):
             payload = candidate
-            break
 
     allowed_return_codes = {0, 3} if command == "model-status" else {0}
-    valid_payload = (
-        isinstance(payload, dict)
-        and isinstance(payload.get("required_models"), list)
-        and isinstance(payload.get("missing_models"), list)
-        and isinstance(payload.get("cache_directory"), str)
-    )
-    if result.returncode not in allowed_return_codes or not valid_payload:
+    if result.returncode not in allowed_return_codes or payload is None:
         logger.warning(
             "Speaker diarization model command failed with exit code %s",
             result.returncode,
@@ -4824,6 +4839,9 @@ def enroll_voiceprint(name, audio_file, is_self):
     saved = get_config().save_voiceprint(
         name, embeddings[dominant], is_self=is_self, duration=totals[dominant],
     )
+    if saved is None:
+        print(json.dumps({"success": False, "error": "Could not save the voice profile."}))
+        sys.exit(1)
     print(json.dumps({
         "success": True,
         "name": saved["name"],
@@ -4903,6 +4921,12 @@ def enroll_self_from_person(person):
             profile["display_name"], prototype["embedding_mean"], is_self=True,
             duration=prototype.get("speech_duration_seconds"),
         )
+        if saved is None:
+            print(json.dumps({
+                "success": False,
+                "error": "Could not save the self voice profile.",
+            }))
+            sys.exit(1)
 
     print(json.dumps({
         "success": True,
@@ -5323,7 +5347,6 @@ def confirm_speaker(
         merge_same_channel_fragments,
         prototype_channel_matches,
         prototype_run_matches,
-        read_speakers_sidecar,
         record_original_labels,
         relabel_transcript_exact,
         relabel_transcript_speaker,
@@ -5342,19 +5365,26 @@ def confirm_speaker(
         sys.exit(1)
 
     output_dir = get_data_dirs()["output"]
-    if expected_run_id is not None:
-        try:
-            SpeakerSidecarStore(output_dir).assert_current(meeting_stem, expected_run_id)
-        except StaleDiarizationRun as error:
-            print(json.dumps({
-                "success": False,
-                "error": str(error),
-                "error_code": error.error_code,
-            }))
-            sys.exit(1)
-    sidecar = read_speakers_sidecar(output_dir, meeting_stem)
-    if sidecar is None:
+    store = SpeakerSidecarStore(output_dir)
+    sidecar_lock = store.lock(meeting_stem)
+    try:
+        sidecar_lock.acquire()
+    except (filelock.Timeout, OSError):
+        print(json.dumps({"success": False, "error": "Could not lock the speaker analysis."}))
+        sys.exit(1)
+    click.get_current_context().call_on_close(sidecar_lock.release)
+    sidecar = store.read(meeting_stem)
+    if not isinstance(sidecar, dict):
         print(json.dumps({"success": False, "error": f"No speakers sidecar found for {meeting_stem!r}"}))
+        sys.exit(1)
+    current_run_token = store.run_token(sidecar)
+    if expected_run_id is not None and current_run_token != expected_run_id:
+        error = StaleDiarizationRun(expected_run_id, current_run_token)
+        print(json.dumps({
+            "success": False,
+            "error": str(error),
+            "error_code": error.error_code,
+        }))
         sys.exit(1)
     channel_data = (sidecar.get("channels") or {}).get(channel)
     if channel_data is None:
@@ -5635,7 +5665,13 @@ def confirm_speaker(
             # in the transcript and marking it as mixed later would leave
             # the name standing. First write wins, so re-confirming (the
             # "Change" flow) never records a person's name as the original.
-            record_original_labels(output_dir, meeting_stem, transcript_path, target_ids)
+            record_original_labels(
+                output_dir,
+                meeting_stem,
+                transcript_path,
+                target_ids,
+                lock_held=True,
+            )
             relabeled_lines = relabel_transcript_exact(
                 transcript_path, turn_manifest, target_ids, person["display_name"],
             )
@@ -5650,7 +5686,14 @@ def confirm_speaker(
     # now decided, and leaving the marking would have the panel report a
     # confirmed row as still parked. Swept across every fragment, because
     # the merged row reads generic when ANY member carries the key.
-    clear_cluster_review_state(output_dir, meeting_stem, channel, fragment_ids)
+    clear_cluster_review_state(
+        output_dir,
+        meeting_stem,
+        channel,
+        fragment_ids,
+        current_run_token,
+        lock_held=True,
+    )
 
     # Cheap and always-safe (unlike transcript relabeling, no reason to
     # gate this behind a flag) -- keeps the meeting's Participants chip in
@@ -5846,24 +5889,36 @@ def mark_speaker_cluster(
         merge_same_channel_fragments,
         clusters_from_sidecar_channel,
         minimum_speaker_count,
-        read_speakers_sidecar,
         restore_transcript_labels,
         set_cluster_multi_speaker,
     )
 
     output_dir = get_data_dirs()["output"]
-    if expected_run_id is not None:
-        try:
-            SpeakerSidecarStore(output_dir).assert_current(meeting_stem, expected_run_id)
-        except StaleDiarizationRun as error:
-            print(json.dumps({
-                "success": False,
-                "error": str(error),
-                "error_code": error.error_code,
-            }))
-            sys.exit(1)
-    sidecar = read_speakers_sidecar(output_dir, meeting_stem)
-    channels = sidecar.get("channels") if isinstance(sidecar, dict) else None
+    store = SpeakerSidecarStore(output_dir)
+    sidecar_lock = store.lock(meeting_stem)
+    try:
+        sidecar_lock.acquire()
+    except (filelock.Timeout, OSError):
+        print(json.dumps({"success": False, "error": "Could not lock the speaker analysis."}))
+        sys.exit(1)
+    click.get_current_context().call_on_close(sidecar_lock.release)
+    sidecar = store.read(meeting_stem)
+    if not isinstance(sidecar, dict):
+        print(json.dumps({
+            "success": False,
+            "error": "The speaker analysis is missing or invalid.",
+        }))
+        sys.exit(1)
+    current_run_token = store.run_token(sidecar)
+    if expected_run_id is not None and current_run_token != expected_run_id:
+        error = StaleDiarizationRun(expected_run_id, current_run_token)
+        print(json.dumps({
+            "success": False,
+            "error": str(error),
+            "error_code": error.error_code,
+        }))
+        sys.exit(1)
+    channels = sidecar.get("channels")
     channel_data = channels.get(channel) if isinstance(channels, dict) else None
     raw_clusters = channel_data.get("clusters") if isinstance(channel_data, dict) else None
     if not isinstance(raw_clusters, dict) or not isinstance(
@@ -5971,7 +6026,8 @@ def mark_speaker_cluster(
             channel,
             diarization_speaker_id,
             multiple,
-            expected_run_id,
+            current_run_token,
+            lock_held=True,
         )
     except (OSError, StaleDiarizationRun) as error:
         if isinstance(error, StaleDiarizationRun):
@@ -5986,6 +6042,7 @@ def mark_speaker_cluster(
         print(json.dumps({
             "success": False,
             "error": "Could not save the speaker marking.",
+            "cleared_confirmation_from": cleared_from,
         }))
         sys.exit(1)
 
@@ -5993,7 +6050,12 @@ def mark_speaker_cluster(
         # "A human kept this generic" is superseded by "a human says it is
         # several people". Clear it only after the stronger marking is safe.
         clear_cluster_review_state(
-            output_dir, meeting_stem, channel, fragment_ids, expected_run_id,
+            output_dir,
+            meeting_stem,
+            channel,
+            fragment_ids,
+            current_run_token,
+            lock_held=True,
         )
         # Derive the readable artefacts from durable state on every attempt.
         # A previous attempt can commit profile cleanup and then fail its

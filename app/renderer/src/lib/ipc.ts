@@ -996,6 +996,7 @@ export interface StenoaiBridge {
   version: number;
 
   app: {
+    platform: 'darwin' | 'linux' | 'win32';
     getVersion: RequestFn<[], AppVersionResponse>;
   };
 

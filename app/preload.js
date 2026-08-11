@@ -10,6 +10,11 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const VERSION = 1;
+const rendererPlatformOverride =
+  process.env.STENOAI_E2E === '1'
+  && ['darwin', 'linux', 'win32'].includes(process.env.STENOAI_E2E_RENDERER_PLATFORM)
+    ? process.env.STENOAI_E2E_RENDERER_PLATFORM
+    : null;
 
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
 const send = (channel, ...args) => ipcRenderer.send(channel, ...args);
@@ -57,6 +62,7 @@ const stenoai = {
   version: VERSION,
 
   app: {
+    platform: rendererPlatformOverride || process.platform,
     getVersion: () => invoke('get-app-version'),
   },
 

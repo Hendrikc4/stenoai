@@ -135,8 +135,12 @@ public enum ModelReadiness {
             return false
         }
         return requiredArtifactRelativePaths(for: relativePath).allSatisfy { artifact in
-            let path = url.appendingPathComponent(artifact, isDirectory: false).path
+            let path = url
+                .appendingPathComponent(artifact, isDirectory: false)
+                .resolvingSymlinksInPath()
+                .path
             guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  attributes[.type] as? FileAttributeType == .typeRegular,
                   let size = attributes[.size] as? NSNumber else {
                 return false
             }

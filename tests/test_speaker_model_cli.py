@@ -51,6 +51,32 @@ class SpeakerModelCliTests(unittest.TestCase):
         self.assertEqual(payload["error"], "Speaker diarization model setup failed")
         self.assertNotIn("download failed", result.output)
 
+    def test_prepare_accepts_coreml_diagnostics_around_json(self):
+        payload = {
+            "ready": True,
+            "cache_directory": "/private/tmp/isolated/models/speaker-diarization",
+            "required_models": ["sortformer/example.mlmodelc"],
+            "missing_models": [],
+        }
+        sidecar_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "E5RT encountered an STL exception. msg = unordered_map::at: key not found."
+                + json.dumps(payload)
+                + "\nMetal teardown warning\n"
+            ),
+            stderr="steno-diarize: preparing speaker diarization models\n",
+        )
+        with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
+             patch("subprocess.run", return_value=sidecar_result):
+            result = CliRunner().invoke(simple_recorder.prepare_speaker_models)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output), {"success": True, **payload})
+        self.assertNotIn("E5RT", result.output)
+        self.assertNotIn("Metal", result.output)
+
     def test_status_without_sidecar_is_structured(self):
         with patch("src.transcriber._resolve_steno_diarize", return_value=None):
             result = CliRunner().invoke(simple_recorder.speaker_model_status)

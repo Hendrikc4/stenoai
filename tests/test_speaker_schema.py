@@ -2,7 +2,7 @@ import math
 import unittest
 
 from src.speaker_schema import validate_display_name, validate_embedding, validate_meeting_stem
-from src.speaker_suggestions import speakers_sidecar_path
+from src.speaker_suggestions import speakers_sidecar_path, write_speakers_sidecar
 from src.voiceprint import cosine_distance
 
 
@@ -22,9 +22,10 @@ class SpeakerSchemaTests(unittest.TestCase):
             [math.nan] * 256,
             [math.inf] * 256,
             ["not-a-number"] * 256,
+            [10**10000] * 256,
         )
         for value in invalid:
-            with self.subTest(kind=repr(value[:1])):
+            with self.subTest(kind=type(value[0]).__name__ if value else "empty"):
                 with self.assertRaises(ValueError):
                     validate_embedding(value)
 
@@ -44,6 +45,14 @@ class SpeakerSchemaTests(unittest.TestCase):
     def test_sidecar_path_rejects_a_stem_outside_the_output_directory(self):
         with self.assertRaises(ValueError):
             speakers_sidecar_path(self.temp_dir, "../private")
+
+    def test_sidecar_writer_rejects_unknown_channels(self):
+        with self.assertRaises(ValueError):
+            write_speakers_sidecar(
+                self.temp_dir,
+                "meeting",
+                {"left": {"recording_type": "unknown", "clusters": {}}},
+            )
 
     def test_distance_rejects_mismatched_or_malformed_vectors(self):
         for left, right in (

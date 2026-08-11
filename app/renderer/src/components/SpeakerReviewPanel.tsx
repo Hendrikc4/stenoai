@@ -68,6 +68,7 @@ function foldPersonName(value: string): string {
   return value
     .trim()
     .normalize('NFKC')
+    .replace(/\s+/gu, ' ')
     .toLowerCase()
     .replaceAll('ß', 'ss')
     .replaceAll('ς', 'σ');

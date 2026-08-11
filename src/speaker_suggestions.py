@@ -53,7 +53,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.voiceprint import cosine_distance
-from src.speaker_schema import validate_meeting_stem
+from src.speaker_schema import VALID_CHANNELS, validate_embedding, validate_meeting_stem
 
 logger = logging.getLogger(__name__)
 
@@ -691,6 +691,8 @@ def write_speakers_sidecar(
     run, and re-minting on every write would make a stale review-state
     key (added in a later slice) look current when the clusters it was
     reviewed against never changed."""
+    if not isinstance(channels, dict) or any(channel not in VALID_CHANNELS for channel in channels):
+        raise ValueError("Invalid speaker channel.")
     payload = {
         "meeting_id": meeting_stem,
         "created_at": time.time(),
@@ -791,6 +793,7 @@ def count_review_markings(sidecar: Optional[dict]) -> dict:
 def set_cluster_multi_speaker(
     output_dir: Path, meeting_stem: str, channel: str,
     diarization_speaker_id: str, marked: bool, expected_run_id: Optional[str] = None,
+    *, lock_held: bool = False,
 ) -> Optional[dict]:
     """Set/clear the marking on ONE raw cluster, rewriting the sidecar in
     place (read-modify-write, atomic temp+rename -- the sidecar carries the
@@ -812,6 +815,7 @@ def set_cluster_multi_speaker(
             if marked
             else cluster.pop(MULTI_SPEAKER_KEY, None)
         ),
+        lock_held=lock_held,
     )
 
 
@@ -895,6 +899,8 @@ def _mutate_cluster(
     diarization_speaker_id: str,
     expected_run_id: Optional[str],
     mutation,
+    *,
+    lock_held: bool = False,
 ) -> Optional[dict]:
     """Mutate one cluster while holding the meeting sidecar lock."""
     from src.speaker_sidecar_store import SpeakerSidecarStore
@@ -913,8 +919,10 @@ def _mutate_cluster(
         mutation(cluster)
 
     try:
+        if lock_held:
+            return store.mutate_locked(meeting_stem, expected_run_id, apply)
         return store.mutate(meeting_stem, expected_run_id, apply)
-    except (FileNotFoundError, KeyError):
+    except (FileNotFoundError, KeyError, ValueError):
         return None
 
 
@@ -924,6 +932,8 @@ def clear_cluster_review_state(
     channel: str,
     diarization_speaker_ids,
     expected_run_id: Optional[str] = None,
+    *,
+    lock_held: bool = False,
 ) -> int:
     """Drop the review marking from a whole set of raw cluster ids in one
     write. Returns how many actually carried it.
@@ -959,13 +969,22 @@ def clear_cluster_review_state(
     if document is None:
         return 0
     try:
-        store.mutate(meeting_stem, expected_run_id, apply)
+        if lock_held:
+            store.mutate_locked(meeting_stem, expected_run_id, apply)
+        else:
+            store.mutate(meeting_stem, expected_run_id, apply)
     except (FileNotFoundError, KeyError, OSError, StaleDiarizationRun):
         return 0
     return cleared
 
 
-def write_sidecar_document(output_dir: Path, meeting_stem: str, sidecar: dict) -> None:
+def write_sidecar_document(
+    output_dir: Path,
+    meeting_stem: str,
+    sidecar: dict,
+    *,
+    acquire_lock: bool = True,
+) -> None:
     """Replace a meeting's whole sidecar document atomically.
 
     A UNIQUE temp name, unlike the fixed "<name>.tmp" the relabel helpers
@@ -978,6 +997,19 @@ def write_sidecar_document(output_dir: Path, meeting_stem: str, sidecar: dict) -
     Same directory as the target so the replace stays a rename within one
     filesystem, which is what makes it atomic.
     """
+    if acquire_lock:
+        from src.speaker_sidecar_store import SpeakerSidecarStore
+
+        store = SpeakerSidecarStore(output_dir)
+        with store.lock(meeting_stem):
+            write_sidecar_document(
+                output_dir,
+                meeting_stem,
+                sidecar,
+                acquire_lock=False,
+            )
+        return
+
     path = speakers_sidecar_path(output_dir, meeting_stem)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp",
@@ -1057,8 +1089,11 @@ def minimum_speaker_count(channels: dict) -> int:
         if not raw:
             continue
         try:
+            parsed = clusters_from_sidecar_channel("", channel_data)
+            if len(parsed) != len(raw):
+                raise ValueError("Some speaker clusters have no usable embedding.")
             merged, _id_resolution = merge_same_channel_fragments(
-                clusters_from_sidecar_channel("", channel_data)
+                parsed
             )
             groups = [[sid, *ctx.merged_from] for sid, (_emb, ctx) in merged.items()]
         except (KeyError, TypeError, ValueError):
@@ -1094,8 +1129,15 @@ def clusters_from_sidecar_channel(meeting_id: str, channel: dict) -> dict:
     recording_type = channel.get("recording_type", "unknown")
     out = {}
     for sid, cluster in (channel.get("clusters") or {}).items():
+        try:
+            embedding = validate_embedding(
+                cluster["embedding"],
+                expected_dimension=None,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError("Speaker sidecar contains an invalid cluster embedding.") from error
         out[sid] = (
-            cluster["embedding"],
+            embedding,
             ClusterContext(
                 meeting_id=meeting_id,
                 diarization_speaker_id=sid,
@@ -1368,6 +1410,7 @@ def _is_generic_transcript_label(label: str) -> bool:
 
 def record_original_labels(
     output_dir: Path, meeting_stem: str, transcript_path: Path, target_ids: set,
+    *, lock_held: bool = False,
 ) -> int:
     """Remember, per manifest entry, what label a line carried BEFORE a
     confirmation renames it. Returns how many entries were newly recorded.
@@ -1389,8 +1432,25 @@ def record_original_labels(
     entry without the key simply has nothing recorded, which is the state
     of every meeting confirmed before this existed.
     """
+    if not lock_held:
+        import filelock
+        from src.speaker_sidecar_store import SpeakerSidecarStore
+
+        store = SpeakerSidecarStore(output_dir)
+        try:
+            with store.lock(meeting_stem):
+                return record_original_labels(
+                    output_dir,
+                    meeting_stem,
+                    transcript_path,
+                    target_ids,
+                    lock_held=True,
+                )
+        except (filelock.Timeout, OSError):
+            return 0
+
     sidecar = read_speakers_sidecar(output_dir, meeting_stem)
-    if sidecar is None:
+    if not isinstance(sidecar, dict):
         return 0
     manifest = sidecar.get("transcript_lines")
     if not manifest or not target_ids or not transcript_path.exists():
@@ -1421,7 +1481,12 @@ def record_original_labels(
         recorded += 1
 
     if recorded:
-        write_sidecar_document(output_dir, meeting_stem, sidecar)
+        write_sidecar_document(
+            output_dir,
+            meeting_stem,
+            sidecar,
+            acquire_lock=False,
+        )
     return recorded
 
 

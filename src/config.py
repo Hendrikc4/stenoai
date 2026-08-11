@@ -24,7 +24,7 @@ import filelock
 
 from src.whisper_models import SUPPORTED_WHISPER_MODELS as _WHISPER_REGISTRY
 from src import templates as _templates
-from src.speaker_schema import validate_display_name
+from src.speaker_schema import validate_display_name, validate_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -1169,6 +1169,10 @@ class Config:
         new one demotes any previous self voiceprint to a regular (named)
         one. Ported from StoredSpeaker/SpeakerMatcher.applyConfirmation.
         """
+        # Persistence is dimension-agnostic so profiles can be migrated to a
+        # future embedder. Current diarizer payloads are still pinned to 256
+        # at their ingestion boundary in src.transcriber.
+        embedding = validate_embedding(embedding, expected_dimension=None)
         before = copy.deepcopy(self._config)
         voiceprints = self._config.setdefault("voiceprints", [])
         if is_self:
@@ -1289,7 +1293,7 @@ class Config:
                 continue
             try:
                 numbers = [float(item) for item in embedding]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if not all(math.isfinite(item) for item in numbers):
                 continue
@@ -1527,6 +1531,9 @@ class Config:
             raise ValueError(f"Invalid created_from: {created_from}")
         if channel is not None and channel not in self.VALID_PROTOTYPE_CHANNELS:
             raise ValueError(f"Invalid channel: {channel}")
+        # See save_voiceprint: validate numeric/finite/non-zero here, while
+        # the active model's exact dimension is enforced at ingestion.
+        embedding = validate_embedding(embedding, expected_dimension=None)
 
         owned_transaction = self._transaction_backup is None
         if owned_transaction and not self.begin_transaction():
@@ -1540,7 +1547,7 @@ class Config:
         prototype = {
             "prototype_id": str(uuid.uuid4()),
             "person_id": person_id,
-            "embedding_mean": list(embedding),
+            "embedding_mean": embedding,
             "sample_count": 1,
             "quality_score": self._prototype_quality_score(speech_duration_seconds, segment_count),
             "recording_type": recording_type,
@@ -1597,9 +1604,16 @@ class Config:
                 by_meeting.setdefault(entry.get("meeting_id"), []).append(entry)
 
             def rank(entry):
+                def finite_number(value) -> float:
+                    try:
+                        number = float(value or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        return float("-inf")
+                    return number if math.isfinite(number) else float("-inf")
+
                 return (
-                    float(entry.get("quality_score") or 0.0),
-                    float(entry.get("created_at") or 0.0),
+                    finite_number(entry.get("quality_score")),
+                    finite_number(entry.get("created_at")),
                     str(entry.get("prototype_id") or ""),
                 )
 
@@ -1620,11 +1634,7 @@ class Config:
                 if (entry.get("recording_type"), entry.get("channel")) == context
             ]
             if context_retained:
-                retained.remove(min(context_retained, key=lambda entry: (
-                    float(entry.get("quality_score") or 0.0),
-                    float(entry.get("created_at") or 0.0),
-                    str(entry.get("prototype_id") or ""),
-                )))
+                retained.remove(min(context_retained, key=rank))
             retained.append(preserved)
         entries[:] = retained
 

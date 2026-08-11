@@ -1361,6 +1361,12 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     cfg=cfg,
                 )
             self.assertFalse(_last_json(first.output)["success"])
+            self.assertIn("Person Alpha", transcript.read_text())
+            self.assertIn("Person Alpha", summary.read_text())
+            self.assertEqual(
+                _last_json(first.output).get("cleared_confirmation_from"),
+                ["Person Alpha"],
+            )
 
             retry = self._run(
                 simple_recorder.mark_speaker_cluster,
@@ -2025,6 +2031,7 @@ class SetClusterReviewStateCliTests(unittest.TestCase):
         # a traceback reaches the UI as "something went wrong", with the
         # actual state unreported.
         broken = [
+            ["not-a-dict"],
             {"channels": ["not-a-dict"]},
             {"channels": {"system": ["not-a-dict"]}},
             {"channels": {"system": {"clusters": ["not-a-dict"]}}},
@@ -2105,6 +2112,7 @@ class PersistSidecarReportsLostMarkingsTests(unittest.TestCase):
             with mock.patch("simple_recorder.logger") as log:
                 simple_recorder._persist_speaker_sidecar(output_dir, "mtg001", self._FRESH_RUN)
             self.assertEqual(log.warning.call_args_list, [])
+
     def test_a_first_run_with_no_previous_sidecar_reports_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "output"
@@ -2113,6 +2121,21 @@ class PersistSidecarReportsLostMarkingsTests(unittest.TestCase):
                 self.assertTrue(
                     simple_recorder._persist_speaker_sidecar(output_dir, "mtg001", self._FRESH_RUN))
             self.assertEqual(log.warning.call_args_list, [])
+
+    def test_a_sidecar_write_failure_does_not_fail_the_meeting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch(
+                "src.speaker_suggestions.write_speakers_sidecar",
+                side_effect=OSError("lock timed out"),
+            ), mock.patch("simple_recorder.logger") as log:
+                written = simple_recorder._persist_speaker_sidecar(
+                    output_dir, "private-meeting-title", self._FRESH_RUN,
+                )
+
+            self.assertFalse(written)
+            self.assertNotIn("private-meeting-title", str(log.warning.call_args_list))
 
 
 if __name__ == '__main__':

@@ -120,4 +120,8 @@ describe('namesCollide', () => {
   it('normalizes compatibility and surrounding whitespace', () => {
     expect(namesCollide('  Person Ａ  ', 'person a')).toBe(true);
   });
+
+  it('collapses repeated internal whitespace like the backend', () => {
+    expect(namesCollide('Person   Alpha', 'person alpha')).toBe(true);
+  });
 });

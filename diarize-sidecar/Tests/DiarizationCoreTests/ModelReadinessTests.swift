@@ -42,21 +42,72 @@ struct ModelReadinessTests {
 
     @Test("Readiness paths match FluidAudio's cache folders")
     func cacheFolderContract() {
-        #expect(ModelReadiness.requiredModelRelativePaths.contains(
-            "speaker-diarization/pyannote_segmentation.mlmodelc"
-        ))
-        #expect(ModelReadiness.requiredModelRelativePaths.contains(
-            "speaker-diarization/wespeaker_v2.mlmodelc"
-        ))
-        #expect(!ModelReadiness.requiredModelRelativePaths.contains(
-            "diarizer/pyannote_segmentation.mlmodelc"
-        ))
-        for relativePath in ModelReadiness.requiredModelRelativePaths {
-            #expect(
-                ModelReadiness.requiredArtifactRelativePaths(for: relativePath)
-                    == expectedArtifacts(for: relativePath)
-            )
-        }
+        let sortformerArtifacts = [
+            "coremldata.bin", "metadata.json", "model0/model.mil",
+            "model0/weights/0-weight.bin", "model1/model.mil",
+            "model1/weights/1-weight.bin",
+        ]
+        let diarizerArtifacts = [
+            "coremldata.bin", "metadata.json", "model.mil", "weights/weight.bin",
+        ]
+        #expect(ModelReadiness.requiredModelRelativePaths == [
+            "sortformer/Sortformer_v2.1.mlmodelc",
+            "sortformer/SortformerNvidiaHigh_v2.mlmodelc",
+            "speaker-diarization/pyannote_segmentation.mlmodelc",
+            "speaker-diarization/wespeaker_v2.mlmodelc",
+        ])
+        #expect(ModelReadiness.requiredArtifactRelativePaths(
+            for: "sortformer/Sortformer_v2.1.mlmodelc"
+        ) == sortformerArtifacts)
+        #expect(ModelReadiness.requiredArtifactRelativePaths(
+            for: "sortformer/SortformerNvidiaHigh_v2.mlmodelc"
+        ) == sortformerArtifacts)
+        #expect(ModelReadiness.requiredArtifactRelativePaths(
+            for: "speaker-diarization/pyannote_segmentation.mlmodelc"
+        ) == diarizerArtifacts)
+        #expect(ModelReadiness.requiredArtifactRelativePaths(
+            for: "speaker-diarization/wespeaker_v2.mlmodelc"
+        ) == diarizerArtifacts)
+    }
+
+    @Test("A directory in place of a required artifact is not ready")
+    func directoryArtifactIsMissing() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("steno-model-directory-artifact-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createCompleteCache(at: root)
+        let model = root.appendingPathComponent(
+            ModelReadiness.requiredModelRelativePaths[0], isDirectory: true
+        )
+        let artifact = model.appendingPathComponent("metadata.json")
+        try FileManager.default.removeItem(at: artifact)
+        try FileManager.default.createDirectory(at: artifact, withIntermediateDirectories: true)
+
+        let result = ModelReadiness.status(cacheDirectory: root)
+
+        #expect(result.ready == false)
+        #expect(result.missingModels == [ModelReadiness.requiredModelRelativePaths[0]])
+    }
+
+    @Test("A required artifact may be a symlink to a regular file")
+    func symlinkArtifactIsReady() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("steno-model-symlink-artifact-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createCompleteCache(at: root)
+        let model = root.appendingPathComponent(
+            ModelReadiness.requiredModelRelativePaths[0], isDirectory: true
+        )
+        let artifact = model.appendingPathComponent("metadata.json")
+        let target = root.appendingPathComponent("shared-metadata.json")
+        try Data([0x01]).write(to: target)
+        try FileManager.default.removeItem(at: artifact)
+        try FileManager.default.createSymbolicLink(at: artifact, withDestinationURL: target)
+
+        let result = ModelReadiness.status(cacheDirectory: root)
+
+        #expect(result.ready == true)
+        #expect(result.missingModels.isEmpty)
     }
 
     @Test("A missing cache is reported without creating it")
