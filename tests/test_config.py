@@ -849,9 +849,9 @@ class ConfigPersonProfileTests(unittest.TestCase):
 
     def test_pruning_tolerates_malformed_persisted_rank_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            config = Config(config_path=Path(tmp_dir) / "config.json")
+            config_path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=config_path)
             person = config.create_person_profile("Person Gamma")
-            mutable = config._get_person_profile_mutable(person["person_id"])
             malformed = {
                 "prototype_id": "damaged",
                 "person_id": person["person_id"],
@@ -860,14 +860,21 @@ class ConfigPersonProfileTests(unittest.TestCase):
                 "channel": "mic",
                 "meeting_id": "old-meeting",
                 "quality_score": "not-a-number",
-                "created_at": 10**10000,
+                "created_at": [],
             }
-            mutable["prototypes"] = [
-                {**malformed, "prototype_id": f"damaged-{index}"}
+            malformed_ids = [
+                f"damaged-{index}"
                 for index in range(Config.MAX_PROTOTYPES_PER_CONTEXT + 6)
             ]
+            document = json.loads(config_path.read_text())
+            document["person_profiles"][0]["prototypes"] = [
+                {**malformed, "prototype_id": prototype_id}
+                for prototype_id in malformed_ids
+            ]
+            config_path.write_text(json.dumps(document))
+            persisted_before = json.loads(config_path.read_text())
             self.assertGreater(
-                len(mutable["prototypes"]),
+                len(persisted_before["person_profiles"][0]["prototypes"]),
                 Config.MAX_PROTOTYPES_PER_CONTEXT,
             )
 
@@ -879,12 +886,18 @@ class ConfigPersonProfileTests(unittest.TestCase):
             )
 
             self.assertIsNotNone(result)
-            retained = config._get_person_profile_mutable(
-                person["person_id"]
-            )["prototypes"]
+            persisted_after = json.loads(config_path.read_text())
+            retained = persisted_after["person_profiles"][0]["prototypes"]
+            retained_ids = {entry["prototype_id"] for entry in retained}
+            self.assertEqual(len(retained), Config.MAX_PROTOTYPES_PER_CONTEXT)
+            self.assertIn(result["prototype_id"], retained_ids)
             self.assertEqual(
-                [entry["prototype_id"] for entry in retained],
-                [result["prototype_id"]],
+                retained_ids - {result["prototype_id"]},
+                set(
+                    sorted(malformed_ids, reverse=True)[
+                        :Config.MAX_PROTOTYPES_PER_CONTEXT - 1
+                    ]
+                ),
             )
 
     def test_get_person_profiles_persists_across_reload(self):

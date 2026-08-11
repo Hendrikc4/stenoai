@@ -164,6 +164,8 @@ describe('useBlobAudioPlayback', () => {
 
     firstPlay.reject(new Error('stale failure'));
     await act(() => staleToggle);
+    expect(first.result.current.playingKey).toBe('cluster-2');
+
     await act(() => second.result.current.toggle('excerpt-3'));
 
     expect(FakeAudio.instances).toHaveLength(3);
