@@ -22,18 +22,22 @@ export const speakersKeys = {
     [...speakersKeys.all, 'suggestions', meetingStem ?? null] as const,
 };
 
-export function usePersonProfiles() {
+export function usePersonProfiles(enabled = true) {
   return useQuery({
     queryKey: speakersKeys.profiles(),
     queryFn: async () => unwrap(await ipc().speakers.listProfiles()).person_profiles,
+    enabled,
   });
 }
 
-export function useSpeakerSuggestions(meetingStem: string | null | undefined) {
+export function useSpeakerSuggestions(
+  meetingStem: string | null | undefined,
+  enabled = true,
+) {
   return useQuery({
     queryKey: speakersKeys.suggestions(meetingStem),
     queryFn: async () => unwrap(await ipc().speakers.suggestForMeeting(meetingStem as string)),
-    enabled: Boolean(meetingStem),
+    enabled: Boolean(meetingStem) && enabled,
   });
 }
 
@@ -41,6 +45,7 @@ interface ConfirmSpeakerArgs {
   meetingStem: string;
   channel: string;
   diarizationSpeakerId: string;
+  expectedRunId: string;
   personId?: string;
   newPersonName?: string;
   /** The meeting's summaryFile, so a successful relabel invalidates the
@@ -59,6 +64,7 @@ export function useConfirmSpeaker() {
           meetingStem: args.meetingStem,
           channel: args.channel,
           diarizationSpeakerId: args.diarizationSpeakerId,
+          expectedRunId: args.expectedRunId,
           personId: args.personId,
           newPersonName: args.newPersonName,
         }),
@@ -128,6 +134,7 @@ export function useGetSpeakerSampleAudio() {
       meetingStem: string;
       channel: string;
       diarizationSpeakerId: string;
+      expectedRunId: string;
       /** Index into the row's `samples`. Omitted plays the longest turn
        * (the collapsed row's single button); a number plays exactly that
        * excerpt, so the audio matches the text it sits next to. */
@@ -135,7 +142,11 @@ export function useGetSpeakerSampleAudio() {
     }) =>
       unwrap(
         await ipc().speakers.getSampleAudio(
-          args.meetingStem, args.channel, args.diarizationSpeakerId, args.segmentIndex,
+          args.meetingStem,
+          args.channel,
+          args.diarizationSpeakerId,
+          args.expectedRunId,
+          args.segmentIndex,
         ),
       ),
   });
@@ -164,6 +175,7 @@ export function useMarkSpeakerCluster() {
       meetingStem: string;
       channel: string;
       diarizationSpeakerId: string;
+      expectedRunId: string;
       containsMultipleSpeakers: boolean;
       /** The meeting's summaryFile, carried for the same reason the confirm
        * mutation carries it: marking a CONFIRMED cluster withdraws that
@@ -199,6 +211,7 @@ export function useSetClusterReviewState() {
       meetingStem: string;
       channel: string;
       diarizationSpeakerId: string;
+      expectedRunId: string;
       generic: boolean;
     }) => unwrap(await ipc().speakers.setClusterReviewState(args)),
     onSuccess: async (_data, args) => {

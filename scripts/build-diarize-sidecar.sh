@@ -23,6 +23,7 @@ swift build \
 
 BUILD_BIN="$PKG/.build/${ARCH}-apple-macosx/release/diarize-sidecar"
 cp "$BUILD_BIN" "$OUT"
+test -x "$OUT"
 
 # Ad-hoc signature so the binary runs locally; CI re-signs with the Developer
 # ID when packaging the .app bundle.

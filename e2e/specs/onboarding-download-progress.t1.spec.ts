@@ -73,3 +73,30 @@ test('transcription step renders an indeterminate "preparing" bar (no fabricated
   // No fabricated percentage on the indeterminate bar.
   await expect(bar.getByText('%')).toHaveCount(0);
 });
+
+test('optional speaker model failure does not block the rest of onboarding', async ({
+  launchApp,
+}) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_MOCK_PARAKEET_INSTALLED: '1',
+      STENOAI_E2E_SPEAKER_MODEL_FAILURE: '1',
+    },
+  });
+
+  await page.evaluate(() => {
+    window.location.hash = '#/setup';
+  });
+  await page.getByRole('button', { name: 'Begin setup' }).click();
+
+  await expect(page.locator('[data-setup-step="speakers"]')).toHaveAttribute(
+    'data-setup-status',
+    'failed',
+  );
+  await expect(page.locator('[data-setup-step="ollama"]')).toHaveAttribute(
+    'data-setup-status',
+    'done',
+  );
+  await expect(page.getByRole('button', { name: 'Continue to app' })).toBeVisible();
+});

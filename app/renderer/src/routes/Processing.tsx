@@ -356,10 +356,13 @@ export function Processing() {
     if (generation === prevGenRef.current) return;
     prevGenRef.current = generation;
     pendingChunkRef.current = '';
+    clearDiarizeTimer();
+    diarizeStartedAtRef.current = null;
+    diarizeHasPercentRef.current = false;
     sawActivityRef.current = false;
     idleEmptyRef.current = false;
     setGaveUp(false);
-  }, [generation, setGaveUp]);
+  }, [generation, setGaveUp, clearDiarizeTimer]);
 
   React.useEffect(() => {
     let idleTicks = 0;

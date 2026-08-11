@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  channelClusterCapacity,
   isKeptGeneric,
   showsKeepGenericButton,
   showsNamingActions,
@@ -45,6 +46,29 @@ describe('shouldShowSpeakerReview', () => {
   it('waits for a meeting stem and a completed suggestion response', () => {
     expect(shouldShowSpeakerReview(null, true, true, 2)).toBe(false);
     expect(shouldShowSpeakerReview('meeting', true, false, 2)).toBe(false);
+  });
+});
+
+describe('channelClusterCapacity', () => {
+  it('uses the largest channel rather than summing possible duplicate voices', () => {
+    expect(channelClusterCapacity({
+      system: { one: suggestion(), two: suggestion() },
+      mic: { one: suggestion() },
+    })).toBe(2);
+  });
+
+  it('uses the same channel that establishes the highest speaker minimum', () => {
+    expect(channelClusterCapacity({
+      mic: {
+        one: suggestion(),
+        two: suggestion(),
+        three: suggestion(),
+      },
+      system: {
+        one: suggestion({ contains_multiple_speakers: true }),
+        two: suggestion({ contains_multiple_speakers: true }),
+      },
+    })).toBe(2);
   });
 });
 

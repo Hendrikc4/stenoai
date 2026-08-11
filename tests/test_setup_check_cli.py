@@ -82,6 +82,19 @@ class SetupCheckJsonTests(unittest.TestCase):
             res.output,
         )
 
+    def test_missing_optional_speaker_models_are_a_warning(self):
+        with patch(
+            "simple_recorder._run_speaker_model_command",
+            return_value={"success": True, "ready": False},
+        ):
+            res = CliRunner().invoke(simple_recorder.setup_check, ["--json"])
+
+        self.assertEqual(res.exit_code, 0, res.output)
+        data = _only_json(res.output)
+        speaker = next(c for c in data["checks"] if c["name"] == "speaker-diarization-model")
+        self.assertEqual(speaker["status"], "warn")
+        self.assertTrue(speaker["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

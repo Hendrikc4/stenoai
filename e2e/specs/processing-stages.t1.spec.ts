@@ -85,11 +85,26 @@ test('walks transcribing -> diarizing (with embedding sub-progress) -> summarizi
   await expect(label).toHaveText('Merging summaries…');
 
   // The bug this spec exists to catch: chunkProgress used to persist
-  // unconditionally across stage transitions, so a stale sub-label (here,
-  // "Merging summaries…") could leak into 'finalizing'.
+  // Finalizing always renders its own fixed label. The retry-path test below
+  // covers stale dynamic sub-label cleanup where it is observable.
   await emit(app, 'summary-complete', { success: true, sessionName: 'test-session' });
   await expect(label).toHaveText('Almost done…');
   await expect(label).toHaveAttribute('data-stage', 'finalizing');
+});
+
+test('a new processing generation cannot inherit the previous diarization timer', async ({ launchApp }) => {
+  const { app, page } = await launchApp({ mockIpc: true, fakeAudio: true });
+  await openProcessing(page);
+
+  const label = page.getByTestId('processing-stage-label');
+  await emit(app, 'processing-progress', { line: 'PROGRESS:diarize:You:start' });
+  await expect(label).toHaveText('Diarizing You channel…');
+
+  await page.evaluate(() => window.stenoai.recording.start('second-session'));
+  await expect(page.getByRole('heading', { name: 'second-session' })).toBeVisible();
+  await expect(label).toHaveText('Analyzing transcript');
+  await page.waitForTimeout(1_200);
+  await expect(label).toHaveText('Analyzing transcript');
 });
 
 test('shows a ticking elapsed-time counter during segmentation, before any embedding percentage arrives', async ({ launchApp }) => {

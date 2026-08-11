@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { orderProfilesForRow, filterProfilesByQuery } from './SpeakerReviewPanel';
+import { namesCollide, orderProfilesForRow, filterProfilesByQuery } from './SpeakerReviewPanel';
 
 const p = (display_name: string) => ({ display_name, person_id: `id-${display_name.toLowerCase()}` });
 
@@ -108,5 +108,16 @@ describe('filterProfilesByQuery', () => {
     const input = [p('Zoe'), p('Alice')];
     filterProfilesByQuery(input, 'zoe');
     expect(input.map((x) => x.display_name)).toEqual(['Zoe', 'Alice']);
+  });
+});
+
+describe('namesCollide', () => {
+  it('matches common Unicode case-fold equivalents used by the backend', () => {
+    expect(namesCollide('Straße', 'STRASSE')).toBe(true);
+    expect(namesCollide('ΟΣ', 'ος')).toBe(true);
+  });
+
+  it('normalizes compatibility and surrounding whitespace', () => {
+    expect(namesCollide('  Person Ａ  ', 'person a')).toBe(true);
   });
 });

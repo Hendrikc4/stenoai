@@ -279,9 +279,10 @@ jobs:
       # to PyInstaller's internal layout (e.g. the _internal/ contents dir).
       - name: Restore exec bits on bundled binaries
         run: |
-          find dist/stenoai -type f \( -name stenoai -o -name ffmpeg -o -name ollama \) \
+          find dist/stenoai -type f \( -name stenoai -o -name ffmpeg -o -name ollama -o -name steno-diarize \) \
             -exec chmod +x {} +
           test -x dist/stenoai/stenoai  # fail loud if the launcher didn't get +x
+          test -x dist/stenoai/_internal/steno-diarize
 
       # The app probes 11434 and skips its own `ollama serve` on a 200, so a real
       # Ollama on the runner would answer instead of a test stub. Kill it first
@@ -344,9 +345,10 @@ jobs:
 
       - name: Restore exec bits on bundled binaries
         run: |
-          find dist/stenoai -type f \( -name stenoai -o -name ffmpeg -o -name ollama \) \
+          find dist/stenoai -type f \( -name stenoai -o -name ffmpeg -o -name ollama -o -name steno-diarize \) \
             -exec chmod +x {} +
           test -x dist/stenoai/stenoai
+          test -x dist/stenoai/_internal/steno-diarize
 
       - name: Ensure no stray Ollama
         run: pkill -f ollama || true

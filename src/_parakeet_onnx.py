@@ -507,15 +507,9 @@ def _transcribe_windows(ts_model: Any, samples) -> _SimpleResult:
             if start + chunk_samples >= len(samples):
                 break
             continue
-        windows_recognized += 1
-        # Liveness signal for the Electron inactivity watchdog — a long
-        # meeting recognising window-by-window on CPU is alive, not hung.
-        # Failed windows emit nothing (they skip via `continue` above, and
-        # failing fast costs little liveness); emitting ``windows_attempted``
-        # means `done` jumps past them on the next success, so the counter
-        # still tracks position in the file rather than just successes.
+        # The model returned, so the backend is alive even if this payload is
+        # malformed and cannot count toward transcript coverage.
         _emit_heartbeat(windows_attempted, total_windows)
-
         tokens = list(getattr(result, "tokens", None) or [])
         timestamps = list(getattr(result, "timestamps", None) or [])
         if len(tokens) != len(timestamps):
@@ -529,6 +523,7 @@ def _transcribe_windows(ts_model: Any, samples) -> _SimpleResult:
                 break
             continue
 
+        windows_recognized += 1
         for tok, ts in zip(tokens, timestamps):
             g_start = _ts_start(ts) + chunk_start_s
             g_end = _ts_end(ts) + chunk_start_s

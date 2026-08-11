@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.voiceprint import cosine_distance
+from src.speaker_schema import validate_meeting_stem
 
 logger = logging.getLogger(__name__)
 
@@ -301,15 +302,28 @@ def score_candidates(embedding: list, context: ClusterContext, profiles: list) -
     candidates = []
     for person in profiles:
         pool = _prototype_pool(person, context.recording_type)
-        if not pool:
+        distances = []
+        usable_pool = []
+        for prototype in pool:
+            try:
+                distances.append(cosine_distance(embedding, prototype.get("embedding_mean")))
+                usable_pool.append(prototype)
+            except (TypeError, ValueError):
+                continue
+        if not distances:
             continue
-        distance = min(cosine_distance(embedding, p["embedding_mean"]) for p in pool)
+        distance = min(distances)
 
         negatives = person.get("hard_negatives") or []
-        negative_distance = (
-            min(cosine_distance(embedding, n["embedding_mean"]) for n in negatives)
-            if negatives else None
-        )
+        negative_distances = []
+        for negative in negatives:
+            try:
+                negative_distances.append(
+                    cosine_distance(embedding, negative.get("embedding_mean"))
+                )
+            except (TypeError, ValueError):
+                continue
+        negative_distance = min(negative_distances) if negative_distances else None
         hard_negative_conflict = (
             negative_distance is not None
             and negative_distance <= HARD_NEGATIVE_DISTANCE_THRESHOLD
@@ -321,14 +335,24 @@ def score_candidates(embedding: list, context: ClusterContext, profiles: list) -
             display_name=person["display_name"],
             distance=distance,
             hard_negative_conflict=hard_negative_conflict,
-            confirmed_meeting_count=len({p.get("meeting_id") for p in pool if p.get("meeting_id")}),
+            confirmed_meeting_count=len({
+                prototype.get("meeting_id")
+                for prototype in usable_pool
+                if prototype.get("meeting_id")
+            }),
             negative_distance=negative_distance,
         ))
     candidates.sort(key=lambda c: c.distance)
     return candidates
 
 
-def suggest_speaker(embedding: list, context: ClusterContext, profiles: list) -> SuggestionResult:
+def suggest_speaker(
+    embedding: list,
+    context: ClusterContext,
+    profiles: list,
+    *,
+    scored_candidates: Optional[list] = None,
+) -> SuggestionResult:
     """Score one diarized cluster against all known people. Never raises —
     an empty/malformed `profiles` list just yields status="none", matching
     src.transcriber._apply_voiceprint_matches's "never fail a meeting"
@@ -349,7 +373,11 @@ def suggest_speaker(embedding: list, context: ClusterContext, profiles: list) ->
             reasons=["marked by a human as containing more than one person"],
         )
 
-    candidates = score_candidates(embedding, context, profiles)
+    candidates = (
+        scored_candidates
+        if scored_candidates is not None
+        else score_candidates(embedding, context, profiles)
+    )
     if not candidates:
         return SuggestionResult(
             diarization_speaker_id=context.diarization_speaker_id,
@@ -450,28 +478,39 @@ def suggest_speakers_for_meeting(
     SuggestionResult}}` covering every input cluster.
     """
     flat = [
-        (channel, sid, embedding, context)
+        (
+            channel,
+            sid,
+            embedding,
+            context,
+            [] if context.contains_multiple_speakers else score_candidates(
+                embedding, context, profiles,
+            ),
+        )
         for channel, clusters in channel_clusters.items()
         for sid, (embedding, context) in clusters.items()
     ]
 
     def _best_distance(entry) -> float:
-        _, _, embedding, context = entry
-        # A mixed cluster never claims a person (suggest_speaker returns
-        # "none" for it), so its blended centroid must not get to sort
-        # ahead of the real clusters and influence assignment order either.
-        if context.contains_multiple_speakers:
-            return float("inf")
-        candidates = score_candidates(embedding, context, profiles)
+        candidates = entry[4]
         return candidates[0].distance if candidates else float("inf")
 
     flat.sort(key=lambda e: (_best_distance(e), e[0], e[1]))
 
     results: dict = {channel: {} for channel in channel_clusters}
     used_person_ids: set = set()
-    for channel, sid, embedding, context in flat:
-        available = [p for p in profiles if p["person_id"] not in used_person_ids]
-        result = suggest_speaker(embedding, context, available)
+    for channel, sid, embedding, context, candidates in flat:
+        available_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.person_id not in used_person_ids
+        ]
+        result = suggest_speaker(
+            embedding,
+            context,
+            profiles=[],
+            scored_candidates=available_candidates,
+        )
         if result.status == "confirmed" and result.suggested_person_id:
             used_person_ids.add(result.suggested_person_id)
         results[channel][sid] = result
@@ -528,7 +567,14 @@ def merge_same_channel_fragments(clusters: dict) -> tuple:
     for i in range(len(sids)):
         for j in range(i + 1, len(sids)):
             a, b = sids[i], sids[j]
-            if cosine_distance(clusters[a][0], clusters[b][0]) <= SAME_MEETING_MERGE_DISTANCE_THRESHOLD:
+            try:
+                close = (
+                    cosine_distance(clusters[a][0], clusters[b][0])
+                    <= SAME_MEETING_MERGE_DISTANCE_THRESHOLD
+                )
+            except (TypeError, ValueError):
+                close = False
+            if close:
                 union(a, b)
 
     groups: dict = {}
@@ -608,7 +654,7 @@ def merge_same_channel_fragments(clusters: dict) -> tuple:
 # numbering -- a mic "SPEAKER_0" and a system "SPEAKER_0" are unrelated.
 
 def speakers_sidecar_path(output_dir: Path, meeting_stem: str) -> Path:
-    return output_dir / f"{meeting_stem}_speakers.json"
+    return output_dir / f"{validate_meeting_stem(meeting_stem)}_speakers.json"
 
 
 def write_speakers_sidecar(
@@ -744,7 +790,7 @@ def count_review_markings(sidecar: Optional[dict]) -> dict:
 
 def set_cluster_multi_speaker(
     output_dir: Path, meeting_stem: str, channel: str,
-    diarization_speaker_id: str, marked: bool,
+    diarization_speaker_id: str, marked: bool, expected_run_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Set/clear the marking on ONE raw cluster, rewriting the sidecar in
     place (read-modify-write, atomic temp+rename -- the sidecar carries the
@@ -755,29 +801,18 @@ def set_cluster_multi_speaker(
     doesn't exist -- callers report that as an error rather than silently
     marking nothing.
     """
-    sidecar, channel_data = _freshest_channel(output_dir, meeting_stem, channel)
-    if sidecar is None:
-        return None
-    cluster = _cluster_entries(channel_data).get(diarization_speaker_id)
-    if not isinstance(cluster, dict):
-        return None
-
-    # The second read, as late as possible before the write -- see
-    # _freshest_channel on the window this closes and the one it leaves.
-    fresh_sidecar, fresh_channel = _freshest_channel(output_dir, meeting_stem, channel)
-    if fresh_sidecar is not None:
-        fresh_cluster = _cluster_entries(fresh_channel).get(diarization_speaker_id)
-        if isinstance(fresh_cluster, dict):
-            sidecar = fresh_sidecar
-            cluster = fresh_cluster
-
-    if marked:
-        cluster[MULTI_SPEAKER_KEY] = True
-    else:
-        cluster.pop(MULTI_SPEAKER_KEY, None)
-
-    write_sidecar_document(output_dir, meeting_stem, sidecar)
-    return sidecar
+    return _mutate_cluster(
+        output_dir,
+        meeting_stem,
+        channel,
+        diarization_speaker_id,
+        expected_run_id,
+        lambda cluster: (
+            cluster.__setitem__(MULTI_SPEAKER_KEY, True)
+            if marked
+            else cluster.pop(MULTI_SPEAKER_KEY, None)
+        ),
+    )
 
 
 def _freshest_channel(output_dir: Path, meeting_stem: str, channel: str) -> tuple:
@@ -825,7 +860,7 @@ def _cluster_entries(channel_data: dict) -> dict:
 
 def set_cluster_review_state(
     output_dir: Path, meeting_stem: str, channel: str,
-    diarization_speaker_id: str, state: Optional[str],
+    diarization_speaker_id: str, state: Optional[str], expected_run_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Set/clear how far the review got on ONE raw cluster.
 
@@ -839,34 +874,56 @@ def set_cluster_review_state(
     sidecar, channel or cluster does not exist -- callers report that rather
     than reporting a mark that never happened.
     """
-    sidecar, channel_data = _freshest_channel(output_dir, meeting_stem, channel)
-    if sidecar is None:
+    return _mutate_cluster(
+        output_dir,
+        meeting_stem,
+        channel,
+        diarization_speaker_id,
+        expected_run_id,
+        lambda cluster: (
+            cluster.pop(REVIEW_STATE_KEY, None)
+            if state is None
+            else cluster.__setitem__(REVIEW_STATE_KEY, state)
+        ),
+    )
+
+
+def _mutate_cluster(
+    output_dir: Path,
+    meeting_stem: str,
+    channel: str,
+    diarization_speaker_id: str,
+    expected_run_id: Optional[str],
+    mutation,
+) -> Optional[dict]:
+    """Mutate one cluster while holding the meeting sidecar lock."""
+    from src.speaker_sidecar_store import SpeakerSidecarStore
+
+    store = SpeakerSidecarStore(output_dir)
+    if expected_run_id is None:
+        initial = store.read(meeting_stem)
+        expected_run_id = store.run_token(initial)
+
+    def apply(document):
+        channels = document.get("channels")
+        channel_data = channels.get(channel) if isinstance(channels, dict) else None
+        cluster = _cluster_entries(channel_data).get(diarization_speaker_id) if isinstance(channel_data, dict) else None
+        if not isinstance(cluster, dict):
+            raise KeyError(diarization_speaker_id)
+        mutation(cluster)
+
+    try:
+        return store.mutate(meeting_stem, expected_run_id, apply)
+    except (FileNotFoundError, KeyError):
         return None
-    cluster = _cluster_entries(channel_data).get(diarization_speaker_id)
-    if not isinstance(cluster, dict):
-        return None
-
-    # The second read, same as set_cluster_multi_speaker: this key rides in
-    # the same document as the voice embeddings, so writing back a copy
-    # that went stale would take a concurrent marking with it.
-    fresh_sidecar, fresh_channel = _freshest_channel(output_dir, meeting_stem, channel)
-    if fresh_sidecar is not None:
-        fresh_cluster = _cluster_entries(fresh_channel).get(diarization_speaker_id)
-        if isinstance(fresh_cluster, dict):
-            sidecar = fresh_sidecar
-            cluster = fresh_cluster
-
-    if state is None:
-        cluster.pop(REVIEW_STATE_KEY, None)
-    else:
-        cluster[REVIEW_STATE_KEY] = state
-
-    write_sidecar_document(output_dir, meeting_stem, sidecar)
-    return sidecar
 
 
 def clear_cluster_review_state(
-    output_dir: Path, meeting_stem: str, channel: str, diarization_speaker_ids,
+    output_dir: Path,
+    meeting_stem: str,
+    channel: str,
+    diarization_speaker_ids,
+    expected_run_id: Optional[str] = None,
 ) -> int:
     """Drop the review marking from a whole set of raw cluster ids in one
     write. Returns how many actually carried it.
@@ -880,21 +937,31 @@ def clear_cluster_review_state(
     follows has already succeeded, and a missing sidecar or channel there
     means there is nothing to clear, not that the confirm went wrong.
     """
-    sidecar, channel_data = _freshest_channel(output_dir, meeting_stem, channel)
-    if sidecar is None:
-        return 0
-    # The second read, same as the two setters above.
-    fresh_sidecar, fresh_channel = _freshest_channel(output_dir, meeting_stem, channel)
-    if fresh_sidecar is not None:
-        sidecar, channel_data = fresh_sidecar, fresh_channel
-    clusters = _cluster_entries(channel_data)
+    from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
+
+    store = SpeakerSidecarStore(output_dir)
+    if expected_run_id is None:
+        initial = store.read(meeting_stem)
+        expected_run_id = store.run_token(initial)
     cleared = 0
-    for sid in diarization_speaker_ids:
-        cluster = clusters.get(sid)
-        if isinstance(cluster, dict) and cluster.pop(REVIEW_STATE_KEY, None) is not None:
-            cleared += 1
-    if cleared:
-        write_sidecar_document(output_dir, meeting_stem, sidecar)
+
+    def apply(document):
+        nonlocal cleared
+        channels = document.get("channels")
+        channel_data = channels.get(channel) if isinstance(channels, dict) else None
+        clusters = _cluster_entries(channel_data) if isinstance(channel_data, dict) else {}
+        for sid in diarization_speaker_ids:
+            cluster = clusters.get(sid)
+            if isinstance(cluster, dict) and cluster.pop(REVIEW_STATE_KEY, None) is not None:
+                cleared += 1
+
+    document = store.read(meeting_stem)
+    if document is None:
+        return 0
+    try:
+        store.mutate(meeting_stem, expected_run_id, apply)
+    except (FileNotFoundError, KeyError, OSError, StaleDiarizationRun):
+        return 0
     return cleared
 
 
@@ -1292,6 +1359,11 @@ def _manifest_describes_lines(line_starts: list, turn_manifest: list) -> bool:
 
 MULTI_SPEAKER_TRANSCRIPT_LABEL = "Multiple speakers"
 ORIGINAL_LABEL_KEY = "original_label"
+_GENERIC_TRANSCRIPT_LABELS = {"You", "Others", "Together"}
+
+
+def _is_generic_transcript_label(label: str) -> bool:
+    return label in _GENERIC_TRANSCRIPT_LABELS or re.fullmatch(r"Speaker \d+", label) is not None
 
 
 def record_original_labels(
@@ -1357,8 +1429,9 @@ def restore_transcript_labels(
     transcript_path: Path, turn_manifest: list, target_ids: set,
 ) -> int:
     """Undo a confirmation's rename on ONE cluster's lines, putting back the
-    label each line carried before it -- or `MULTI_SPEAKER_TRANSCRIPT_LABEL`
-    where nothing was recorded.
+    label each line carried before it. Where nothing was recorded, an
+    existing generic diarization label remains unchanged and a person name
+    is replaced with `MULTI_SPEAKER_TRANSCRIPT_LABEL`.
 
     The fallback is not a guess: it is the statement the user just made by
     marking the cluster, and it is the honest thing to show for a line the
@@ -1402,7 +1475,11 @@ def restore_transcript_labels(
         if (entry.get("channel"), entry.get("diarization_speaker_id")) not in target_ids:
             continue
         timestamp_str, label, text = _TRANSCRIPT_LINE_RE.match(lines[line_idx]).groups()
-        restored = entry.get(ORIGINAL_LABEL_KEY) or MULTI_SPEAKER_TRANSCRIPT_LABEL
+        restored = entry.get(ORIGINAL_LABEL_KEY)
+        if not restored:
+            if _is_generic_transcript_label(label):
+                continue
+            restored = MULTI_SPEAKER_TRANSCRIPT_LABEL
         if label == restored:
             continue
         lines[line_idx] = f"[{timestamp_str}] [{restored}] {text}"
@@ -1623,14 +1700,17 @@ def sample_segments(segments: list, limit: int = SAMPLE_SEGMENT_LIMIT) -> list:
     return sorted(longest, key=lambda s: s.get("start", 0))
 
 
-def cluster_transcript_lines(
+def build_transcript_manifest_index(
     transcript_path: Path,
-    turn_manifest: Optional[list] = None,
-    target_ids: Optional[set] = None,
-) -> list:
-    """`[(timestamp_seconds, text)]` of the saved transcript's lines that
-    belong to ONE diarized cluster. Never raises; returns [] when the
-    transcript is missing or has no diarised lines.
+    turn_manifest: Optional[list],
+) -> dict:
+    """Parse and validate a transcript manifest once for all clusters.
+
+    The returned mapping is keyed by ``(channel, diarization_speaker_id)``.
+    Values retain source-line order plus the global next-line boundary, so
+    merged cluster rows can combine several keys without losing chronology.
+    An empty mapping means the transcript and manifest cannot be paired
+    safely.
 
     Deliberately does NOT skip lines labeled "You", unlike the relabel
     functions in this module. Not skipping them is the whole point: on the
@@ -1644,11 +1724,9 @@ def cluster_transcript_lines(
     where it IS correct (never rewrite the owner's label); reading and
     rewriting simply want opposite rules.
 
-    Two ways to decide ownership, best first:
-
-    `turn_manifest` + `target_ids` (the sidecar's "transcript_lines", one
-    entry per diarised line in order): exact recorded provenance, the same
-    mechanism confirm-speaker prefers. No ambiguity to resolve at all. A
+    `turn_manifest` (the sidecar's "transcript_lines", one entry per
+    diarised line in order) is exact recorded provenance, the same
+    mechanism confirm-speaker prefers. No ambiguity needs resolving. A
     manifest whose length doesn't match the transcript's diarised-line
     count is refused rather than mispaired, same as
     `relabel_transcript_exact`.
@@ -1677,12 +1755,12 @@ def cluster_transcript_lines(
     honest half: it cuts audio at this cluster's own segments, which are
     internally consistent with the run that produced them.
     """
-    if not transcript_path.exists():
-        return []
+    if not turn_manifest or not transcript_path.exists():
+        return {}
     try:
         content = transcript_path.read_text(encoding="utf-8")
     except OSError:
-        return []
+        return {}
 
     parsed = []
     for line in content.split("\n"):
@@ -1698,8 +1776,6 @@ def cluster_transcript_lines(
             # silently shifting every later pairing by one.
             parsed.append((None, text))
 
-    if not turn_manifest or not target_ids:
-        return []
     if len(turn_manifest) != len(parsed):
         # Same refusal as relabel_transcript_exact: a manifest that does not
         # line up with the transcript cannot be paired by position, and
@@ -1709,7 +1785,7 @@ def cluster_transcript_lines(
             "%d entries -- refusing to guess a pairing, no excerpt text.",
             transcript_path, len(parsed), len(turn_manifest),
         )
-        return []
+        return {}
     if not _manifest_describes_lines([ts for ts, _text in parsed], turn_manifest):
         # Same refusal one step further in: the count survives a manifest
         # left over from an earlier transcription of this meeting, and
@@ -1720,7 +1796,7 @@ def cluster_transcript_lines(
             "no excerpt text.",
             transcript_path, len(turn_manifest),
         )
-        return []
+        return {}
     # (start, next_line_start, text) per owned line. The third element is
     # what makes a turn bounded at all: a transcript line carries only ONE
     # timestamp, its START, because src.transcriber merges consecutive
@@ -1756,14 +1832,46 @@ def cluster_transcript_lines(
         )
         next_starts.append(following)
 
-    return [
-        (ts, next_start, text)
-        for ts, (_marker, text), next_start, entry in zip(
-            starts, parsed, next_starts, turn_manifest,
-        )
-        if (entry.get("channel"), entry.get("diarization_speaker_id")) in target_ids
-        and ts is not None
+    index: dict = {}
+    for position, (ts, (_marker, text), next_start, entry) in enumerate(zip(
+        starts, parsed, next_starts, turn_manifest,
+    )):
+        if ts is None or not isinstance(entry, dict):
+            continue
+        key = (entry.get("channel"), entry.get("diarization_speaker_id"))
+        if not all(isinstance(value, str) and value for value in key):
+            continue
+        index.setdefault(key, []).append((position, ts, next_start, text))
+    return index
+
+
+def _transcript_lines_from_index(transcript_index: dict, target_ids: Optional[set]) -> list:
+    if not transcript_index or not target_ids:
+        return []
+    matched = [
+        row
+        for target_id in target_ids
+        for row in transcript_index.get(target_id, [])
     ]
+    matched.sort(key=lambda row: row[0])
+    return [(timestamp, next_start, text) for _, timestamp, next_start, text in matched]
+
+
+def cluster_transcript_lines(
+    transcript_path: Path,
+    turn_manifest: Optional[list] = None,
+    target_ids: Optional[set] = None,
+) -> list:
+    """Transcript turns belonging to one cluster, using exact provenance.
+
+    This compatibility wrapper builds an index for one caller. Meeting-wide
+    callers should build it once with :func:`build_transcript_manifest_index`
+    and pass it to ``extract_segment_samples``.
+    """
+    return _transcript_lines_from_index(
+        build_transcript_manifest_index(transcript_path, turn_manifest),
+        target_ids,
+    )
 
 
 def _join_texts(texts: list, max_chars: int) -> Optional[str]:
@@ -1963,6 +2071,7 @@ def extract_segment_samples(
     max_chars: int = SAMPLE_TEXT_MAX_CHARS,
     turn_manifest: Optional[list] = None,
     target_ids: Optional[set] = None,
+    transcript_index: Optional[dict] = None,
 ) -> list:
     """`[{"start", "end", "text"}]` -- the moments offered for review, in
     chronological order, each independently playable.
@@ -1978,8 +2087,12 @@ def extract_segment_samples(
     offering -- the audio is this cluster's own, and listening is what
     identifies a voice; a quote was always the lesser half.
     """
-    owned = cluster_transcript_lines(
-        transcript_path, turn_manifest=turn_manifest, target_ids=target_ids,
+    owned = (
+        _transcript_lines_from_index(transcript_index, target_ids)
+        if transcript_index is not None
+        else cluster_transcript_lines(
+            transcript_path, turn_manifest=turn_manifest, target_ids=target_ids,
+        )
     )
 
     if not owned:
@@ -2152,6 +2265,7 @@ def extract_speaker_sample_audio(
     span = target.get("end", 0) - target.get("start", 0)
     if not span > 0:
         return False
+    span = min(span, SAMPLE_MAX_SECONDS)
     start = max(0.0, target.get("start", 0) - SAMPLE_AUDIO_PADDING_SECONDS)
     duration = span + 2 * SAMPLE_AUDIO_PADDING_SECONDS
 
@@ -2166,7 +2280,11 @@ def extract_speaker_sample_audio(
             ],
             capture_output=True, timeout=SAMPLE_AUDIO_EXTRACTION_TIMEOUT_SECONDS,
         )
-        return result.returncode == 0 and output_path.exists()
+        return (
+            result.returncode == 0
+            and output_path.exists()
+            and output_path.stat().st_size > 0
+        )
     except (subprocess.TimeoutExpired, OSError) as e:
         logger.warning("Could not extract speaker sample audio: %s", e)
         return False

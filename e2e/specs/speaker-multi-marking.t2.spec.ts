@@ -2,6 +2,7 @@ import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import {
   enableSpeakerIdentification,
+  fixtureDiarizationRunId,
   writeSpeakersSidecar,
   writeTranscriptFile,
   writeMeetingMarkdown,
@@ -32,6 +33,7 @@ type StenoWindow = Window & {
         meetingStem: string;
         channel: string;
         diarizationSpeakerId: string;
+        expectedRunId: string;
         containsMultipleSpeakers: boolean;
       }) => Promise<{
         success: boolean;
@@ -44,6 +46,7 @@ type StenoWindow = Window & {
         meetingStem: string;
         channel: string;
         diarizationSpeakerId: string;
+        expectedRunId: string;
         newPersonName?: string;
         personId?: string;
       }) => Promise<{ success: boolean; error?: string }>;
@@ -51,9 +54,11 @@ type StenoWindow = Window & {
         meetingStem: string;
         channel: string;
         diarizationSpeakerId: string;
+        expectedRunId: string;
         generic: boolean;
       }) => Promise<{
-        success: boolean;
+      success: boolean;
+      diarization_run_id?: string;
         error?: string;
         resolved_diarization_speaker_id?: string;
         fragment_ids?: string[];
@@ -119,7 +124,7 @@ function seedMeeting(userDataDir: string, stem: string) {
         SPEAKER_1: {
           embedding: [0.0, 1.0],
           speech_duration_seconds: 40.0,
-          segment_count: 2,
+          segment_count: 1,
           segments: [{ start: 200.0, end: 210.0 }],
         },
       },
@@ -182,7 +187,7 @@ test('a marked cluster is withheld from naming, refused by confirm, and raises t
 
   const marked = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.markCluster(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', containsMultipleSpeakers: true },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), containsMultipleSpeakers: true },
   );
   expect(marked.success).toBe(true);
   expect(marked.contains_multiple_speakers).toBe(true);
@@ -215,7 +220,7 @@ test('a marked cluster is withheld from naming, refused by confirm, and raises t
   // can reach config.json to degrade suggestions in unrelated meetings.
   const refused = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Alpha' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Alpha' },
   );
   expect(refused.success).toBe(false);
   expect(refused.error).toContain('more than one person');
@@ -228,7 +233,7 @@ test('a marked cluster is withheld from naming, refused by confirm, and raises t
   // the others their naming.
   const accepted = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', newPersonName: 'Person Gamma' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Gamma' },
   );
   expect(accepted.success).toBe(true);
 
@@ -236,7 +241,7 @@ test('a marked cluster is withheld from naming, refused by confirm, and raises t
   // marked row stays visible in the panel precisely so this is reachable).
   const unmarked = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.markCluster(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', containsMultipleSpeakers: false },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), containsMultipleSpeakers: false },
   );
   expect(unmarked.success).toBe(true);
   expect(unmarked.minimum_speaker_count).toBe(2);
@@ -262,7 +267,7 @@ test('marking a cluster that was already confirmed withdraws the name and its vo
   // later excerpt and realise the cluster is mixed.
   const confirmed = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Alpha' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Alpha' },
   );
   expect(confirmed.success).toBe(true);
   await expect.poll(() => {
@@ -274,7 +279,7 @@ test('marking a cluster that was already confirmed withdraws the name and its vo
 
   const marked = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.markCluster(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', containsMultipleSpeakers: true },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), containsMultipleSpeakers: true },
   );
   expect(marked.success).toBe(true);
   expect(marked.cleared_confirmation_from).toEqual(['Person Alpha']);
@@ -294,7 +299,7 @@ test('marking a cluster that was already confirmed withdraws the name and its vo
   // derived from that mixed cluster.
   const neighbour = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', newPersonName: 'Person Gamma' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Gamma' },
   );
   expect(neighbour.success).toBe(true);
   const profiles = (readJson(configPath).person_profiles ?? []) as Array<{
@@ -406,7 +411,7 @@ test('deleting a meeting reports its unnamed speakers and removes its voice-embe
   // hearing it and the delete takes the audio.
   await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', newPersonName: 'Person Gamma' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Gamma' },
   );
   await expect.poll(async () =>
     (await page.evaluate(
@@ -453,8 +458,8 @@ test('keeping a speaker generic round-trips through the sidecar, and a confirm c
   // The standing-rule coverage for the persisted review state: the panel's
   // "Keep generic" used to change nothing outside React, so the only proof
   // that matters is that the marking is on disk and comes back out of a
-  // real suggest-speakers. The fixture stays legacy-shaped (no run block) --
-  // its specs staying green IS the backward-compatibility proof.
+  // real suggest-speakers. Legacy sidecars remain covered by the backend unit
+  // tests; mutations in this E2E use the current run-aware IPC contract.
   const realDirBefore = fileSig(realUserDataDir());
   const stem = 'e2e-review-state';
   seedMeeting(userDataDir, stem);
@@ -469,7 +474,7 @@ test('keeping a speaker generic round-trips through the sidecar, and a confirm c
 
   const marked = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.setClusterReviewState(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', generic: true },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), generic: true },
   );
   expect(marked.success).toBe(true);
   expect(marked.review_state).toBe('generic');
@@ -492,7 +497,7 @@ test('keeping a speaker generic round-trips through the sidecar, and a confirm c
   // marking -- otherwise the panel would report a confirmed row as parked.
   const confirmed = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Ida' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Ida' },
   );
   expect(confirmed.success).toBe(true);
   await expect
@@ -502,12 +507,12 @@ test('keeping a speaker generic round-trips through the sidecar, and a confirm c
   // And the explicit undo removes the key rather than storing a null.
   const reMarked = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.setClusterReviewState(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', generic: true },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', expectedRunId: fixtureDiarizationRunId(stem), generic: true },
   );
   expect(reMarked.success).toBe(true);
   const cleared = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.setClusterReviewState(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', generic: false },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_1', expectedRunId: fixtureDiarizationRunId(stem), generic: false },
   );
   expect(cleared.success).toBe(true);
   expect(cleared.review_state).toBeNull();

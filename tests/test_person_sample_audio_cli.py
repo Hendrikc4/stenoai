@@ -162,6 +162,15 @@ class PersonSampleResolutionTests(unittest.TestCase):
 
         self.assertIsNone(_resolve_person_sample(profile, self.dirs))
 
+    def test_corrupt_meeting_identifier_is_quarantined(self):
+        profile = {
+            "person_id": "p1",
+            "prototypes": [_prototype("../outside", None)],
+            "hard_negatives": [],
+        }
+
+        self.assertIsNone(_resolve_person_sample(profile, self.dirs))
+
 
 class PersonSampleCliTests(unittest.TestCase):
     def setUp(self):
@@ -210,6 +219,34 @@ class PersonSampleCliTests(unittest.TestCase):
             "prototypes", "embedding", "embedding_mean",
         }
         self.assertTrue(private_keys.isdisjoint(profile))
+
+    def test_list_profiles_reuses_sidecar_resolution_across_people(self):
+        self._seed_playable_person("Person Alpha")
+        second = self.config.create_person_profile("Person Beta")
+        run_id = read_speakers_sidecar(
+            self.output_dir, "meeting",
+        )["diarization_run"]["run_id"]
+        self.config.add_speaker_prototype(
+            second["person_id"],
+            [1.0, 0.0],
+            recording_type="remote",
+            meeting_id="meeting",
+            diarization_speaker_id="SPEAKER_0",
+            speech_duration_seconds=30.0,
+            segment_count=4,
+            created_from="user_confirmed",
+            channel="system",
+            diarization_run_id=run_id,
+        )
+
+        with mock.patch(
+            "src.speaker_suggestions.read_speakers_sidecar",
+            wraps=read_speakers_sidecar,
+        ) as read_sidecar:
+            result = self._run(simple_recorder.list_person_profiles, [])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(read_sidecar.call_count, 1)
 
     def test_list_profiles_treats_structurally_invalid_sidecars_as_unplayable(self):
         self._seed_playable_person()

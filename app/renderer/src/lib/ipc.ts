@@ -9,7 +9,11 @@
  */
 
 // ---------- shared result envelope ----------
-export type Result<T> = ({ success: true } & T) | { success: false; error: string };
+export type Result<T> = ({ success: true } & T) | {
+  success: false;
+  error: string;
+  error_code?: string;
+};
 
 // ---------- domain types ----------
 export interface SessionInfo {
@@ -56,6 +60,9 @@ export interface Meeting {
   action_items?: unknown[];
   transcript?: string;
   is_diarised?: boolean;
+  /** Whether a per-meeting speaker sidecar exists. The detail view uses this
+   *  to avoid spawning two speaker backend reads for ordinary notes. */
+  has_speaker_sidecar?: boolean;
   diarised_text?: string | null;
   folders?: string[];
   /** Whether the ORIGINAL recording is still on disk (list-meetings only —
@@ -325,6 +332,12 @@ export type SetupCheckResponse = Result<{
   allGood: boolean;
   checks: SetupCheckItem[];
 }>;
+export type SpeakerModelStatusResponse = Result<{
+  ready: boolean;
+  cache_directory: string;
+  required_models: string[];
+  missing_models: string[];
+}>;
 
 export type MicPermissionResponse = Result<{ status: MicPermissionStatus }>;
 export type MicPermissionGrantResponse = Result<{ granted: boolean }>;
@@ -511,6 +524,8 @@ export interface SpeakerSuggestion {
   review_state?: string | null;
 }
 export type SuggestSpeakersResponse = Result<{
+  schema_version: 1;
+  diarization_run_id: string | null;
   meeting_id: string;
   /** Whether the source recording still exists on disk (keep_recordings
    *  defaults off, so this is false for most older backfilled meetings) --
@@ -542,6 +557,7 @@ export interface MarkSpeakerClusterParams {
   meetingStem: string;
   channel: string;
   diarizationSpeakerId: string;
+  expectedRunId: string;
   containsMultipleSpeakers: boolean;
 }
 
@@ -549,6 +565,7 @@ export interface SetClusterReviewStateParams {
   meetingStem: string;
   channel: string;
   diarizationSpeakerId: string;
+  expectedRunId: string;
   /** True records "a human reviewed this and left it unnamed"; false
    *  removes that marking, which is the undo. */
   generic: boolean;
@@ -585,6 +602,7 @@ export interface ConfirmSpeakerParams {
   meetingStem: string;
   channel: string;
   diarizationSpeakerId: string;
+  expectedRunId: string;
   personId?: string;
   newPersonName?: string;
 }
@@ -1003,6 +1021,8 @@ export interface StenoaiBridge {
     check: RequestFn<[], SetupCheckResponse>;
     ollamaAndModel: RequestFn<[], Result<Record<string, unknown>>>;
     parakeet: RequestFn<[], Result<Record<string, unknown>>>;
+    speakerModelsStatus: RequestFn<[], SpeakerModelStatusResponse>;
+    speakerModels: RequestFn<[], SpeakerModelStatusResponse>;
     test: RequestFn<[], Result<Record<string, unknown>>>;
     triggerWizard: RequestFn<[], Result<Record<string, unknown>>>;
   };
@@ -1152,7 +1172,13 @@ export interface StenoaiBridge {
     renameProfile: RequestFn<[id: string, displayName: string], Result<Record<string, never>>>;
     deleteProfile: RequestFn<[id: string], Result<Record<string, never>>>;
     getSampleAudio: RequestFn<
-      [meetingStem: string, channel: string, diarizationSpeakerId: string, segmentIndex?: number],
+      [
+        meetingStem: string,
+        channel: string,
+        diarizationSpeakerId: string,
+        expectedRunId: string,
+        segmentIndex?: number,
+      ],
       GetSpeakerSampleAudioResponse
     >;
     getPersonSampleAudio: RequestFn<[id: string], GetSpeakerSampleAudioResponse>;

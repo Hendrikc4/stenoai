@@ -119,6 +119,19 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             self._seed_sidecar(tmp)
             cfg = Config(config_path=Path(tmp) / "config.json")
             existing = cfg.create_person_profile("Person Gamma")
+            first = cfg.add_speaker_prototype(
+                existing["person_id"],
+                [0.9, 0.1],
+                recording_type="in_person",
+                meeting_id="older-meeting",
+                diarization_speaker_id="SPEAKER_07",
+                speech_duration_seconds=25.0,
+                segment_count=4,
+                created_from="user_confirmed",
+                channel="mic",
+                diarization_run_id="older-run",
+            )
+            self.assertIsNotNone(first)
             result, cfg = self._run(
                 ["mtg001", "mic", "SPEAKER_00", "--person-id", existing["person_id"]], tmp, cfg=cfg,
             )
@@ -126,7 +139,11 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             self.assertTrue(data["success"])
             self.assertEqual(data["person_id"], existing["person_id"])
             profile = cfg.get_person_profile(existing["person_id"])
-            self.assertEqual(len(profile["prototypes"]), 1)
+            self.assertEqual(len(profile["prototypes"]), 2)
+            self.assertEqual(
+                {prototype["meeting_id"] for prototype in profile["prototypes"]},
+                {"older-meeting", "mtg001"},
+            )
 
     def test_new_person_with_existing_name_fails_gracefully(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,6 +230,30 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             self.assertEqual(max_profile["hard_negatives"][0]["diarization_run_id"], run_id)
             self.assertEqual(sarah_profile["prototypes"][0]["diarization_run_id"], run_id)
             self.assertEqual(sarah_profile["hard_negatives"][0]["diarization_run_id"], run_id)
+
+    def test_stale_run_failure_has_a_stable_machine_readable_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_sidecar(tmp)
+            output_dir = Path(tmp) / "output"
+            reviewed_run_id = read_speakers_sidecar(
+                output_dir, "mtg001",
+            )["diarization_run"]["run_id"]
+            self._rediarize(tmp)
+
+            result, _ = self._run(
+                [
+                    "mtg001", "mic", "SPEAKER_00",
+                    "--new-person", "Person Gamma",
+                    "--expected-run-id", reviewed_run_id,
+                ],
+                tmp,
+            )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(
+                _last_json(result.output)["error_code"],
+                "stale_diarization_run",
+            )
 
     def test_confirm_against_legacy_sidecar_produces_prototypes_without_run_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -968,10 +1009,6 @@ class ConfirmSpeakerUpdatesParticipantsTests(unittest.TestCase):
             self.assertEqual(data["participants_updated"], ["Person Gamma"])  # computed fine, just nothing to write to
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ConfirmSpeakerEvidenceHygieneTests(ConfirmSpeakerCliTests):
     """Hard negatives are permanent suppression evidence, so a duplicate is
     not merely untidy: every copy is another reason the matcher will refuse a
@@ -1010,3 +1047,7 @@ class ConfirmSpeakerEvidenceHygieneTests(ConfirmSpeakerCliTests):
 
             self.assertEqual(len(cfg.get_person_profile(max_id)["hard_negatives"]), 1)
             self.assertEqual(len(cfg.get_person_profile(sarah_id)["hard_negatives"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

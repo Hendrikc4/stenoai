@@ -8,6 +8,7 @@ import {
   usePersonProfiles,
 } from '@/hooks/useSpeakerSuggestions';
 import type { PersonProfile } from '@/lib/ipc';
+import { useBlobAudioPlayback } from '@/hooks/useBlobAudioPlayback';
 import { SettingRow, COMPACT_BTN } from './primitives';
 
 // ---------------------------------------------------------------------------
@@ -46,99 +47,16 @@ function describeSamples(profile: PersonProfile): string {
   return `${n} voice sample${n === 1 ? '' : 's'}`;
 }
 
-function base64ToBlobUrl(base64: string): string {
-  const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
-  return URL.createObjectURL(new Blob([bytes], { type: 'audio/wav' }));
-}
-
 export function PeopleTab() {
   const profilesQuery = usePersonProfiles();
   const deleteProfile = useDeletePersonProfile();
   const getPersonSample = useGetPersonSampleAudio();
   const [deleteTarget, setDeleteTarget] = React.useState<PersonProfile | null>(null);
   const [deleteError, setDeleteError] = React.useState(false);
-  const [pendingPersonId, setPendingPersonId] = React.useState<string | null>(null);
-  const [playingPersonId, setPlayingPersonId] = React.useState<string | null>(null);
-  const [playErrorPersonId, setPlayErrorPersonId] = React.useState<string | null>(null);
-  const audioRef = React.useRef<HTMLAudioElement | null>(null);
-  const objectUrlRef = React.useRef<string | null>(null);
-  const playbackGenerationRef = React.useRef(0);
-
-  const releaseMedia = React.useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.onended = null;
-      audioRef.current.onerror = null;
-      audioRef.current.pause();
-      audioRef.current = null;
-    }
-    if (objectUrlRef.current) {
-      URL.revokeObjectURL(objectUrlRef.current);
-      objectUrlRef.current = null;
-    }
-  }, []);
-
-  const stopPlayback = React.useCallback(() => {
-    playbackGenerationRef.current += 1;
-    releaseMedia();
-    setPendingPersonId(null);
-    setPlayingPersonId(null);
-  }, [releaseMedia]);
-
-  React.useEffect(() => () => {
-    playbackGenerationRef.current += 1;
-    releaseMedia();
-  }, [releaseMedia]);
-
-  const togglePlayback = async (profile: PersonProfile) => {
-    if (playingPersonId === profile.person_id) {
-      stopPlayback();
-      return;
-    }
-
-    stopPlayback();
-    setPlayErrorPersonId(null);
-    setPendingPersonId(profile.person_id);
-    const generation = playbackGenerationRef.current;
-
-    try {
-      const result = await getPersonSample.mutateAsync(profile.person_id);
-      if (generation !== playbackGenerationRef.current) return;
-
-      const objectUrl = base64ToBlobUrl(result.audio_base64);
-      const audio = new Audio(objectUrl);
-      objectUrlRef.current = objectUrl;
-      audioRef.current = audio;
-
-      audio.onended = () => {
-        if (generation !== playbackGenerationRef.current) return;
-        releaseMedia();
-        setPlayingPersonId(null);
-      };
-      audio.onerror = () => {
-        if (generation !== playbackGenerationRef.current) return;
-        releaseMedia();
-        setPlayingPersonId(null);
-        setPlayErrorPersonId(profile.person_id);
-      };
-
-      await audio.play();
-      if (generation !== playbackGenerationRef.current) {
-        releaseMedia();
-        return;
-      }
-      setPlayingPersonId(profile.person_id);
-    } catch {
-      if (generation === playbackGenerationRef.current) {
-        releaseMedia();
-        setPlayingPersonId(null);
-        setPlayErrorPersonId(profile.person_id);
-      }
-    } finally {
-      if (generation === playbackGenerationRef.current) {
-        setPendingPersonId(null);
-      }
-    }
-  };
+  const playback = useBlobAudioPlayback(async (personId: string) => {
+    const result = await getPersonSample.mutateAsync(personId);
+    return result.audio_base64;
+  });
 
   const profiles = React.useMemo(
     () =>
@@ -179,7 +97,7 @@ export function PeopleTab() {
             description={(
               <>
                 <span>{describeSamples(profile)}</span>
-                {playErrorPersonId === profile.person_id && (
+                {playback.errorKey === profile.person_id && (
                   <span
                     role="alert"
                     className="mt-1 block"
@@ -197,31 +115,31 @@ export function PeopleTab() {
                 <Button
                   variant="outline"
                   className={COMPACT_BTN}
-                  disabled={pendingPersonId !== null}
-                  onClick={() => void togglePlayback(profile)}
+                  disabled={playback.pendingKey !== null}
+                  onClick={() => void playback.toggle(profile.person_id)}
                   aria-label={
-                    playingPersonId === profile.person_id
+                    playback.playingKey === profile.person_id
                       ? `Stop voice sample for ${profile.display_name}`
                       : `Play voice sample for ${profile.display_name}`
                   }
                   data-testid={`people-play-${profile.person_id}`}
                 >
-                  {pendingPersonId === profile.person_id ? (
+                  {playback.pendingKey === profile.person_id ? (
                     <Loader2 className="size-[13px] animate-spin" />
-                  ) : playingPersonId === profile.person_id ? (
+                  ) : playback.playingKey === profile.person_id ? (
                     <Square className="size-[13px]" />
                   ) : (
                     <Play className="size-[13px]" />
                   )}
-                  {playingPersonId === profile.person_id ? 'Stop' : 'Play'}
+                  {playback.playingKey === profile.person_id ? 'Stop' : 'Play'}
                 </Button>
               )}
               <Button
                 variant="outline"
                 className={COMPACT_BTN}
-                disabled={pendingPersonId !== null}
+                disabled={playback.pendingKey !== null}
                 onClick={() => {
-                  stopPlayback();
+                  playback.stop();
                   setDeleteError(false);
                   setDeleteTarget(profile);
                 }}

@@ -3572,7 +3572,7 @@ def full_reprocess(meeting_stem, audio_file_override):
         Path(notes_file).write_text(notes_text, encoding='utf-8')
 
     try:
-        process_streaming.callback(str(audio_path), session_name, notes_file, None)
+        process_streaming.callback(str(audio_path), session_name, notes_file, None, None)
     finally:
         if notes_file:
             try:
@@ -4243,6 +4243,85 @@ def clear_state():
         print("SUCCESS: No state file found - already clear")
 
 
+def _run_speaker_model_command(command: str, timeout: int) -> dict:
+    """Run a non-audio command on the macOS diarization sidecar.
+
+    The sidecar is the single authority for its FluidAudio cache layout. Keep
+    this wrapper deliberately narrow and return only validated JSON so stderr
+    from model loaders never crosses the renderer IPC boundary.
+    """
+    import subprocess
+    from src.transcriber import _resolve_steno_diarize
+
+    binary = _resolve_steno_diarize()
+    if not binary:
+        return {
+            "success": False,
+            "ready": False,
+            "error": "Speaker diarization is unavailable on this system",
+        }
+    try:
+        result = subprocess.run(
+            [binary, command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Speaker diarization model command could not complete")
+        return {
+            "success": False,
+            "ready": False,
+            "error": "Speaker diarization model setup could not complete",
+        }
+
+    payload = None
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(candidate.get("ready"), bool):
+            payload = candidate
+            break
+
+    allowed_return_codes = {0, 3} if command == "model-status" else {0}
+    valid_payload = (
+        isinstance(payload, dict)
+        and isinstance(payload.get("required_models"), list)
+        and isinstance(payload.get("missing_models"), list)
+        and isinstance(payload.get("cache_directory"), str)
+    )
+    if result.returncode not in allowed_return_codes or not valid_payload:
+        logger.warning(
+            "Speaker diarization model command failed with exit code %s",
+            result.returncode,
+        )
+        return {
+            "success": False,
+            "ready": False,
+            "error": "Speaker diarization model setup failed",
+        }
+
+    return {"success": True, **payload}
+
+
+@cli.command(name="speaker-model-status")
+def speaker_model_status():
+    """Report whether the local speaker-diarization models are ready."""
+    print(json.dumps(_run_speaker_model_command("model-status", timeout=15)))
+
+
+@cli.command(name="prepare-speaker-models")
+def prepare_speaker_models():
+    """Download and compile the macOS speaker-diarization models."""
+    payload = _run_speaker_model_command("prepare-models", timeout=60 * 60)
+    print(json.dumps(payload))
+    if not payload.get("success") or not payload.get("ready"):
+        sys.exit(1)
+
+
 @cli.command()
 @click.option('--json', 'as_json', is_flag=True,
               help='Emit a single machine-readable JSON object instead of the human-readable report.')
@@ -4337,6 +4416,18 @@ def setup_check(as_json):
             checks.append(("❌ ffmpeg", f"not found - run: {install_hint}"))
     except Exception as e:
         checks.append(("❌ ffmpeg", f"Error: {e}"))
+
+    # Acoustic speaker diarization ships only on macOS. Its model-status
+    # command is read-only: a missing cache routes the user through onboarding
+    # instead of silently downloading models during their first meeting.
+    if sys.platform == "darwin":
+        speaker_models = _run_speaker_model_command("model-status", timeout=15)
+        if speaker_models.get("success") and speaker_models.get("ready"):
+            checks.append(("✅ speaker-diarization-model", "ready"))
+        elif speaker_models.get("success"):
+            checks.append(("⚠️ speaker-diarization-model", "not installed (optional)"))
+        else:
+            checks.append(("⚠️ speaker-diarization-model", "unavailable (optional)"))
     
     # Skip Ollama model check during setup - service starts automatically when needed
     # Just verify Ollama binary is installed
@@ -4863,6 +4954,7 @@ def list_person_profiles():
     from src.config import get_config, get_data_dirs
     profiles = get_config().get_person_profiles()
     dirs = get_data_dirs()
+    sample_lookup_cache = {"sidecars": {}, "clusters": {}, "recordings": {}}
 
     def _counts_by_context(entries):
         counts: dict = {}
@@ -4878,7 +4970,9 @@ def list_person_profiles():
                 "display_name": p.get("display_name"),
                 "prototype_counts": _counts_by_context(p.get("prototypes") or []),
                 "hard_negative_counts": _counts_by_context(p.get("hard_negatives") or []),
-                "sample_available": _resolve_person_sample(p, dirs) is not None,
+                "sample_available": _resolve_person_sample(
+                    p, dirs, lookup_cache=sample_lookup_cache,
+                ) is not None,
                 "updated_at": p.get("updated_at"),
             }
             for p in profiles
@@ -4886,7 +4980,12 @@ def list_person_profiles():
     }))
 
 
-def _resolve_person_sample(profile: dict, dirs: dict) -> Optional[dict]:
+def _resolve_person_sample(
+    profile: dict,
+    dirs: dict,
+    *,
+    lookup_cache: Optional[dict] = None,
+) -> Optional[dict]:
     """Return the best currently playable positive prototype for a person.
 
     The returned provenance stays inside Python. Renderer-facing profile
@@ -4904,6 +5003,11 @@ def _resolve_person_sample(profile: dict, dirs: dict) -> Optional[dict]:
     if not isinstance(profile, dict):
         return None
 
+    cache = lookup_cache if isinstance(lookup_cache, dict) else {}
+    sidecar_cache = cache.setdefault("sidecars", {})
+    cluster_cache = cache.setdefault("clusters", {})
+    recording_cache = cache.setdefault("recordings", {})
+
     prototypes = profile.get("prototypes") or []
     if not isinstance(prototypes, list):
         return None
@@ -4918,7 +5022,14 @@ def _resolve_person_sample(profile: dict, dirs: dict) -> Optional[dict]:
         if not all(isinstance(value, str) and value for value in (meeting_id, channel, speaker_id)):
             continue
 
-        sidecar = read_speakers_sidecar(Path(dirs["output"]), meeting_id)
+        if meeting_id not in sidecar_cache:
+            try:
+                sidecar_cache[meeting_id] = read_speakers_sidecar(
+                    Path(dirs["output"]), meeting_id,
+                )
+            except ValueError:
+                sidecar_cache[meeting_id] = None
+        sidecar = sidecar_cache[meeting_id]
         if not isinstance(sidecar, dict):
             continue
         diarization_run = sidecar.get("diarization_run") or {}
@@ -4934,26 +5045,38 @@ def _resolve_person_sample(profile: dict, dirs: dict) -> Optional[dict]:
         channel_data = channels.get(channel)
         if not isinstance(channel_data, dict):
             continue
-        raw_clusters_by_id = channel_data.get("clusters") or {}
-        if not isinstance(raw_clusters_by_id, dict):
+        cluster_key = (meeting_id, channel)
+        if cluster_key not in cluster_cache:
+            raw_clusters_by_id = channel_data.get("clusters") or {}
+            resolved = None
+            if isinstance(raw_clusters_by_id, dict):
+                valid_clusters = {
+                    sid: cluster
+                    for sid, cluster in raw_clusters_by_id.items()
+                    if isinstance(sid, str)
+                    and isinstance(cluster, dict)
+                    and isinstance(cluster.get("embedding"), list)
+                    and bool(cluster["embedding"])
+                    and all(
+                        isinstance(value, (int, float))
+                        for value in cluster["embedding"]
+                    )
+                }
+                try:
+                    raw_clusters = clusters_from_sidecar_channel(
+                        meeting_id,
+                        {**channel_data, "clusters": valid_clusters},
+                    )
+                    clusters, id_resolution = merge_same_channel_fragments(raw_clusters)
+                    resolved = (raw_clusters_by_id, clusters, id_resolution)
+                except (IndexError, KeyError, TypeError, ValueError, ZeroDivisionError):
+                    pass
+            cluster_cache[cluster_key] = resolved
+
+        cluster_resolution = cluster_cache[cluster_key]
+        if cluster_resolution is None:
             continue
-        valid_clusters = {
-            sid: cluster
-            for sid, cluster in raw_clusters_by_id.items()
-            if isinstance(sid, str)
-            and isinstance(cluster, dict)
-            and isinstance(cluster.get("embedding"), list)
-            and bool(cluster["embedding"])
-            and all(isinstance(value, (int, float)) for value in cluster["embedding"])
-        }
-        safe_channel_data = {**channel_data, "clusters": valid_clusters}
-        raw_clusters = clusters_from_sidecar_channel(meeting_id, safe_channel_data)
-        if speaker_id not in raw_clusters:
-            continue
-        try:
-            clusters, id_resolution = merge_same_channel_fragments(raw_clusters)
-        except (IndexError, TypeError, ValueError, ZeroDivisionError):
-            continue
+        raw_clusters_by_id, clusters, id_resolution = cluster_resolution
         resolved_id = id_resolution.get(speaker_id)
         if resolved_id not in clusters:
             continue
@@ -4971,7 +5094,11 @@ def _resolve_person_sample(profile: dict, dirs: dict) -> Optional[dict]:
         if not pooled_segments:
             continue
 
-        recording_path = _find_recording_file(Path(dirs["recordings"]), meeting_id)
+        if meeting_id not in recording_cache:
+            recording_cache[meeting_id] = _find_recording_file(
+                Path(dirs["recordings"]), meeting_id,
+            )
+        recording_path = recording_cache[meeting_id]
         if recording_path is None:
             continue
 
@@ -5058,7 +5185,12 @@ def create_person_profile(display_name):
     """Create a new, empty named person profile."""
     from src.config import get_config
     config = get_config()
-    config.begin_transaction()
+    if not config.begin_transaction():
+        print(json.dumps({
+            "success": False,
+            "error": "Could not lock the person profile store.",
+        }))
+        sys.exit(1)
     try:
         profile = config.create_person_profile(display_name)
     except ValueError as e:
@@ -5139,11 +5271,20 @@ def delete_person_profile(person_id):
 @click.argument('diarization_speaker_id')
 @click.option('--person-id', default=None, help="Confirm as this existing known person.")
 @click.option('--new-person', default=None, help="Confirm as a brand-new person with this display name.")
+@click.option('--expected-run-id', default=None, help="Reject the change if diarization was replaced.")
 @click.option(
     '--relabel-transcript', is_flag=True, default=False,
     help="Also rewrite this speaker's turns in the meeting's saved transcript with their real name.",
 )
-def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, new_person, relabel_transcript):
+def confirm_speaker(
+    meeting_stem,
+    channel,
+    diarization_speaker_id,
+    person_id,
+    new_person,
+    expected_run_id,
+    relabel_transcript,
+):
     """Confirm one diarized cluster as a real person.
 
     Creates the person's first SpeakerPrototype (or adds another if they
@@ -5174,6 +5315,7 @@ def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, ne
     confirm itself if the transcript is missing or nothing matches.
     """
     from src.config import get_config, get_data_dirs
+    from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
     from src.speaker_suggestions import (
         clear_cluster_review_state,
         clusters_from_sidecar_channel,
@@ -5200,6 +5342,16 @@ def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, ne
         sys.exit(1)
 
     output_dir = get_data_dirs()["output"]
+    if expected_run_id is not None:
+        try:
+            SpeakerSidecarStore(output_dir).assert_current(meeting_stem, expected_run_id)
+        except StaleDiarizationRun as error:
+            print(json.dumps({
+                "success": False,
+                "error": str(error),
+                "error_code": error.error_code,
+            }))
+            sys.exit(1)
     sidecar = read_speakers_sidecar(output_dir, meeting_stem)
     if sidecar is None:
         print(json.dumps({"success": False, "error": f"No speakers sidecar found for {meeting_stem!r}"}))
@@ -5252,7 +5404,12 @@ def confirm_speaker(meeting_stem, channel, diarization_speaker_id, person_id, ne
         }))
         sys.exit(1)
 
-    config.begin_transaction()
+    if not config.begin_transaction():
+        print(json.dumps({
+            "success": False,
+            "error": "Could not lock the person profile store.",
+        }))
+        sys.exit(1)
     if new_person:
         try:
             person = config.create_person_profile(new_person)
@@ -5563,7 +5720,10 @@ def speaker_timestamps(meeting_stem, channel, diarization_speaker_id):
     help="--generic (default) records that a human reviewed this cluster and "
          "chose to leave it unnamed; --clear removes that marking.",
 )
-def set_cluster_review_state_command(meeting_stem, channel, diarization_speaker_id, generic):
+@click.option('--expected-run-id', default=None, help="Reject the change if diarization was replaced.")
+def set_cluster_review_state_command(
+    meeting_stem, channel, diarization_speaker_id, generic, expected_run_id,
+):
     """Record how far the review got on one diarized cluster.
 
     "Keep generic" is the only review outcome that leaves no other trace. A
@@ -5578,6 +5738,7 @@ def set_cluster_review_state_command(meeting_stem, channel, diarization_speaker_
     marking it as holding several people supersedes it, and both clear it.
     """
     from src.config import get_data_dirs
+    from src.speaker_sidecar_store import StaleDiarizationRun
     from src.speaker_suggestions import (
         REVIEW_STATE_GENERIC,
         clusters_from_sidecar_channel,
@@ -5587,9 +5748,22 @@ def set_cluster_review_state_command(meeting_stem, channel, diarization_speaker_
 
     output_dir = get_data_dirs()["output"]
     state = REVIEW_STATE_GENERIC if generic else None
-    sidecar = set_cluster_review_state(
-        output_dir, meeting_stem, channel, diarization_speaker_id, state,
-    )
+    try:
+        sidecar = set_cluster_review_state(
+            output_dir,
+            meeting_stem,
+            channel,
+            diarization_speaker_id,
+            state,
+            expected_run_id,
+        )
+    except StaleDiarizationRun as error:
+        print(json.dumps({
+            "success": False,
+            "error": str(error),
+            "error_code": error.error_code,
+        }))
+        sys.exit(1)
     if sidecar is None:
         print(json.dumps({
             "success": False,
@@ -5639,7 +5813,10 @@ def set_cluster_review_state_command(meeting_stem, channel, diarization_speaker_
     help="--multiple (default) marks the cluster as holding more than one person; "
          "--single clears the marking.",
 )
-def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple):
+@click.option('--expected-run-id', default=None, help="Reject the change if diarization was replaced.")
+def mark_speaker_cluster(
+    meeting_stem, channel, diarization_speaker_id, multiple, expected_run_id,
+):
     """Record that one diarized cluster holds MORE THAN ONE person -- the
     one fact about a cluster that cannot be measured, only witnessed.
 
@@ -5662,6 +5839,7 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     nothing consumes that number yet.
     """
     from src.config import get_config, get_data_dirs
+    from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
     from src.speaker_suggestions import (
         clear_cluster_review_state,
         confirmed_participant_names,
@@ -5674,6 +5852,16 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     )
 
     output_dir = get_data_dirs()["output"]
+    if expected_run_id is not None:
+        try:
+            SpeakerSidecarStore(output_dir).assert_current(meeting_stem, expected_run_id)
+        except StaleDiarizationRun as error:
+            print(json.dumps({
+                "success": False,
+                "error": str(error),
+                "error_code": error.error_code,
+            }))
+            sys.exit(1)
     sidecar = read_speakers_sidecar(output_dir, meeting_stem)
     channels = sidecar.get("channels") if isinstance(sidecar, dict) else None
     channel_data = channels.get(channel) if isinstance(channels, dict) else None
@@ -5729,7 +5917,12 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     cleared_from = []
     restored_lines = 0
     if multiple and fragment_ids:
-        config.begin_transaction()
+        if not config.begin_transaction():
+            print(json.dumps({
+                "success": False,
+                "error": "Could not lock the person profile store.",
+            }))
+            sys.exit(1)
         # Run-scoped for the same reason the confirm path is: the cluster
         # this marking describes exists only within this run, so an entry
         # from a superseded run shares nothing with it but a reused id.
@@ -5773,9 +5966,21 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     # retry; leaving a poisoned biometric prototype active is not.
     try:
         sidecar = set_cluster_multi_speaker(
-            output_dir, meeting_stem, channel, diarization_speaker_id, multiple,
+            output_dir,
+            meeting_stem,
+            channel,
+            diarization_speaker_id,
+            multiple,
+            expected_run_id,
         )
-    except OSError:
+    except (OSError, StaleDiarizationRun) as error:
+        if isinstance(error, StaleDiarizationRun):
+            print(json.dumps({
+                "success": False,
+                "error": str(error),
+                "error_code": error.error_code,
+            }))
+            sys.exit(1)
         sidecar = None
     if sidecar is None:
         print(json.dumps({
@@ -5787,29 +5992,22 @@ def mark_speaker_cluster(meeting_stem, channel, diarization_speaker_id, multiple
     if multiple and fragment_ids:
         # "A human kept this generic" is superseded by "a human says it is
         # several people". Clear it only after the stronger marking is safe.
-        clear_cluster_review_state(output_dir, meeting_stem, channel, fragment_ids)
-        if cleared_from:
-            # The transcript is the artefact a human reads, and the one the
-            # summary and every export are built from. Withdrawing the
-            # profile while leaving the name on the lines would mean the app
-            # knows this voice is several people and keeps naming one of
-            # them. Each line goes back to the label it carried before the
-            # confirmation; where none was recorded -- meetings confirmed
-            # before that existed -- it becomes "Multiple speakers", which
-            # is not a guess but the statement the user just made.
-            restored_lines = restore_transcript_labels(
-                get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt",
-                sidecar.get("transcript_lines") or [],
-                {(channel, fid) for fid in fragment_ids},
-            )
-            # Same upkeep confirm-speaker does: the meeting's Participants
-            # chip is derived from confirmed prototypes, so dropping one has
-            # to update it or the note keeps listing someone who is no
-            # longer attributed to any of its speakers.
-            _update_summary_participants(
-                output_dir, meeting_stem,
-                confirmed_participant_names(meeting_stem, config.get_person_profiles()),
-            )
+        clear_cluster_review_state(
+            output_dir, meeting_stem, channel, fragment_ids, expected_run_id,
+        )
+        # Derive the readable artefacts from durable state on every attempt.
+        # A previous attempt can commit profile cleanup and then fail its
+        # sidecar write. Retrying then has no newly-cleared person to report,
+        # but it must still repair the transcript and Participants section.
+        restored_lines = restore_transcript_labels(
+            get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt",
+            sidecar.get("transcript_lines") or [],
+            {(channel, fid) for fid in fragment_ids},
+        )
+        _update_summary_participants(
+            output_dir, meeting_stem,
+            confirmed_participant_names(meeting_stem, config.get_person_profiles()),
+        )
 
     print(json.dumps({
         "success": True,
@@ -5949,8 +6147,10 @@ def suggest_speakers(meeting_stem):
     surface, see the plan doc).
     """
     from src.config import get_config
+    from src.speaker_sidecar_store import SpeakerSidecarStore
     from src.speaker_suggestions import (
         SUGGESTION_MIN_AVG_TURN_SECONDS,
+        build_transcript_manifest_index,
         clusters_from_sidecar_channel,
         extract_segment_samples,
         merge_same_channel_fragments,
@@ -5968,6 +6168,8 @@ def suggest_speakers(meeting_stem):
     if not config.get_identity_matching_enabled():
         print(json.dumps({
             "success": True,
+            "schema_version": 1,
+            "diarization_run_id": None,
             "meeting_id": meeting_stem,
             "recording_available": False,
             "minimum_speaker_count": 0,
@@ -5980,6 +6182,8 @@ def suggest_speakers(meeting_stem):
     if sidecar is None:
         print(json.dumps({
             "success": True,
+            "schema_version": 1,
+            "diarization_run_id": None,
             "meeting_id": meeting_stem,
             "recording_available": False,
             "minimum_speaker_count": 0,
@@ -6004,6 +6208,7 @@ def suggest_speakers(meeting_stem):
     # (measured -- see cluster_transcript_lines). The play buttons are
     # unaffected; they cut audio at this run's own segments.
     turn_manifest = sidecar.get("transcript_lines")
+    transcript_index = build_transcript_manifest_index(transcript_path, turn_manifest)
 
     # Which diarization run the clusters below belong to. A prototype
     # confirmed against a DIFFERENT run describes a voice this run may have
@@ -6012,6 +6217,7 @@ def suggest_speakers(meeting_stem):
     # any row here. `None` on a legacy sidecar, where the predicate's
     # both-absent rule keeps every existing confirmation current.
     run_id = (sidecar.get("diarization_run") or {}).get("run_id")
+    run_token = SpeakerSidecarStore(dirs["output"]).run_token(sidecar)
 
     profiles = config.get_person_profiles()
     # Merge fragments per channel first, then suggest for ALL channels in
@@ -6058,6 +6264,7 @@ def suggest_speakers(meeting_stem):
             cluster_samples = extract_segment_samples(
                 transcript_path, pooled_segments,
                 turn_manifest=turn_manifest, target_ids=target_ids,
+                transcript_index=transcript_index,
             )
             # Whether a human has ALREADY confirmed this exact cluster,
             # derived from real persisted state (an existing prototype),
@@ -6175,6 +6382,8 @@ def suggest_speakers(meeting_stem):
 
     print(json.dumps({
         "success": True,
+        "schema_version": 1,
+        "diarization_run_id": run_token,
         "meeting_id": meeting_stem,
         "recording_available": recording_path is not None,
         # Clusters plus one extra for each cluster marked as mixed. Worth
@@ -6215,7 +6424,10 @@ def suggest_speakers(meeting_stem):
     help="Play this entry of the cluster's `samples` list (as returned by "
          "suggest-speakers) instead of its longest turn.",
 )
-def get_speaker_sample_audio(meeting_stem, channel, diarization_speaker_id, segment_index):
+@click.option('--expected-run-id', default=None, help="Reject playback if diarization was replaced.")
+def get_speaker_sample_audio(
+    meeting_stem, channel, diarization_speaker_id, segment_index, expected_run_id,
+):
     """Extract a short audio clip of one diarized cluster, for the review
     UI's play button. Picks the cluster's single LONGEST pooled segment
     (primary + merged fragments) to avoid cross-voice contamination --
@@ -6240,6 +6452,7 @@ def get_speaker_sample_audio(meeting_stem, channel, diarization_speaker_id, segm
     import tempfile
 
     from src.config import get_data_dirs
+    from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
     from src.speaker_suggestions import (
         clusters_from_sidecar_channel,
         extract_segment_samples,
@@ -6249,6 +6462,16 @@ def get_speaker_sample_audio(meeting_stem, channel, diarization_speaker_id, segm
     )
 
     dirs = get_data_dirs()
+    if expected_run_id is not None:
+        try:
+            SpeakerSidecarStore(dirs["output"]).assert_current(meeting_stem, expected_run_id)
+        except StaleDiarizationRun as error:
+            print(json.dumps({
+                "success": False,
+                "error": str(error),
+                "error_code": error.error_code,
+            }))
+            sys.exit(1)
     sidecar = read_speakers_sidecar(dirs["output"], meeting_stem)
     if sidecar is None:
         print(json.dumps({"success": False, "error": f"No speakers sidecar found for {meeting_stem!r}"}))
@@ -6302,11 +6525,12 @@ def get_speaker_sample_audio(meeting_stem, channel, diarization_speaker_id, segm
             return
         target = {"start": samples[segment_index]["start"], "end": samples[segment_index]["end"]}
 
-    suffix = "" if segment_index is None else f"_{segment_index}"
-    output_path = (
-        Path(tempfile.gettempdir())
-        / f"steno_sample_{meeting_stem}_{channel}_{resolved_id}{suffix}.wav"
-    )
+    with tempfile.NamedTemporaryFile(
+        prefix="steno-sample-",
+        suffix=".wav",
+        delete=False,
+    ) as temp_audio:
+        output_path = Path(temp_audio.name)
     try:
         ok = extract_speaker_sample_audio(
             recording_path, channel, pooled_segments, output_path,
@@ -6390,6 +6614,8 @@ def _update_summary_participants(output_dir: Path, meeting_stem: str, participan
         except (OSError, ValueError) as e:
             logger.warning(f"Could not read {json_path} to update participants: {e}")
             return
+        if data.get("participants") == participant_names:
+            return
         data["participants"] = participant_names
         _atomic_write_json(json_path, data)
         return
@@ -6457,6 +6683,9 @@ def _update_summary_participants(output_dir: Path, meeting_stem: str, participan
             spliced = lines[:summary_end] + new_section + lines[summary_end:]
     else:
         return  # nothing to add, nothing to remove
+
+    if spliced == lines:
+        return
 
     tmp_path = md_path.with_name(md_path.name + ".tmp")
     tmp_path.write_text("\n".join(spliced), encoding="utf-8")

@@ -19,12 +19,25 @@ exclusion masks); this module only has the comparison math left.
 
 from __future__ import annotations
 
+import math
+
 
 def cosine_similarity(a, b) -> float:
     """Cosine similarity between two equal-length vectors, in [-1, 1]."""
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(y * y for y in b) ** 0.5
+    if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)):
+        raise ValueError("Speaker embeddings must be vectors.")
+    if not a or len(a) != len(b):
+        raise ValueError("Speaker embeddings must have equal non-zero dimensions.")
+    try:
+        left = [float(value) for value in a]
+        right = [float(value) for value in b]
+    except (TypeError, ValueError) as error:
+        raise ValueError("Speaker embeddings must be numeric.") from error
+    if not all(math.isfinite(value) for value in [*left, *right]):
+        raise ValueError("Speaker embeddings must contain finite values.")
+    dot = sum(x * y for x, y in zip(left, right))
+    norm_a = sum(x * x for x in left) ** 0.5
+    norm_b = sum(y * y for y in right) ** 0.5
     denom = norm_a * norm_b
     if denom == 0:
         return 0.0

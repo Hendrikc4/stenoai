@@ -193,7 +193,7 @@ export interface FixtureSpeakerCluster {
 /**
  * Write a deterministic `<stem>_speakers.json` sidecar into
  * <userDataDir>/output, mirroring src.speaker_suggestions.write_speakers_sidecar's
- * JSON shape exactly: `{meeting_id, created_at, channels: {mic|system: {recording_type,
+ * JSON shape exactly: `{meeting_id, created_at, diarization_run, channels: {mic|system: {recording_type,
  * clusters: {sid: {embedding, speech_duration_seconds, segment_count, segments}}}}}`.
  * Model-free -- no real diarizer/embedding extraction involved, just a
  * known-good sidecar so suggest-speakers/confirm-speaker have real data to
@@ -203,6 +203,10 @@ export interface FixtureTurnManifestEntry {
   start: number;
   channel: string;
   diarization_speaker_id: string;
+}
+
+export function fixtureDiarizationRunId(stem: string): string {
+  return `${stem}-fixture-run`;
 }
 
 export function writeSpeakersSidecar(
@@ -217,6 +221,10 @@ export function writeSpeakersSidecar(
   const data: Record<string, unknown> = {
     meeting_id: stem,
     created_at: Date.now() / 1000,
+    diarization_run: {
+      run_id: fixtureDiarizationRunId(stem),
+      created_at: Date.now() / 1000,
+    },
     channels,
   };
   // Omitted (not written empty) when absent, exactly like the real writer --

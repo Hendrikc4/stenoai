@@ -301,6 +301,8 @@ log stream --predicate 'eventMessage CONTAINS "ollama" OR process CONTAINS "Sten
 
 - **Update didn't install**: Auto-updates are applied on next quit. Quit via the **Steno → Quit** menu (not just closing the window), then reopen.
 - **No system audio / no `[Others]` speaker labels**: On macOS, allow Steno to record system audio in **System Settings → Privacy & Security → Screen & System Audio Recording**. Screen Recording access is not required.
+- **No individual speaker groups**: Individual speaker separation and named voice profiles currently require an Apple Silicon Mac. Windows keeps the channel-level `[You]` and `[Others]` labels.
+- **Speaker separation is unavailable after an update**: On macOS, open the setup wizard from Settings and let the Speaker Diarization step finish once. Meetings never download these models in the background.
 - **`stenoai://` deep link doesn't start recording**: Make sure Steno has launched at least once after install so the URL scheme is registered. If it still fails, check the terminal log for `Protocol handler registration` output.
 - **Recording stops early**: Check microphone permission, System Audio Recording permission (if recording system audio), and available disk space.
 - **"Processing failed"**: Usually an Ollama service or model issue — check the terminal logs.

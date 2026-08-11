@@ -9,15 +9,20 @@ from src.speaker_suggestions import (
     ClusterContext,
     REVIEW_STATE_GENERIC,
     REVIEW_STATE_KEY,
+    SAMPLE_AUDIO_PADDING_SECONDS,
+    SAMPLE_MAX_SECONDS,
+    SAME_MEETING_MERGE_DISTANCE_THRESHOLD,
     SUGGESTION_MIN_AVG_TURN_SECONDS,
     SUGGESTION_MIN_DURATION_SECONDS,
     SUGGESTION_MIN_SEGMENT_COUNT,
     build_clusters_from_diarization,
+    build_transcript_manifest_index,
     clear_cluster_review_state,
     clusters_from_sidecar_channel,
     confirmed_participant_names,
     determine_recording_type,
     extract_sample_text,
+    extract_segment_samples,
     extract_speaker_sample_audio,
     longest_segment,
     merge_same_channel_fragments,
@@ -245,13 +250,31 @@ class SuggestSpeakerTests(unittest.TestCase):
         self.assertEqual(result.suggested_name, "Person Gamma")
         self.assertEqual(result.suggested_person_id, "p1")
 
-    def test_possible_when_threshold_clears_but_stability_does_not(self):
-        profiles = [_profile("p1", "Person Gamma", prototypes=[_prototype([1.0, 0.0])])]
+    def test_possible_when_duration_is_below_stability_gate(self):
+        profiles = [_profile(
+            "p1", "Person Gamma",
+            prototypes=_multi_meeting_prototypes([1.0, 0.0], [0.98, 0.01]),
+        )]
         weak_context = ClusterContext(
             meeting_id="mtg001", diarization_speaker_id="SPEAKER_0",
             recording_type="in_person",
-            speech_duration_seconds=2.0,  # below SUGGESTION_MIN_DURATION_SECONDS
-            segment_count=1,  # below SUGGESTION_MIN_SEGMENT_COUNT
+            speech_duration_seconds=SUGGESTION_MIN_DURATION_SECONDS - 0.1,
+            segment_count=SUGGESTION_MIN_SEGMENT_COUNT,
+        )
+        result = suggest_speaker([1.0, 0.0], weak_context, profiles)
+        self.assertEqual(result.status, "possible")
+        self.assertEqual(result.suggested_name, "Person Gamma")
+
+    def test_possible_when_segment_count_is_below_stability_gate(self):
+        profiles = [_profile(
+            "p1", "Person Gamma",
+            prototypes=_multi_meeting_prototypes([1.0, 0.0], [0.98, 0.01]),
+        )]
+        weak_context = ClusterContext(
+            meeting_id="mtg001", diarization_speaker_id="SPEAKER_0",
+            recording_type="in_person",
+            speech_duration_seconds=SUGGESTION_MIN_DURATION_SECONDS,
+            segment_count=SUGGESTION_MIN_SEGMENT_COUNT - 1,
         )
         result = suggest_speaker([1.0, 0.0], weak_context, profiles)
         self.assertEqual(result.status, "possible")
@@ -312,7 +335,10 @@ class SuggestSpeakerTests(unittest.TestCase):
         # real speech -- duration/segment-count gates alone don't catch it.
         # Reproduces the exact shape of a confirmed false positive found
         # this session: 56 turns, 85.4s total, ~1.53s/turn average.
-        profiles = [_profile("p1", "Person Gamma", prototypes=[_prototype([1.0, 0.0])])]
+        profiles = [_profile(
+            "p1", "Person Gamma",
+            prototypes=_multi_meeting_prototypes([1.0, 0.0], [0.98, 0.01]),
+        )]
         fragmented_context = ClusterContext(
             meeting_id="mtg001", diarization_speaker_id="SPEAKER_0",
             recording_type="in_person",
@@ -474,6 +500,27 @@ class SuggestSpeakersForMeetingTests(unittest.TestCase):
         self.assertEqual(results["mic"]["SPEAKER_0"].status, "none")
         self.assertEqual(results["system"], {})
 
+    def test_each_cluster_is_scored_only_once(self):
+        profiles = [
+            _profile(
+                "p1",
+                "Person Gamma",
+                prototypes=_multi_meeting_prototypes([1.0, 0.0], [0.97, 0.03]),
+            )
+        ]
+        channel_clusters = {"mic": {
+            "SPEAKER_0": ([1.0, 0.0], _stable_context(sid="SPEAKER_0")),
+            "SPEAKER_1": ([0.0, 1.0], _stable_context(sid="SPEAKER_1")),
+        }}
+
+        with mock.patch(
+            "src.speaker_suggestions.score_candidates",
+            wraps=score_candidates,
+        ) as scorer:
+            suggest_speakers_for_meeting(channel_clusters, profiles)
+
+        self.assertEqual(scorer.call_count, 2)
+
 
 def _ctx(sid, duration, segments=5):
     return ClusterContext(
@@ -516,13 +563,14 @@ class MergeSameChannelFragmentsTests(unittest.TestCase):
         self.assertEqual(merged["SPEAKER_0"][1].merged_from, [])
 
     def test_transitive_merge_via_connected_components(self):
-        # A~B close, B~C close, but A~C distance is right at the edge --
-        # must still merge into one group via the A-B-C chain.
+        # Adjacent pairs clear the merge threshold, while the endpoints do
+        # not. The only way all three can merge is the A-B-C connection.
         a = [1.0, 0.0]
-        b = [0.995, 0.0999]     # dist(a,b) ~= 0.005
-        c = [0.98, 0.19]        # dist(b,c) ~= 0.045; dist(a,c) ~= 0.051 -- both under 0.10 anyway,
-        # but the point is the grouping algorithm doesn't require a single
-        # global anchor -- verified structurally via 3-way group below.
+        b = [0.9396926, 0.3420201]  # 20 degrees from A
+        c = [0.7660444, 0.6427876]  # 20 degrees from B, 40 from A
+        self.assertLessEqual(cosine_distance(a, b), SAME_MEETING_MERGE_DISTANCE_THRESHOLD)
+        self.assertLessEqual(cosine_distance(b, c), SAME_MEETING_MERGE_DISTANCE_THRESHOLD)
+        self.assertGreater(cosine_distance(a, c), SAME_MEETING_MERGE_DISTANCE_THRESHOLD)
         clusters = {
             "SPEAKER_0": (a, _ctx("SPEAKER_0", 300)),
             "SPEAKER_1": (b, _ctx("SPEAKER_1", 200)),
@@ -1270,6 +1318,33 @@ class ExtractSampleTextTests(unittest.TestCase):
                 "hello there",
             )
 
+    def test_prebuilt_manifest_index_avoids_reparsing_per_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_transcript(
+                tmp,
+                "[00:05] [Speaker 2] first voice\n"
+                "[00:10] [Speaker 3] second voice",
+            )
+            manifest = self._manifest(
+                (5.0, "system", "SPEAKER_0"),
+                (10.0, "system", "SPEAKER_1"),
+            )
+            index = build_transcript_manifest_index(path, manifest)
+
+            with mock.patch(
+                "src.speaker_suggestions.cluster_transcript_lines",
+                side_effect=AssertionError("must use the prebuilt index"),
+            ):
+                samples = extract_segment_samples(
+                    path,
+                    [{"start": 4.0, "end": 8.0}],
+                    turn_manifest=manifest,
+                    target_ids={("system", "SPEAKER_0")},
+                    transcript_index=index,
+                )
+
+            self.assertEqual(samples[0]["text"], "first voice")
+
 
 class ExtractSpeakerSampleAudioTests(unittest.TestCase):
     def test_returns_false_when_no_segments(self):
@@ -1319,6 +1394,30 @@ class ExtractSpeakerSampleAudioTests(unittest.TestCase):
             self.assertIn("-ss", cmd)
             self.assertIn(str(max(0.0, 10.0 - 0.3)), cmd)
             self.assertIn("pan=mono|c0=c1", cmd)  # "system" -> channel index 1
+
+    def test_audio_extraction_caps_an_untrusted_long_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "mtg001.wav"
+            audio_path.write_bytes(b"stub")
+            out_path = Path(tmp) / "out.wav"
+
+            def fake_run(cmd, **kwargs):
+                out_path.write_bytes(b"wav-stub")
+                return mock.Mock(returncode=0)
+
+            with mock.patch("src.transcriber._resolve_ffmpeg", return_value="/usr/bin/ffmpeg"), \
+                 mock.patch("src.speaker_suggestions.subprocess.run", side_effect=fake_run) as run_mock:
+                ok = extract_speaker_sample_audio(
+                    audio_path,
+                    "mic",
+                    [{"start": 10.0, "end": 610.0}],
+                    out_path,
+                )
+
+            self.assertTrue(ok)
+            cmd = run_mock.call_args.args[0]
+            duration = float(cmd[cmd.index("-t") + 1])
+            self.assertLessEqual(duration, SAMPLE_MAX_SECONDS + 2 * SAMPLE_AUDIO_PADDING_SECONDS)
 
     def test_mic_channel_uses_channel_index_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1515,10 +1614,6 @@ class ReviewStateTests(unittest.TestCase):
                 clear_cluster_review_state(output_dir, "mtg001", "mic", {"SPEAKER_0"}), 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SidecarDurabilityTests(unittest.TestCase):
     """The rename is atomic; that is not the same as durable.
 
@@ -1587,3 +1682,7 @@ class SidecarDurabilityTests(unittest.TestCase):
                     write_sidecar_document(output_dir, "mtg001", doc)
             leftovers = [p.name for p in output_dir.iterdir()]
             self.assertEqual(leftovers, [], f"temp file left behind: {leftovers}")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -9,7 +9,7 @@
 // macOS-only: `say` doesn't exist on Windows/Linux. Callers must gate on
 // isSayAvailable() (and process.platform) and skip loudly otherwise.
 import { execFileSync } from 'child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 
@@ -45,9 +45,13 @@ export function isSayAvailable(): boolean {
   if (sayAvailable === undefined) {
     try {
       const dir = mkdtempSync(path.join(tmpdir(), 'stenoai-e2e-say-probe-'));
-      const pcm = synthesize('Testing one two three.', path.join(dir, 'probe.wav'));
-      const seconds = pcm.length / 2 / 16000;
-      sayAvailable = seconds >= MIN_SAY_DURATION_SECONDS;
+      try {
+        const pcm = synthesize('Testing one two three.', path.join(dir, 'probe.wav'));
+        const seconds = pcm.length / 2 / 16000;
+        sayAvailable = seconds >= MIN_SAY_DURATION_SECONDS;
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     } catch {
       sayAvailable = false;
     }
@@ -111,17 +115,20 @@ export function makeStereoSpeechWav(
   opts: { micUtteranceA: string; micUtteranceB: string; systemUtterance: string },
 ): StereoSpeechResult {
   const dir = mkdtempSync(path.join(tmpdir(), 'stenoai-e2e-say-'));
+  try {
+    const uttA = synthesize(opts.micUtteranceA, path.join(dir, 'mic_a.wav'));
+    const gapSeconds = 1.0;
+    const uttB = synthesize(opts.micUtteranceB, path.join(dir, 'mic_b.wav'));
+    const micPcm = Buffer.concat([uttA, silencePcm(gapSeconds), uttB]);
 
-  const uttA = synthesize(opts.micUtteranceA, path.join(dir, 'mic_a.wav'));
-  const gapSeconds = 1.0;
-  const uttB = synthesize(opts.micUtteranceB, path.join(dir, 'mic_b.wav'));
-  const micPcm = Buffer.concat([uttA, silencePcm(gapSeconds), uttB]);
+    const sysUtt = synthesize(opts.systemUtterance, path.join(dir, 'sys.wav'));
+    const sysPcm = Buffer.concat([sysUtt, silencePcm(Math.max(0, micPcm.length / 2 / 16000 - sysUtt.length / 2 / 16000))]);
 
-  const sysUtt = synthesize(opts.systemUtterance, path.join(dir, 'sys.wav'));
-  const sysPcm = Buffer.concat([sysUtt, silencePcm(Math.max(0, micPcm.length / 2 / 16000 - sysUtt.length / 2 / 16000))]);
+    writeStereoWav(destPath, micPcm, sysPcm);
 
-  writeStereoWav(destPath, micPcm, sysPcm);
-
-  const durA = uttA.length / 2 / 16000;
-  return { micBoundarySeconds: durA + gapSeconds / 2 };
+    const durA = uttA.length / 2 / 16000;
+    return { micBoundarySeconds: durA + gapSeconds / 2 };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }

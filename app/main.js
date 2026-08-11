@@ -57,6 +57,7 @@ const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
 const { registerSettingsIpc } = require('./settings-ipc');
 const { registerPersonSampleIpc } = require('./person-sample-ipc');
+const { registerSpeakerIpc } = require('./speaker-ipc');
 const { registerObsidianSync } = require('./obsidian-sync');
 const { registerObsidianIpc } = require('./obsidian-ipc');
 const { isSafeToAutoInstall } = require('./update-idle-gate');
@@ -78,6 +79,7 @@ const {
   parseShortcutUrl,
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
+const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -2897,6 +2899,22 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
     }
     const { realPath: realResolved, allowedOutputDirs } = validated;
     const content = await fs.promises.readFile(realResolved, 'utf-8');
+    const summaryBase = path.basename(realResolved);
+    const summarySuffix = summaryBase.endsWith('_summary.md')
+      ? '_summary.md'
+      : summaryBase.endsWith('_summary.json')
+        ? '_summary.json'
+        : null;
+    let hasSpeakerSidecar = false;
+    if (summarySuffix) {
+      const meetingStem = summaryBase.slice(0, -summarySuffix.length);
+      const speakerSidecarPath = path.join(path.dirname(realResolved), `${meetingStem}_speakers.json`);
+      try {
+        hasSpeakerSidecar = (await fs.promises.lstat(speakerSidecarPath)).isFile();
+      } catch {
+        hasSpeakerSidecar = false;
+      }
+    }
     if (summaryFile.endsWith('.md')) {
       // Legacy .md meetings are still listed by list-meetings, so their detail
       // pages route through here. Unlike the list payload, the detail page
@@ -2904,11 +2922,11 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
       // TranscriptPanel), so we return everything parseMeetingMarkdown yields.
       const mdMeeting = parseMeetingMarkdown(content, realResolved);
       const mdSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-      return { success: true, meeting: { ...mdMeeting, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
+      return { success: true, meeting: { ...mdMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
     }
     const jsonMeeting = JSON.parse(content);
     const jsonSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-    return { success: true, meeting: { ...jsonMeeting, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
+    return { success: true, meeting: { ...jsonMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -6388,6 +6406,49 @@ ipcMain.handle('startup-setup-check', async () => {
   }
 });
 
+async function runSpeakerModelCommand(command) {
+  if (process.platform !== 'darwin') {
+    return {
+      success: false,
+      ready: false,
+      error: 'Speaker diarization is unavailable on this system',
+    };
+  }
+  const output = await runPythonScript('simple_recorder.py', [command]);
+  return parseSpeakerModelStatusOutput(output);
+}
+
+ipcMain.handle('speaker-model-status', async () => {
+  try {
+    return await runSpeakerModelCommand('speaker-model-status');
+  } catch (error) {
+    sendDebugLog('Speaker diarization model status check failed');
+    return {
+      success: false,
+      ready: false,
+      error: 'Could not check the speaker diarization models',
+    };
+  }
+});
+
+ipcMain.handle('setup-speaker-models', async () => {
+  try {
+    sendDebugLog('Preparing local speaker diarization models...');
+    const result = await runSpeakerModelCommand('prepare-speaker-models');
+    if (result.success && result.ready) {
+      sendDebugLog('Speaker diarization models ready');
+    }
+    return result;
+  } catch (error) {
+    sendDebugLog('Speaker diarization model setup failed');
+    return {
+      success: false,
+      ready: false,
+      error: 'Speaker diarization model setup failed',
+    };
+  }
+});
+
 // ── Auto-updater ──
 // Mirrors the autoUpdater event sequence (available -> progress* ->
 // downloaded) so AboutTab can recover its state on every mount instead of
@@ -7962,139 +8023,6 @@ ipcMain.handle('reset-template', async (_e, id) => {
   }
 });
 
-ipcMain.handle('list-person-profiles', async () => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', ['list-person-profiles']);
-    return { success: true, ...JSON.parse(out) };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('suggest-speakers', async (_e, meetingStem) => {
-  const safeStem = path.basename(String(meetingStem || ''));
-  if (!safeStem) {
-    return {
-      success: true,
-      meeting_id: safeStem,
-      recording_available: false,
-      minimum_speaker_count: 0,
-      channels: {},
-    };
-  }
-  try {
-    const out = await runPythonScript('simple_recorder.py', ['suggest-speakers', safeStem]);
-    return JSON.parse(out);
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('confirm-speaker', async (_e, params) => {
-  try {
-    const args = [
-      'confirm-speaker',
-      params.meetingStem,
-      params.channel,
-      params.diarizationSpeakerId,
-    ];
-    if (params.personId) args.push('--person-id', params.personId);
-    if (params.newPersonName) args.push('--new-person', params.newPersonName);
-    // The UI path always relabels the saved transcript on confirm; the
-    // bare CLI/backfill-validation workflow leaves this flag off by
-    // default (see the plan doc's Phase 4 section).
-    args.push('--relabel-transcript');
-    const out = await runPythonScript('simple_recorder.py', args);
-    return JSON.parse(out);
-  } catch (error) {
-    return parsePythonFailureJson(error);
-  }
-});
-
-ipcMain.handle('create-person-profile', async (_e, displayName) => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', ['create-person-profile', displayName]);
-    return JSON.parse(out);
-  } catch (error) {
-    return parsePythonFailureJson(error);
-  }
-});
-
-ipcMain.handle('rename-person-profile', async (_e, id, displayName) => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', ['rename-person-profile', id, displayName]);
-    return JSON.parse(out);
-  } catch (error) {
-    return parsePythonFailureJson(error);
-  }
-});
-
-ipcMain.handle('delete-person-profile', async (_e, id) => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', ['delete-person-profile', id]);
-    return JSON.parse(out);
-  } catch (error) {
-    return parsePythonFailureJson(error);
-  }
-});
-
-ipcMain.handle('get-speaker-sample-audio', async (_e, meetingStem, channel, diarizationSpeakerId, segmentIndex) => {
-  try {
-    const args = ['get-speaker-sample-audio', meetingStem, channel, diarizationSpeakerId];
-    // Only forwarded when the caller actually asked for a specific excerpt.
-    // Number.isInteger (not a truthiness check) because index 0 is the
-    // first excerpt and must not be dropped as falsy.
-    if (Number.isInteger(segmentIndex)) args.push('--segment-index', String(segmentIndex));
-    const out = await runPythonScript('simple_recorder.py', args);
-    return JSON.parse(out);
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('mark-speaker-cluster', async (_e, params) => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', [
-      'mark-speaker-cluster',
-      params.meetingStem,
-      params.channel,
-      params.diarizationSpeakerId,
-      params.containsMultipleSpeakers ? '--multiple' : '--single',
-    ]);
-    return JSON.parse(out);
-  } catch (error) {
-    return parsePythonFailureJson(error);
-  }
-});
-
-ipcMain.handle('set-cluster-review-state', async (_e, params) => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', [
-      'set-cluster-review-state',
-      params.meetingStem,
-      params.channel,
-      params.diarizationSpeakerId,
-      params.generic ? '--generic' : '--clear',
-    ]);
-    return JSON.parse(out);
-  } catch (error) {
-    return parsePythonFailureJson(error);
-  }
-});
-
-ipcMain.handle('speaker-naming-status', async (_e, meetingStem) => {
-  try {
-    const out = await runPythonScript('simple_recorder.py', ['speaker-naming-status', meetingStem]);
-    return JSON.parse(out);
-  } catch (error) {
-    // Never surfaced to the user and never allowed to matter: this only
-    // decides whether one extra sentence appears in a delete confirmation.
-    // A failure here must not stand between someone and deleting their own
-    // recording, so it degrades to "nothing to warn about".
-    return { success: false, error: error.message };
-  }
-});
-
 ipcMain.handle('get-transcription-engine', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['get-transcription-engine'], true);
@@ -8361,6 +8289,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
 // tray) deliberately stay in main.js until that domain's own extraction.
 registerSettingsIpc({ ipcMain, runPythonScript, sendDebugLog });
 registerPersonSampleIpc({ ipcMain, runPythonScript });
+registerSpeakerIpc({ ipcMain, runPythonScript, parsePythonFailureJson });
 
 // Fired by the renderer's silence detector. The renderer has already
 // asked main to stop the recording via pause/stop; this just surfaces

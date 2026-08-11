@@ -22,7 +22,7 @@ def _fake_process_streaming(output_dir, transcripts_dir, speakers_turn_manifest=
     exactly what the real command does, so these tests exercise full-reprocess's
     OWN restore logic rather than re-testing process_streaming itself (already
     covered by the @pipeline e2e specs)."""
-    def _run(audio_file, name, notes, live_transcript):
+    def _run(audio_file, name, notes, live_transcript, append_to):
         stem = Path(audio_file).stem
         (output_dir / f"{stem}_summary.md").write_text(
             f"---\ntitle: \"{name}\"\ndate: \"2026-07-17T11:00:00\"\n---\n\n"
@@ -140,11 +140,11 @@ class FullReprocessCliTests(unittest.TestCase):
             # captured DURING the call, not from call_args afterward.
             seen_notes_text = {}
 
-            def _fake_with_notes_capture(audio_file, name, notes, live_transcript):
+            def _fake_with_notes_capture(audio_file, name, notes, live_transcript, append_to):
                 if notes:
                     seen_notes_text["text"] = Path(notes).read_text(encoding="utf-8")
                     seen_notes_text["path"] = notes
-                return fake(audio_file, name, notes, live_transcript)
+                return fake(audio_file, name, notes, live_transcript, append_to)
 
             mock_callback = mock.Mock(side_effect=_fake_with_notes_capture)
             with mock.patch.object(simple_recorder.process_streaming, "callback", mock_callback):
@@ -153,10 +153,11 @@ class FullReprocessCliTests(unittest.TestCase):
             self.assertTrue(data["success"])
             self.assertTrue(data["notes_preserved"])
 
-            audio_file, name, notes_path, live_transcript = mock_callback.call_args[0]
+            audio_file, name, notes_path, live_transcript, append_to = mock_callback.call_args[0]
             self.assertEqual(Path(audio_file), recordings_dir / "mtg001.wav")
             self.assertEqual(name, "Weekly Sync")
             self.assertIsNone(live_transcript)
+            self.assertIsNone(append_to)
             self.assertEqual(seen_notes_text["text"], "Remember to follow up with Person Gamma.")
             # The temp notes file is cleaned up after the call.
             self.assertFalse(Path(seen_notes_text["path"]).exists())

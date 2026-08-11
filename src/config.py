@@ -7,6 +7,7 @@ Handles storing and loading user preferences like model selection.
 import copy
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -14,6 +15,7 @@ import shutil
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -22,6 +24,7 @@ import filelock
 
 from src.whisper_models import SUPPORTED_WHISPER_MODELS as _WHISPER_REGISTRY
 from src import templates as _templates
+from src.speaker_schema import validate_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +355,7 @@ class Config:
         # on disk or relabel a transcript without the matching profile.
         self._transaction_backup: Optional[tuple[Dict[str, Any], Dict[str, Any]]] = None
         self._transaction_dirty = False
+        self._transaction_lock = None
         self._migrate_cloud_model_map()
         self._migrate_whisper_model()
         self._migrate_summary_model()
@@ -362,7 +366,6 @@ class Config:
         self._normalize_templates()
         self._seed_sample_template()
         self._normalize_voiceprints()
-        self._normalize_person_profiles()
 
     def _migrate_language_zh(self) -> None:
         """Migrate the legacy single ``"zh"`` language to Simplified (``zh-Hans``).
@@ -790,15 +793,29 @@ class Config:
             logger.error(f"Error saving config: {e}")
             return False
 
-    def begin_transaction(self) -> None:
-        """Defer saves until ``commit_transaction`` writes once atomically."""
+    def begin_transaction(self) -> bool:
+        """Reload and defer mutations while holding the config file lock."""
         if self._transaction_backup is not None:
             raise RuntimeError("Config transaction already active")
+        lock = filelock.FileLock(
+            str(self.config_path) + ".lock", timeout=self._SAVE_LOCK_TIMEOUT,
+        )
+        try:
+            lock.acquire()
+        except filelock.Timeout:
+            logger.error(f"Timed out acquiring config lock at {lock.lock_file}")
+            return False
+        fresh = self._read_disk_for_merge()
+        if fresh is not None:
+            self._config = fresh
+            self._snapshot = copy.deepcopy(fresh)
         self._transaction_backup = (
             copy.deepcopy(self._config),
             copy.deepcopy(self._snapshot),
         )
         self._transaction_dirty = False
+        self._transaction_lock = lock
+        return True
 
     def commit_transaction(self) -> bool:
         """Commit a deferred batch, restoring in-memory state on failure."""
@@ -806,13 +823,22 @@ class Config:
             raise RuntimeError("No Config transaction active")
         old_config, old_snapshot = self._transaction_backup
         dirty = self._transaction_dirty
-        self._transaction_backup = None
-        self._transaction_dirty = False
-        if not dirty or self._save():
+        try:
+            if dirty:
+                _atomic_write_json(self.config_path, self._config)
+                self._snapshot = copy.deepcopy(self._config)
             return True
-        self._config = old_config
-        self._snapshot = old_snapshot
-        return False
+        except Exception as error:
+            logger.error(f"Error saving config transaction: {error}")
+            self._config = old_config
+            self._snapshot = old_snapshot
+            return False
+        finally:
+            self._transaction_backup = None
+            self._transaction_dirty = False
+            if self._transaction_lock is not None:
+                self._transaction_lock.release()
+                self._transaction_lock = None
 
     def rollback_transaction(self) -> None:
         """Discard a deferred batch without touching the on-disk config."""
@@ -821,6 +847,9 @@ class Config:
         self._config, self._snapshot = self._transaction_backup
         self._transaction_backup = None
         self._transaction_dirty = False
+        if self._transaction_lock is not None:
+            self._transaction_lock.release()
+            self._transaction_lock = None
 
     def _get_default_config(self) -> Dict[str, Any]:
         """Get default configuration."""
@@ -1127,7 +1156,7 @@ class Config:
     def save_voiceprint(
         self, name: str, embedding: list, is_self: bool = False,
         duration: Optional[float] = None,
-    ) -> dict:
+    ) -> Optional[dict]:
         """Upsert a voiceprint by name.
 
         `duration` is the speaking time (seconds) `embedding` was extracted
@@ -1140,6 +1169,7 @@ class Config:
         new one demotes any previous self voiceprint to a regular (named)
         one. Ported from StoredSpeaker/SpeakerMatcher.applyConfirmation.
         """
+        before = copy.deepcopy(self._config)
         voiceprints = self._config.setdefault("voiceprints", [])
         if is_self:
             for v in voiceprints:
@@ -1185,7 +1215,9 @@ class Config:
                 "is_self": is_self,
             }
             voiceprints.append(saved)
-        self._save()
+        if not self._save():
+            self._config = before
+            return None
         return dict(saved)
 
     def delete_voiceprint(self, name: str) -> bool:
@@ -1213,28 +1245,72 @@ class Config:
     # Channels a prototype's cluster can come from -- mirrors the sidecar's
     # per-channel structure (src.speaker_suggestions.write_speakers_sidecar).
     VALID_PROTOTYPE_CHANNELS = {"mic", "system"}
-
-    def _normalize_person_profiles(self) -> None:
-        """Coerce persisted person-profile state into a list of dicts on
-        every load, mirroring `_normalize_voiceprints` — a malformed-but-
-        parseable config must not crash later reads/writes."""
-        if self._load_failed:
-            return
-        raw = self._config.get("person_profiles", [])
-        self._config["person_profiles"] = (
-            [
-                p for p in raw
-                if isinstance(p, dict) and "person_id" in p and "display_name" in p
-            ]
-            if isinstance(raw, list)
-            else []
-        )
+    MAX_PROTOTYPES_PER_CONTEXT = 24
+    MAX_HARD_NEGATIVES_PER_CONTEXT = 48
 
     def get_person_profiles(self) -> list:
         """All stored person profiles, each `{person_id, display_name,
         created_at, updated_at, prototypes, hard_negatives}`. See
         `add_speaker_prototype` for the `SpeakerPrototype` shape."""
-        return list(self._config.get("person_profiles", []))
+        profiles = []
+        raw = self._config.get("person_profiles", [])
+        if not isinstance(raw, list):
+            return []
+        for profile in raw:
+            if (
+                not isinstance(profile, dict)
+                or not isinstance(profile.get("person_id"), str)
+                or not profile.get("person_id")
+                or not isinstance(profile.get("display_name"), str)
+                or not profile.get("display_name").strip()
+            ):
+                continue
+            safe = dict(profile)
+            safe["prototypes"] = self._usable_speaker_evidence(
+                profile.get("prototypes")
+            )
+            safe["hard_negatives"] = self._usable_speaker_evidence(
+                profile.get("hard_negatives")
+            )
+            profiles.append(safe)
+        return profiles
+
+    @staticmethod
+    def _usable_speaker_evidence(value) -> list:
+        """Return safe copies without deleting malformed persisted evidence."""
+        if not isinstance(value, list):
+            return []
+        usable = []
+        for entry in value:
+            if not isinstance(entry, dict):
+                continue
+            embedding = entry.get("embedding_mean")
+            if not isinstance(embedding, list) or not embedding:
+                continue
+            try:
+                numbers = [float(item) for item in embedding]
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(item) for item in numbers):
+                continue
+            clean = dict(entry)
+            clean["embedding_mean"] = numbers
+            usable.append(clean)
+        return usable
+
+    def _get_person_profile_mutable(self, person_id: str) -> Optional[dict]:
+        return next(
+            (
+                profile
+                for profile in (
+                    self._config.get("person_profiles", [])
+                    if isinstance(self._config.get("person_profiles", []), list)
+                    else []
+                )
+                if isinstance(profile, dict) and profile.get("person_id") == person_id
+            ),
+            None,
+        )
 
     def get_person_profile(self, person_id: str) -> Optional[dict]:
         return next(
@@ -1247,10 +1323,14 @@ class Config:
         the "New person" flow (both the plain CLI and confirm-speaker
         --new-person) can silently create a second profile for someone who
         already has one, splitting their evidence across two person_ids."""
-        normalized = display_name.strip().casefold()
+        normalized = " ".join(
+            unicodedata.normalize("NFKC", display_name).split()
+        ).casefold()
         return any(
             p.get("person_id") != exclude_person_id
-            and (p.get("display_name") or "").strip().casefold() == normalized
+            and " ".join(
+                unicodedata.normalize("NFKC", p.get("display_name") or "").split()
+            ).casefold() == normalized
             for p in self.get_person_profiles()
         )
 
@@ -1261,33 +1341,60 @@ class Config:
         insensitive) already exists -- names must stay unique so a
         confirmed cluster always resolves to one real person's evidence.
         """
-        if self._person_name_taken(display_name):
-            raise ValueError(f"A person named {display_name.strip()!r} already exists")
-        profiles = self._config.setdefault("person_profiles", [])
-        now = time.time()
-        profile = {
-            "person_id": str(uuid.uuid4()),
-            "display_name": display_name,
-            "created_at": now,
-            "updated_at": now,
-            "prototypes": [],
-            "hard_negatives": [],
-        }
-        profiles.append(profile)
-        self._save()
-        return dict(profile)
+        display_name = validate_display_name(display_name)
+        owned_transaction = self._transaction_backup is None
+        if owned_transaction and not self.begin_transaction():
+            raise OSError("Could not lock the person profile store.")
+        try:
+            if self._person_name_taken(display_name):
+                raise ValueError(f"A person named {display_name!r} already exists")
+            profiles = self._config.setdefault("person_profiles", [])
+            if not isinstance(profiles, list):
+                raise ValueError("The person profile store is malformed and needs repair.")
+            now = time.time()
+            profile = {
+                "person_id": str(uuid.uuid4()),
+                "display_name": display_name,
+                "created_at": now,
+                "updated_at": now,
+                "prototypes": [],
+                "hard_negatives": [],
+            }
+            profiles.append(profile)
+            if not self._save():
+                raise OSError("Could not save the person profile.")
+            if owned_transaction and not self.commit_transaction():
+                raise OSError("Could not save the person profile.")
+            return dict(profile)
+        except Exception:
+            if owned_transaction and self._transaction_backup is not None:
+                self.rollback_transaction()
+            raise
 
     def rename_person_profile(self, person_id: str, display_name: str) -> bool:
         """Raises ValueError if another person already has this name (same
         uniqueness invariant as create_person_profile)."""
-        profile = self.get_person_profile(person_id)
-        if profile is None:
+        display_name = validate_display_name(display_name)
+        owned_transaction = self._transaction_backup is None
+        if owned_transaction and not self.begin_transaction():
             return False
-        if self._person_name_taken(display_name, exclude_person_id=person_id):
-            raise ValueError(f"A person named {display_name.strip()!r} already exists")
-        profile["display_name"] = display_name
-        profile["updated_at"] = time.time()
-        return self._save()
+        try:
+            profile = self._get_person_profile_mutable(person_id)
+            if profile is None:
+                if owned_transaction:
+                    self.rollback_transaction()
+                return False
+            if self._person_name_taken(display_name, exclude_person_id=person_id):
+                raise ValueError(f"A person named {display_name!r} already exists")
+            profile["display_name"] = display_name
+            profile["updated_at"] = time.time()
+            if not self._save():
+                raise OSError("Could not save the person profile.")
+            return not owned_transaction or self.commit_transaction()
+        except Exception:
+            if owned_transaction and self._transaction_backup is not None:
+                self.rollback_transaction()
+            raise
 
     def delete_person_profile(self, person_id: str) -> bool:
         """Delete a person profile and, critically, the derived evidence of
@@ -1315,10 +1422,26 @@ class Config:
         id describe a different voice and belong to whoever is still
         confirmed there.
         """
+        owned_transaction = self._transaction_backup is None
+        if owned_transaction and not self.begin_transaction():
+            return False
         profiles = self._config.get("person_profiles", [])
-        target = next((p for p in profiles if p.get("person_id") == person_id), None)
+        if not isinstance(profiles, list):
+            if owned_transaction:
+                self.rollback_transaction()
+            return False
+        target = next(
+            (
+                profile
+                for profile in profiles
+                if isinstance(profile, dict) and profile.get("person_id") == person_id
+            ),
+            None,
+        )
         if target is None:
-            return False  # no such profile
+            if owned_transaction:
+                self.rollback_transaction()
+            return False
 
         for proto in target.get("prototypes") or []:
             meeting_id = proto.get("meeting_id")
@@ -1326,7 +1449,7 @@ class Config:
             if not meeting_id or not sid:
                 continue
             for other in profiles:
-                if other.get("person_id") == person_id:
+                if not isinstance(other, dict) or other.get("person_id") == person_id:
                     continue
                 self.remove_speaker_evidence(
                     other["person_id"], meeting_id=meeting_id,
@@ -1336,9 +1459,17 @@ class Config:
                     diarization_run_id=proto.get("diarization_run_id"),
                 )
 
-        remaining = [p for p in profiles if p.get("person_id") != person_id]
+        remaining = [
+            profile
+            for profile in profiles
+            if not isinstance(profile, dict) or profile.get("person_id") != person_id
+        ]
         self._config["person_profiles"] = remaining
-        return self._save()
+        if not self._save():
+            if owned_transaction:
+                self.rollback_transaction()
+            return False
+        return not owned_transaction or self.commit_transaction()
 
     @staticmethod
     def _prototype_quality_score(speech_duration_seconds: float, segment_count: int) -> float:
@@ -1390,15 +1521,21 @@ class Config:
         clusters have since been re-diarized and this entry's ids may not
         mean what they used to" (src.speaker_suggestions.prototype_run_matches).
         `None` for callers with no run to report, e.g. enrollment."""
-        profile = self.get_person_profile(person_id)
-        if profile is None:
-            return None
         if recording_type not in self.VALID_RECORDING_TYPES:
             raise ValueError(f"Invalid recording_type: {recording_type}")
         if created_from not in self.VALID_PROTOTYPE_SOURCES:
             raise ValueError(f"Invalid created_from: {created_from}")
         if channel is not None and channel not in self.VALID_PROTOTYPE_CHANNELS:
             raise ValueError(f"Invalid channel: {channel}")
+
+        owned_transaction = self._transaction_backup is None
+        if owned_transaction and not self.begin_transaction():
+            return None
+        profile = self._get_person_profile_mutable(person_id)
+        if profile is None:
+            if owned_transaction:
+                self.rollback_transaction()
+            return None
 
         prototype = {
             "prototype_id": str(uuid.uuid4()),
@@ -1420,9 +1557,76 @@ class Config:
             prototype["diarization_run_id"] = diarization_run_id
         key = "hard_negatives" if negative else "prototypes"
         profile.setdefault(key, []).append(prototype)
+        self._prune_speaker_evidence(
+            profile[key],
+            self.MAX_HARD_NEGATIVES_PER_CONTEXT if negative else self.MAX_PROTOTYPES_PER_CONTEXT,
+            preserve_prototype_id=prototype["prototype_id"],
+        )
         profile["updated_at"] = time.time()
-        self._save()
+        if not self._save():
+            if owned_transaction:
+                self.rollback_transaction()
+            return None
+        if owned_transaction and not self.commit_transaction():
+            return None
         return dict(prototype)
+
+    @staticmethod
+    def _prune_speaker_evidence(
+        entries: list, cap: int, *, preserve_prototype_id: Optional[str] = None,
+    ) -> None:
+        """Bound retained evidence per recording context deterministically."""
+        preserved = next(
+            (
+                entry for entry in entries
+                if entry.get("prototype_id") == preserve_prototype_id
+            ),
+            None,
+        )
+        grouped = {}
+        for entry in entries:
+            context = (entry.get("recording_type"), entry.get("channel"))
+            grouped.setdefault(context, []).append(entry)
+        retained = []
+        for context_entries in grouped.values():
+            if len(context_entries) <= cap:
+                retained.extend(context_entries)
+                continue
+            by_meeting = {}
+            for entry in context_entries:
+                by_meeting.setdefault(entry.get("meeting_id"), []).append(entry)
+
+            def rank(entry):
+                return (
+                    float(entry.get("quality_score") or 0.0),
+                    float(entry.get("created_at") or 0.0),
+                    str(entry.get("prototype_id") or ""),
+                )
+
+            representatives = [max(values, key=rank) for values in by_meeting.values()]
+            representatives.sort(key=rank, reverse=True)
+            chosen = representatives[:cap]
+            chosen_ids = {id(entry) for entry in chosen}
+            remaining = [entry for entry in context_entries if id(entry) not in chosen_ids]
+            remaining.sort(key=rank, reverse=True)
+            chosen.extend(remaining[: max(0, cap - len(chosen))])
+            retained.extend(chosen)
+        if preserved is not None and all(
+            entry.get("prototype_id") != preserve_prototype_id for entry in retained
+        ):
+            context = (preserved.get("recording_type"), preserved.get("channel"))
+            context_retained = [
+                entry for entry in retained
+                if (entry.get("recording_type"), entry.get("channel")) == context
+            ]
+            if context_retained:
+                retained.remove(min(context_retained, key=lambda entry: (
+                    float(entry.get("quality_score") or 0.0),
+                    float(entry.get("created_at") or 0.0),
+                    str(entry.get("prototype_id") or ""),
+                )))
+            retained.append(preserved)
+        entries[:] = retained
 
     def remove_speaker_evidence(
         self,
@@ -1484,7 +1688,7 @@ class Config:
         """
         from src.speaker_suggestions import prototype_channel_matches, prototype_run_matches
 
-        profile = self.get_person_profile(person_id)
+        profile = self._get_person_profile_mutable(person_id)
         if profile is None:
             return 0
         key = "hard_negatives" if negative else "prototypes"
@@ -1517,7 +1721,7 @@ class Config:
         repair CLI, which decides exactly which entries to drop during its
         dry-run analysis and must then remove exactly those. Returns the
         count removed; saves only when something was."""
-        profile = self.get_person_profile(person_id)
+        profile = self._get_person_profile_mutable(person_id)
         if profile is None or not entry_ids:
             return 0
         key = "hard_negatives" if negative else "prototypes"
@@ -1538,7 +1742,7 @@ class Config:
         written before `add_speaker_prototype` recorded channels, whose
         channel the repair CLI recovered from their meeting's sidecar.
         Returns how many entries were updated; saves only when any were."""
-        profile = self.get_person_profile(person_id)
+        profile = self._get_person_profile_mutable(person_id)
         if profile is None or not channels_by_entry_id:
             return 0
         for channel in channels_by_entry_id.values():
@@ -1746,7 +1950,7 @@ class Config:
         Default off. Independent of diarization itself -- see the module
         comment above the default-config `identity_matching_enabled` entry
         for what turning this off actually stops."""
-        return self._config.get("identity_matching_enabled", False)
+        return self._config.get("identity_matching_enabled") is True
 
     def set_identity_matching_enabled(self, enabled: bool) -> bool:
         """Set whether cross-recording speaker identification is enabled."""

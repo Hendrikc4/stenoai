@@ -55,11 +55,21 @@ pyinstaller stenoai.spec --noconfirm
 ```
 
 `stenoai.spec` bundles `bin/steno-diarize` only when it exists and only on
-macOS (`_IS_DARWIN`), so skipping the build step is safe — the app falls
-back to the legacy channel-only "You"/"Others" labeling whenever the binary
-or a diarization run is unavailable (missing binary, timeout, bad output);
-this never fails a meeting. Windows/Linux never get acoustic diarization —
+macOS (`_IS_DARWIN`). A local development build may omit it and falls back
+to legacy channel-only "You"/"Others" labeling. A macOS release build must
+build it first and assert both `bin/steno-diarize` and the bundled copy are
+executable; the release workflows enforce those checks. A failed individual
+diarization run still falls back without failing the meeting. Windows/Linux
+never get acoustic diarization;
 `_resolve_steno_diarize()` returns `None` immediately off-darwin.
+
+FluidAudio models are prepared explicitly during macOS onboarding with
+`prepare-speaker-models` and checked without writes via `speaker-model-status`.
+Normal meeting processing never downloads or repairs these models: the Swift
+sidecar enables FluidAudio's offline-only mode before loading them and falls
+back to channel labels when the cache is unavailable. The cache lives below
+the Steno user-data directory and therefore honors `STENOAI_USER_DATA_DIR` in
+tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 
 ### End-to-end tests (Playwright)
 The e2e suite drives the **real Electron app** (real window, real clicks) to catch

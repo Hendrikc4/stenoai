@@ -81,6 +81,29 @@ test('Approve confirms the suggested person for a "confirmed"-tier row', async (
   await expect(row.getByRole('button', { name: 'Approve' })).toHaveCount(0);
 });
 
+test('a stale speaker action refreshes the analysis and explains what changed', async ({
+  launchApp,
+}) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_STALE_SPEAKER_RUN: '1',
+    },
+  });
+  await openDetail(page);
+
+  const row = page.getByTestId('speaker-row-mic:SPEAKER_0');
+  await row.getByRole('button', { name: 'Approve' }).click();
+
+  await expect(row.getByTestId('speaker-feedback-mic:SPEAKER_0')).toContainText(
+    'The speaker analysis changed while you were reviewing. Refreshing the list. Check the row before trying again.',
+  );
+  await expect(row.getByTestId('speaker-feedback-mic:SPEAKER_0')).not.toContainText('Reload');
+  await expect(row).toContainText('refreshed after new analysis');
+  await expect(row.getByRole('button', { name: 'Approve' })).toBeEnabled();
+});
+
 test('Change picks a different existing person for a "possible"-tier row', async ({ launchApp }) => {
   const { page } = await launchApp({
     mockIpc: true,
@@ -103,7 +126,10 @@ test('Change picks a different existing person for a "possible"-tier row', async
 test('New person creates and confirms a brand-new profile', async ({ launchApp }) => {
   const { page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1' },
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_CONFIRM_SPEAKER_DELAY_MS: '400',
+    },
   });
   await openDetail(page);
 
@@ -125,7 +151,68 @@ test('New person creates and confirms a brand-new profile', async ({ launchApp }
   await expect(page.getByTestId('speaker-new-person-submit')).toBeEnabled();
   await page.getByTestId('speaker-new-person-submit').click();
 
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+  await expect(dialog.getByTestId('speaker-new-person-submit')).toHaveText('Creating…');
+
   await expect(row).toContainText('✓ Confirmed as Person Gamma');
+  await expect(dialog).toHaveCount(0);
+});
+
+test('New person stays open and shows a safe error when creation fails', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_CONFIRM_SPEAKER_FAIL: '1',
+    },
+  });
+  await openDetail(page);
+
+  const row = page.getByTestId('speaker-row-mic:SPEAKER_2');
+  await row.getByRole('button', { name: 'New person' }).click();
+  await page.getByTestId('speaker-new-person-input').fill('Person Gamma');
+  await page.getByTestId('speaker-profile-authorized').check();
+  await page.getByTestId('speaker-new-person-submit').click();
+
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByTestId('speaker-new-person-error')).toHaveText(
+    'Could not create this person. The name may already exist. Try another name.',
+  );
+  await expect(page.getByTestId('speaker-new-person-error')).not.toContainText('private backend');
+});
+
+test('a stale New person attempt closes the old row before refreshing', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_STALE_SPEAKER_RUN: '1',
+    },
+  });
+  await openDetail(page);
+
+  const row = page.getByTestId('speaker-row-mic:SPEAKER_2');
+  await row.getByRole('button', { name: 'New person' }).click();
+  await page.getByTestId('speaker-new-person-input').fill('Person Gamma');
+  await page.getByTestId('speaker-profile-authorized').check();
+  await page.getByTestId('speaker-new-person-submit').click();
+
+  // The dialog held a row object from the old run. It must disappear before
+  // the query adopts the new run id, otherwise a retry can combine that new
+  // id with the old cluster id and enroll the wrong voice.
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(row.getByTestId('speaker-feedback-mic:SPEAKER_2')).toContainText(
+    'Refreshing the list. Check the row before trying again.',
+  );
+  await expect(row).toContainText('refreshed after new analysis');
+
+  // A retry starts from a newly selected row and requires fresh consent.
+  await row.getByRole('button', { name: 'New person' }).click();
+  await expect(page.getByTestId('speaker-new-person-input')).toHaveValue('');
+  await expect(page.getByTestId('speaker-profile-authorized')).not.toBeChecked();
+  await expect(page.getByTestId('speaker-new-person-submit')).toBeDisabled();
 });
 
 test('New person blocks creating a duplicate of an existing person', async ({ launchApp }) => {
@@ -187,7 +274,10 @@ test('People settings deletion unwinds a confirmed meeting row', async ({
 }) => {
   const { page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1' },
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_DELETE_PERSON_DELAY_MS: '400',
+    },
   });
   await openDetail(page);
 
@@ -207,6 +297,8 @@ test('People settings deletion unwinds a confirmed meeting row', async ({
   await expect(confirmDialog).toContainText("This removes them from every meeting's speaker suggestions");
   await expect(confirmDialog).toContainText("This can't be undone.");
   await confirmDialog.getByRole('button', { name: 'Delete' }).click();
+  await page.keyboard.press('Escape');
+  await expect(confirmDialog).toBeVisible();
   await expect(confirmDialog).toHaveCount(0);
 
   await openDetail(page);
@@ -376,6 +468,26 @@ test('Keep generic marks the row and leaves the undo one click away', async ({ l
   await expect(row.getByRole('button', { name: 'Change' })).toBeVisible();
 });
 
+test('Keep generic failure stays actionable and hides backend detail', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_SET_REVIEW_FAIL: '1',
+    },
+  });
+  await openDetail(page);
+
+  const row = page.getByTestId('speaker-row-mic:SPEAKER_2');
+  await row.getByRole('button', { name: 'Keep generic label' }).click();
+
+  await expect(row.getByTestId('speaker-feedback-mic:SPEAKER_2')).toHaveText(
+    "Couldn't update the review state: Try again.",
+  );
+  await expect(row).not.toContainText('private backend detail');
+  await expect(row.getByRole('button', { name: 'Keep generic label' })).toBeEnabled();
+});
+
 test('the kept-generic marking survives leaving the meeting and coming back', async ({
   launchApp,
 }) => {
@@ -461,6 +573,24 @@ test('play button fetches and plays a real audio clip, toggling to stop', async 
 
   await playButton.click();
   await expect(playButton).toHaveAttribute('aria-label', 'Play sample');
+});
+
+test('speaker row reports a safe error when sample playback fails', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_SPEAKER_SAMPLE_FAIL: '1',
+    },
+  });
+  await openDetail(page);
+
+  const row = page.getByTestId('speaker-row-mic:SPEAKER_0');
+  await row.getByTestId('speaker-play-mic:SPEAKER_0').click();
+  await expect(row.getByRole('alert')).toHaveText(
+    'Could not play this sample. Try again.',
+  );
+  await expect(row.getByRole('alert')).not.toContainText('private backend');
 });
 
 test('confirmation persists after navigating away and back, unlike the transient feedback line', async ({

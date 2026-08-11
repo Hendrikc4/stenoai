@@ -577,6 +577,15 @@ class ConfigIdentityMatchingEnabledTests(unittest.TestCase):
             config = Config(config_path=Path(tmp_dir) / "config.json")
             self.assertFalse(config.get_identity_matching_enabled())
 
+    def test_string_false_does_not_enable_identity_matching(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({
+                "identity_matching_enabled": "false",
+                "identity_matching_privacy_default_version": 1,
+            }))
+            self.assertFalse(Config(config_path=path).get_identity_matching_enabled())
+
     def test_existing_implicit_default_is_migrated_to_false_once(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
@@ -823,6 +832,21 @@ class ConfigPersonProfileTests(unittest.TestCase):
             self.assertEqual(profile["hard_negatives"], [])
             self.assertIn("person_id", profile)
 
+    def test_create_person_profile_reports_a_write_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            with patch.object(config, "_save", return_value=False):
+                with self.assertRaises(OSError):
+                    config.create_person_profile("Person Gamma")
+            self.assertEqual(config.get_person_profiles(), [])
+
+    def test_save_voiceprint_rolls_back_a_write_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            with patch.object(config, "_save", return_value=False):
+                self.assertIsNone(config.save_voiceprint("Person Gamma", [1.0, 0.0]))
+            self.assertEqual(config.get_voiceprints(), [])
+
     def test_get_person_profiles_persists_across_reload(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "config.json"
@@ -854,6 +878,14 @@ class ConfigPersonProfileTests(unittest.TestCase):
             config.create_person_profile("Person Gamma")
             with self.assertRaises(ValueError):
                 config.create_person_profile("  person gamma  ")
+            self.assertEqual(len(config.get_person_profiles()), 1)
+
+    def test_create_person_profile_rejects_unicode_compatibility_variant(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            config.create_person_profile("Person")
+            with self.assertRaises(ValueError):
+                config.create_person_profile("Ｐｅｒｓｏｎ")
             self.assertEqual(len(config.get_person_profiles()), 1)
 
     def test_create_person_profile_allows_distinct_names(self):
@@ -1308,6 +1340,70 @@ class ConfigPersonProfileTests(unittest.TestCase):
             config_path.write_text(json.dumps({"person_profiles": "not a list"}))
             config = Config(config_path=config_path)
             self.assertEqual(config.get_person_profiles(), [])
+
+    def test_malformed_evidence_is_quarantined_without_being_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=path)
+            person = config.create_person_profile("Person Gamma")
+            document = json.loads(path.read_text())
+            malformed = {"prototype_id": "recoverable", "embedding_mean": ["bad"]}
+            document["person_profiles"][0]["prototypes"] = [malformed]
+            path.write_text(json.dumps(document))
+
+            reloaded = Config(config_path=path)
+            self.assertEqual(reloaded.get_person_profiles()[0]["prototypes"], [])
+            self.assertTrue(reloaded.rename_person_profile(person["person_id"], "Person Delta"))
+            persisted = json.loads(path.read_text())
+            self.assertEqual(persisted["person_profiles"][0]["prototypes"], [malformed])
+
+    def test_prototype_retention_is_bounded_per_context(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            person = config.create_person_profile("Person Gamma")
+            for index in range(Config.MAX_PROTOTYPES_PER_CONTEXT + 5):
+                config.add_speaker_prototype(
+                    person["person_id"],
+                    [1.0, float(index + 1)],
+                    recording_type="remote",
+                    meeting_id=f"meeting-{index}",
+                    diarization_speaker_id="SPEAKER_0",
+                    speech_duration_seconds=30.0,
+                    segment_count=5,
+                    created_from="user_confirmed",
+                    channel="system",
+                )
+            profile = config.get_person_profile(person["person_id"])
+            self.assertEqual(
+                len(profile["prototypes"]),
+                Config.MAX_PROTOTYPES_PER_CONTEXT,
+            )
+
+    def test_newly_confirmed_prototype_survives_context_pruning(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            person = config.create_person_profile("Person Gamma")
+            for index in range(Config.MAX_PROTOTYPES_PER_CONTEXT):
+                config.add_speaker_prototype(
+                    person["person_id"], [1.0, float(index + 1)],
+                    recording_type="remote", meeting_id=f"strong-{index}",
+                    diarization_speaker_id="SPEAKER_0",
+                    speech_duration_seconds=30.0, segment_count=5,
+                    created_from="user_confirmed", channel="system",
+                )
+
+            newest = config.add_speaker_prototype(
+                person["person_id"], [1.0, 999.0],
+                recording_type="remote", meeting_id="new-weak-confirmation",
+                diarization_speaker_id="SPEAKER_0",
+                speech_duration_seconds=1.0, segment_count=1,
+                created_from="user_confirmed", channel="system",
+            )
+
+            retained = config.get_person_profile(person["person_id"])["prototypes"]
+            self.assertIsNotNone(newest)
+            self.assertEqual(len(retained), Config.MAX_PROTOTYPES_PER_CONTEXT)
+            self.assertIn(newest["prototype_id"], {item["prototype_id"] for item in retained})
 
 
 if __name__ == "__main__":

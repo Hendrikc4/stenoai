@@ -2,7 +2,11 @@
 // FluidAudio's Sortformer + WeSpeaker.
 //
 // Usage:
-//   steno-diarize <audio-file>
+//   steno-diarize diarize <audio-file>
+//   steno-diarize model-status
+//   steno-diarize prepare-models
+//
+// `steno-diarize <audio-file>` remains accepted for compatibility.
 //
 // Sortformer has a fixed 4-speaker-slot architecture (SortformerConfig.numSpeakers
 // is hardcoded to 4) — there is no speaker-count hint to pass, unlike the
@@ -37,6 +41,7 @@
 // easily confused between genuinely different speakers in real testing.
 
 import CoreML
+import DiarizationCore
 import Foundation
 import FluidAudio
 
@@ -47,6 +52,41 @@ setbuf(stdout, nil)
 // emitting rather than surfaced as a phantom speaker turn.
 let minSegmentDurationSeconds: Float = 0.25
 
+let rawAudioTempPrefix = "steno-diarize-"
+let rawAudioTempSuffix = ".f32le"
+let rawAudioTempMaxAge: TimeInterval = 24 * 60 * 60
+
+// A forced app exit can bypass loadSamplesViaFfmpeg's defer and leave a
+// large raw Float32 file behind. Remove only this sidecar's exact file
+// pattern, and only after it is far older than any supported run timeout.
+func cleanupStaleRawAudioTempFiles(now: Date = Date()) {
+    let fileManager = FileManager.default
+    let tempDirectory = fileManager.temporaryDirectory
+    guard let files = try? fileManager.contentsOfDirectory(
+        at: tempDirectory,
+        includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return
+    }
+
+    for file in files {
+        let name = file.lastPathComponent
+        guard name.hasPrefix(rawAudioTempPrefix), name.hasSuffix(rawAudioTempSuffix) else {
+            continue
+        }
+        guard let values = try? file.resourceValues(
+            forKeys: [.contentModificationDateKey, .isRegularFileKey]
+        ), values.isRegularFile == true, let modifiedAt = values.contentModificationDate else {
+            continue
+        }
+        guard now.timeIntervalSince(modifiedAt) > rawAudioTempMaxAge else {
+            continue
+        }
+        try? fileManager.removeItem(at: file)
+    }
+}
+
 // SortformerConfig.highContextV2's chunk loader (SortformerFeatureLoader)
 // requires a full chunkLen+rightContext window -- 340+40 frames at 0.08s
 // each, 30.4s -- before it emits ANYTHING; audio shorter than that gets
@@ -56,9 +96,17 @@ let minSegmentDurationSeconds: Float = 0.25
 // away from the always-safe .default config.
 let sortformerHighContextMinDuration: Double = 90.0
 
-func fail(_ message: String) -> Never {
+func fail(_ message: String, code: Int32 = 1) -> Never {
     fputs("steno-diarize error: \(message)\n", stderr)
-    exit(1)
+    exit(code)
+}
+
+func printJSON<T: Encodable>(_ value: T) throws {
+    let encoded = try JSONEncoder().encode(value)
+    guard let line = String(data: encoded, encoding: .utf8) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    print(line)
 }
 
 // Compute-unit override, primarily for one-off bulk backfill runs where
@@ -77,14 +125,35 @@ func resolveComputeUnits() -> MLComputeUnits {
     }
 }
 
-guard CommandLine.arguments.count == 2 else {
-    fail("usage: steno-diarize <audio-file>")
+let commandArguments = Array(CommandLine.arguments.dropFirst())
+
+if commandArguments == ["model-status"] {
+    let status = ModelReadiness.status()
+    do {
+        try printJSON(status)
+    } catch {
+        fail("could not encode model status")
+    }
+    exit(status.ready ? 0 : 3)
 }
 
-let inputPath = CommandLine.arguments[1]
+let isPrepareModels = commandArguments == ["prepare-models"]
+let inputPath: String?
+if commandArguments.count == 2, commandArguments[0] == "diarize" {
+    inputPath = commandArguments[1]
+} else if commandArguments.count == 1, !isPrepareModels {
+    inputPath = commandArguments[0]
+} else if isPrepareModels {
+    inputPath = nil
+} else {
+    fail("usage: steno-diarize diarize <audio-file> | model-status | prepare-models")
+}
 
-guard FileManager.default.fileExists(atPath: inputPath) else {
+if let inputPath, !FileManager.default.fileExists(atPath: inputPath) {
     fail("file not found: \(inputPath)")
+}
+if inputPath != nil {
+    cleanupStaleRawAudioTempFiles()
 }
 
 // Locate ffmpeg. The binary lives next to steno-diarize in the bundle;
@@ -114,8 +183,8 @@ func loadSamplesViaFfmpeg(path: String) async throws -> [Float] {
         throw NSError(domain: "steno-diarize", code: 1,
                       userInfo: [NSLocalizedDescriptionKey: "ffmpeg not found"])
     }
-    let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("steno-diarize-\(UUID().uuidString).f32le")
+    let tmpURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("\(rawAudioTempPrefix)\(UUID().uuidString)\(rawAudioTempSuffix)")
     defer { try? FileManager.default.removeItem(at: tmpURL) }
 
     let process = Process()
@@ -339,10 +408,12 @@ func accumulateChunkEmbeddings(
 /// diarization segments themselves are the load-bearing output.
 func extractSortformerEmbeddings(
     audio: [Float],
-    timeline: DiarizerTimeline
+    timeline: DiarizerTimeline,
+    cacheDirectory: URL
 ) async -> [String: [Float]] {
     do {
         let models = try await DiarizerModels.load(
+            from: cacheDirectory.appendingPathComponent("speaker-diarization", isDirectory: true),
             configuration: MLModelConfigurationUtils.defaultConfiguration(computeUnits: resolveComputeUnits())
         )
         let extractor = EmbeddingExtractor(embeddingModel: models.embeddingModel)
@@ -389,6 +460,28 @@ func extractSortformerEmbeddings(
 // and causes terminationHandler to never fire.
 Task {
     do {
+        if isPrepareModels {
+            fputs("steno-diarize: preparing speaker diarization models\n", stderr)
+            let status = try await ModelReadiness.prepare(computeUnits: resolveComputeUnits())
+            try printJSON(status)
+            exit(0)
+        }
+
+        guard let inputPath else {
+            fail("missing audio file")
+        }
+
+        let cacheDirectory = ModelReadiness.runtimeCacheDirectory()
+        let modelStatus = ModelReadiness.status(cacheDirectory: cacheDirectory)
+        guard modelStatus.ready else {
+            try printJSON(modelStatus)
+            fail(
+                "speaker diarization models are not prepared; run steno-diarize prepare-models",
+                code: 3
+            )
+        }
+        ModelReadiness.enableOfflineOnly()
+
         let samples = try await loadSamplesViaFfmpeg(path: inputPath)
 
         // .cpuAndNeuralEngine forces genuine ANE execution — the default
@@ -421,6 +514,7 @@ Task {
             durationSeconds >= sortformerHighContextMinDuration ? .highContextV2 : .default
         let models = try await SortformerModels.loadFromHuggingFace(
             config: sortformerConfig,
+            cacheDirectory: cacheDirectory,
             computeUnits: resolveComputeUnits()
         )
         let diarizer = SortformerDiarizer(config: sortformerConfig)
@@ -454,14 +548,14 @@ Task {
         // extractSortformerEmbeddings never throws, returning [:] on any
         // failure so a voiceprint problem can never take down diarization
         // itself (the segments above are the load-bearing output).
-        let speakers = await extractSortformerEmbeddings(audio: samples, timeline: timeline)
+        let speakers = await extractSortformerEmbeddings(
+            audio: samples,
+            timeline: timeline,
+            cacheDirectory: cacheDirectory
+        )
 
         let output = Output(segments: segments, speakers: speakers)
-        let encoded = try JSONEncoder().encode(output)
-        guard let line = String(data: encoded, encoding: .utf8) else {
-            exit(1)
-        }
-        print(line)
+        try printJSON(output)
         exit(0)
     } catch {
         fputs("steno-diarize error: \(error)\n", stderr)
