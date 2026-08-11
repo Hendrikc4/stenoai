@@ -25,6 +25,8 @@
 
 - `app/renderer/src/components/SpeakerReviewPanel.tsx` owns the New person dialog and loses the transient authorization state and checkbox.
 - `app/renderer/src/routes/settings/AiTab.tsx` owns the single persisted opt-in and receives the responsibility notice.
+- `app/renderer/src/routes/settings/AiTab.test.tsx` verifies the macOS-only switch and responsibility notice without depending on the CI host platform.
+- `app/renderer/src/routes/settings/primitives.tsx` links the notice to the switch for assistive technology.
 - `e2e/specs/speaker-review.t1.spec.ts` verifies that a valid new name can be submitted without a second checkbox while empty and duplicate names remain blocked.
 - `docs/features/speaker-labels.mdx` explains the single opt-in in the feature guide.
 - `website/src/pages/privacy.astro` explains the single opt-in in the public privacy page.
@@ -143,7 +145,7 @@ Do not alter the dialog description, mutation payload, or backend command.
 In `AiTab.tsx`, replace the Speaker identification description with:
 
 ```tsx
-description="Optional and off by default. By enabling this, you confirm that you have informed the people you record and are authorised to create and use their numerical biometric voice profiles. Profiles stay on this device and are used only to suggest people across meetings. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
+description="Optional and off by default. By enabling this, you confirm that you will inform the people you record and that you are authorised to create and use their numerical biometric voice profiles. Profiles stay on this device and are used only to suggest people across meetings. This opt-in does not by itself establish legal compliance. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
 ```
 
 Keep the existing switch, hooks, and mutation unchanged.
@@ -155,12 +157,13 @@ In `docs/features/speaker-labels.mdx`, replace the two sentences about a per-pro
 ```md
 Enable speaker identification only after informing affected people and confirming that you are authorised to create and use their voice profiles.
 The Settings switch is the opt-in; Steno does not collect consent from the recorded person or record a separate authorization for each profile.
+This opt-in does not by itself establish legal compliance for your recording or use case.
 ```
 
 In `website/src/pages/privacy.astro`, replace the last paragraph in the speaker-identification section with:
 
 ```astro
-<p>You are responsible for informing recorded people and establishing an appropriate legal basis for recording and creating a voice profile. Steno requires you to enable speaker identification in Settings before a named profile can be created, but Steno does not collect consent from the recorded person or record a separate authorization for each profile.</p>
+<p>You are responsible for informing recorded people and establishing an appropriate legal basis for recording and creating a voice profile. Steno requires you to enable speaker identification in Settings before a named profile can be created, but Steno does not collect consent from the recorded person or record a separate authorization for each profile. Enabling the setting does not by itself establish legal compliance for your recording or use case.</p>
 ```
 
 - [ ] **Step 6: Run focused verification**
@@ -204,14 +207,15 @@ Run from the repository root:
 
 ```bash
 git diff --check
-rg -n "speaker-profile-authorized|newPersonAuthorized|setNewPersonAuthorized|asks you to confirm that responsibility|Before creating a profile, Steno asks" app e2e docs website
+rg -n "newPersonAuthorized|setNewPersonAuthorized" app/renderer/src
+rg -n "asks you to confirm that responsibility|Before creating a profile, Steno asks|Steno's confirmation records" docs/features docs/privacy website/src/pages/privacy.astro
 ```
 
-Expected: `git diff --check` exits successfully and the repository search returns no matches.
+Expected: `git diff --check` exits successfully and both source searches return no matches.
 
 - [ ] **Step 8: Commit the implementation**
 
 ```bash
-git add app/renderer/src/components/SpeakerReviewPanel.tsx app/renderer/src/routes/settings/AiTab.tsx e2e/specs/speaker-review.t1.spec.ts docs/features/speaker-labels.mdx website/src/pages/privacy.astro
+git add app/renderer/src/components/SpeakerReviewPanel.tsx app/renderer/src/routes/settings/AiTab.tsx app/renderer/src/routes/settings/AiTab.test.tsx app/renderer/src/routes/settings/primitives.tsx e2e/specs/speaker-review.t1.spec.ts docs/features/speaker-labels.mdx docs/privacy/confidential-use-cases.mdx docs/superpowers/plans/2026-08-11-speaker-profile-opt-in-simplification.md docs/superpowers/specs/2026-08-10-speaker-main-hardening-design.md docs/superpowers/specs/2026-08-11-speaker-profile-opt-in-simplification-design.md website/src/pages/privacy.astro
 git commit -m "fix(speakers): use one profile opt-in"
 ```

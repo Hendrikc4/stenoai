@@ -1,6 +1,6 @@
 # Speaker Profile Opt-in Simplification
 
-**Status:** Approved by Ben on 2026-08-11.
+**Status:** Approved.
 
 ## Goal
 
@@ -14,7 +14,9 @@ Speaker identification remains optional and off by default.
 
 The switch in Settings > AI remains the only control that enables creation, storage, and matching of numerical biometric voice profiles.
 
-Its description explains that profiles remain on the device and that the user should enable the feature only after informing affected people and confirming that they are authorised to create and use the profiles.
+Its description explains that profiles remain on the device and that the user confirms they will inform affected people and are authorised to create and use the profiles.
+
+The opt-in does not by itself establish legal compliance for the recording or use case.
 
 Turning on that switch is the active opt-in.
 

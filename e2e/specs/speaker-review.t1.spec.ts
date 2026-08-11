@@ -153,6 +153,22 @@ test('New person creates and confirms a brand-new profile', async ({ launchApp }
   await expect(dialog).toHaveCount(0);
 });
 
+test('New person supports keyboard submission without a second confirmation', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1' },
+  });
+  await openDetail(page);
+
+  const row = page.getByTestId('speaker-row-mic:SPEAKER_2');
+  await row.getByRole('button', { name: 'New person' }).click();
+  await page.getByTestId('speaker-new-person-input').fill('Person Delta');
+  await page.getByTestId('speaker-new-person-input').press('Enter');
+
+  await expect(row).toContainText('✓ Confirmed as Person Delta');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+});
+
 test('New person stays open and shows a safe error when creation fails', async ({ launchApp }) => {
   const { page } = await launchApp({
     mockIpc: true,
@@ -202,14 +218,16 @@ test('a stale New person attempt closes the old row before refreshing', async ({
   // A retry starts from a newly selected row with a fresh name.
   await row.getByRole('button', { name: 'New person' }).click();
   await expect(page.getByTestId('speaker-new-person-input')).toHaveValue('');
-  await expect(page.getByTestId('speaker-profile-authorized')).toHaveCount(0);
   await expect(page.getByTestId('speaker-new-person-submit')).toBeDisabled();
 });
 
 test('New person blocks creating a duplicate of an existing person', async ({ launchApp }) => {
   const { page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1' },
+    env: {
+      STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS: '1',
+      STENOAI_E2E_CONFIRM_SPEAKER_DELAY_MS: '400',
+    },
   });
   await openDetail(page);
 
@@ -223,11 +241,14 @@ test('New person blocks creating a duplicate of an existing person', async ({ la
   await page.getByTestId('speaker-new-person-input').fill('  person alpha ');
   await expect(page.getByTestId('speaker-new-person-duplicate')).toBeVisible();
   await expect(page.getByTestId('speaker-new-person-submit')).toBeDisabled();
+  await page.getByTestId('speaker-new-person-input').press('Enter');
+  await expect(page.getByRole('dialog').getByRole('button', { name: 'Cancel' })).toBeEnabled();
+  await expect(page.getByTestId('speaker-new-person-submit')).toHaveText('Create');
+  await expect(row).toContainText('Unidentified speaker');
 
   // A genuinely new name clears the warning and re-enables Create.
   await page.getByTestId('speaker-new-person-input').fill('Someone New');
   await expect(page.getByTestId('speaker-new-person-duplicate')).toHaveCount(0);
-  await expect(page.getByTestId('speaker-profile-authorized')).toHaveCount(0);
   await expect(page.getByTestId('speaker-new-person-submit')).toBeEnabled();
 });
 

@@ -46,7 +46,7 @@ The release remains strict about bundling the executable, while a separately nam
 ## Data and Privacy Rules
 
 - Cross-meeting identity matching remains off by default and fails closed.
-- Named profiles require the existing local opt-in and authorization confirmation.
+- Named profiles require the existing local Settings opt-in.
 - Speaker names, meeting identifiers, paths, and audio-derived content never enter shareable diagnostics.
 - Meeting stems resolve to a single basename within Steno-managed directories.
 - Embeddings must contain exactly 256 finite numeric values with a non-zero norm.
