@@ -1245,6 +1245,36 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
         )
         return path
 
+    def test_marking_an_unconfirmed_cluster_preserves_its_generic_transcript_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [You] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+
+            marked = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+            )
+            marked_data = _last_json(marked.output)
+            self.assertTrue(marked_data["success"])
+            self.assertEqual(marked_data["transcript_lines_restored"], 0)
+            self.assertIn("[00:05] [You] hello there", transcript.read_text())
+
+            cleared = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00", "--single"],
+                tmp,
+            )
+            self.assertTrue(_last_json(cleared.output)["success"])
+            self.assertIn("[00:05] [You] hello there", transcript.read_text())
+
     def test_marking_a_confirmed_cluster_takes_the_name_out_of_the_transcript(self):
         # The last of the three P1s from the bot review, and the one a user
         # actually reads. confirm-speaker --relabel-transcript rewrites the
@@ -1289,6 +1319,64 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 "and the label the line carried before the confirmation comes back",
             )
             self.assertIn("[00:20] [You] hi back", text)  # never this cluster's line
+
+    def test_retry_after_sidecar_failure_repairs_transcript_and_participants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+            summary = Path(tmp) / "output" / "mtg001_summary.md"
+            summary.write_text(
+                "---\ntitle: \"Meeting\"\n---\n\n## Summary\n\nText.\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            self.assertIn("Person Alpha", transcript.read_text())
+            self.assertIn("Person Alpha", summary.read_text())
+
+            with mock.patch(
+                "src.speaker_suggestions.write_sidecar_document",
+                side_effect=OSError("disk full"),
+            ):
+                first = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+            self.assertFalse(_last_json(first.output)["success"])
+            self.assertIn("Person Alpha", transcript.read_text())
+            self.assertIn("Person Alpha", summary.read_text())
+            self.assertEqual(
+                _last_json(first.output).get("cleared_confirmation_from"),
+                ["Person Alpha"],
+            )
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertNotIn("Person Alpha", transcript.read_text())
+            self.assertNotIn("Person Alpha", summary.read_text())
 
     def test_without_a_recorded_original_the_line_says_multiple_speakers(self):
         # Every meeting confirmed before the original label was recorded has
@@ -1653,10 +1741,6 @@ class SpeakerNamingStatusCliTests(unittest.TestCase):
             self.assertEqual(data["unnamed_clusters"], 0)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class ExcerptFitTests(unittest.TestCase):
     """A quote and its clip are two views of one turn, and each has its own
     cap: 140 characters and 20 seconds. Nothing related them, so a long turn
@@ -1947,6 +2031,7 @@ class SetClusterReviewStateCliTests(unittest.TestCase):
         # a traceback reaches the UI as "something went wrong", with the
         # actual state unreported.
         broken = [
+            ["not-a-dict"],
             {"channels": ["not-a-dict"]},
             {"channels": {"system": ["not-a-dict"]}},
             {"channels": {"system": {"clusters": ["not-a-dict"]}}},
@@ -2036,3 +2121,22 @@ class PersistSidecarReportsLostMarkingsTests(unittest.TestCase):
                 self.assertTrue(
                     simple_recorder._persist_speaker_sidecar(output_dir, "mtg001", self._FRESH_RUN))
             self.assertEqual(log.warning.call_args_list, [])
+
+    def test_a_sidecar_write_failure_does_not_fail_the_meeting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch(
+                "src.speaker_suggestions.write_speakers_sidecar",
+                side_effect=OSError("lock timed out"),
+            ), mock.patch("simple_recorder.logger") as log:
+                written = simple_recorder._persist_speaker_sidecar(
+                    output_dir, "private-meeting-title", self._FRESH_RUN,
+                )
+
+            self.assertFalse(written)
+            self.assertNotIn("private-meeting-title", str(log.warning.call_args_list))
+
+
+if __name__ == '__main__':
+    unittest.main()

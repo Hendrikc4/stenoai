@@ -8,12 +8,26 @@ let package = Package(
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.2"),
     ],
     targets: [
-        .executableTarget(
-            name: "diarize-sidecar",
+        .target(
+            name: "DiarizationCore",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
-            path: "Sources"
+            path: "Sources/DiarizationCore"
+        ),
+        .executableTarget(
+            name: "diarize-sidecar",
+            dependencies: [
+                "DiarizationCore",
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ],
+            path: "Sources",
+            exclude: ["DiarizationCore"]
+        ),
+        .testTarget(
+            name: "DiarizationCoreTests",
+            dependencies: ["DiarizationCore"],
+            path: "Tests/DiarizationCoreTests"
         ),
     ]
 )

@@ -51,7 +51,7 @@ test('registers exactly the 21 settings-toggle handlers', () => {
 });
 
 // Every spread-getter reads its own subcommand SILENTLY and returns
-// { success:true, ...jsonData }. Covers all eight (privacy-notice-seen differs
+// { success:true, ...jsonData }. Covers all nine (privacy-notice-seen differs
 // and has its own test below).
 const SPREAD_GETTERS = [
   'get-keep-recordings', 'get-auto-summarize', 'get-auto-install-when-idle',

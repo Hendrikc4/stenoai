@@ -1,8 +1,12 @@
 import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import { makeWav } from '../fixtures/make-wav';
-import { enableSpeakerIdentification, writeSpeakersSidecar } from '../fixtures/user-config';
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import {
+  enableSpeakerIdentification,
+  fixtureDiarizationRunId,
+  writeSpeakersSidecar,
+} from '../fixtures/user-config';
+import { readFileSync, mkdirSync } from 'fs';
 import path from 'path';
 
 type ProfileMutationResult = {
@@ -20,6 +24,7 @@ type StenoWindow = Window & {
         meetingStem: string;
         channel: string;
         diarizationSpeakerId: string;
+        expectedRunId: string;
         newPersonName: string;
       }) => Promise<ProfileMutationResult>;
       listProfiles: () => Promise<{
@@ -123,9 +128,6 @@ test('People sample playback extracts a current confirmed voice through the bund
       },
     },
   });
-  const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
-  sidecar.diarization_run = { run_id: 'e2e-person-sample-run', created_at: 1_700_000_000 };
-  writeFileSync(sidecarPath, JSON.stringify(sidecar, null, 2));
   enableSpeakerIdentification(userDataDir);
 
   const { page } = await launchApp();
@@ -135,6 +137,7 @@ test('People sample playback extracts a current confirmed voice through the bund
       meetingStem: stem,
       channel: 'mic',
       diarizationSpeakerId: 'SPEAKER_0',
+      expectedRunId: fixtureDiarizationRunId(stem),
       newPersonName: 'Sample Person',
     },
   );

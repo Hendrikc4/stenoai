@@ -147,6 +147,40 @@ class EnrollSelfFromPersonCliTests(unittest.TestCase):
             self.assertEqual(len(cfg.get_voiceprints()), 1)
             self.assertEqual(cfg.get_voiceprint("Person Gamma")["is_self"], True)
 
+    def test_failed_voiceprint_write_returns_structured_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            person = cfg.create_person_profile("Person Gamma")
+            self._add(
+                cfg, person["person_id"], "mtg001", "SPEAKER_00", "in_person",
+                channel="mic", embedding=[1.0, 0.0],
+            )
+            with mock.patch.object(cfg, "save_voiceprint", return_value=None):
+                result = self._run(["Person Gamma"], tmp, cfg)
+
+            self.assertNotEqual(result.exit_code, 0)
+            data = _last_json(result.output)
+            self.assertFalse(data["success"])
+            self.assertIn("save", data["error"].lower())
+
+    def test_malformed_persisted_prototype_returns_structured_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            person = cfg.create_person_profile("Person Gamma")
+            self._add(
+                cfg, person["person_id"], "mtg001", "SPEAKER_00", "in_person",
+                channel="mic", embedding=[1.0, 0.0],
+            )
+            cfg._config["person_profiles"][0]["prototypes"][0]["embedding_mean"] = ["broken"]
+
+            result = self._run(["Person Gamma"], tmp, cfg)
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertNotIn("Traceback", result.output)
+            data = _last_json(result.output)
+            self.assertFalse(data["success"])
+            self.assertIn("no confirmed prototypes", data["error"].lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,12 +2,13 @@ import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import {
   enableSpeakerIdentification,
+  fixtureDiarizationRunId,
   readUserConfig,
   writeSpeakersSidecar,
   writeTranscriptFile,
 } from '../fixtures/user-config';
 import { makeWav } from '../fixtures/make-wav';
-import { readFileSync, mkdirSync } from 'fs';
+import { readFileSync, mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
 
 /**
@@ -40,11 +41,13 @@ type StenoWindow = Window & {
         meetingStem: string;
         channel: string;
         diarizationSpeakerId: string;
+        expectedRunId: string;
         personId?: string;
         newPersonName?: string;
       }) => Promise<ConfirmSpeakerResult>;
       suggestForMeeting: (meetingStem: string) => Promise<{
-        success: boolean;
+      success: boolean;
+      diarization_run_id?: string;
         recording_available?: boolean;
         minimum_speaker_count?: number;
         channels: Record<
@@ -66,6 +69,7 @@ type StenoWindow = Window & {
         meetingStem: string,
         channel: string,
         diarizationSpeakerId: string,
+        expectedRunId: string,
       ) => Promise<{ success: boolean; error?: string; audio_base64?: string }>;
       listProfiles: () => Promise<{
         success: boolean;
@@ -123,13 +127,93 @@ test('speaker identification stays unavailable until the user opts in', async ({
 
   const confirm = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Alpha' },
+    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Alpha' },
   );
   expect(confirm).toMatchObject({
     success: false,
     error: 'Speaker identification is disabled in settings.',
   });
   expect(readUserConfig(userDataDir).person_profiles ?? []).toEqual([]);
+});
+
+test('legacy sidecars without a run id can still be reviewed safely', async ({
+  launchApp,
+  userDataDir,
+}) => {
+  const stem = 'e2e-speaker-legacy-sidecar';
+  const sidecarFile = writeSpeakersSidecar(userDataDir, stem, {
+    mic: {
+      recording_type: 'in_person',
+      clusters: {
+        SPEAKER_0: {
+          embedding: [1.0, 0.0],
+          speech_duration_seconds: 30.0,
+          segment_count: 5,
+          segments: [{ start: 5.0, end: 7.0 }],
+        },
+        SPEAKER_1: {
+          embedding: [0.0, 1.0],
+          speech_duration_seconds: 25.0,
+          segment_count: 4,
+          segments: [{ start: 9.0, end: 11.0 }],
+        },
+      },
+    },
+  });
+  const legacySidecar = readJson(sidecarFile) as Record<string, unknown>;
+  delete legacySidecar.diarization_run;
+  const legacyChannels = legacySidecar.channels as Record<
+    string,
+    { clusters: Record<string, Record<string, unknown>> }
+  >;
+  legacyChannels.mic.clusters.SPEAKER_0.review_state = 'generic';
+  writeFileSync(sidecarFile, JSON.stringify(legacySidecar, null, 2));
+  enableSpeakerIdentification(userDataDir);
+
+  const { page } = await launchApp();
+  const suggestions = await page.evaluate(
+    (meetingStem) => (window as StenoWindow).stenoai.speakers.suggestForMeeting(meetingStem),
+    stem,
+  );
+  expect(suggestions.success).toBe(true);
+  expect(suggestions.diarization_run_id).toMatch(/^legacy-[a-f0-9]{64}$/);
+
+  const result = await page.evaluate(
+    (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
+    {
+      meetingStem: stem,
+      channel: 'mic',
+      diarizationSpeakerId: 'SPEAKER_0',
+      expectedRunId: suggestions.diarization_run_id as string,
+      newPersonName: 'Person Legacy',
+    },
+  );
+  expect(result).toMatchObject({ success: true, display_name: 'Person Legacy' });
+
+  const suggestionsAfterFirstConfirm = await page.evaluate(
+    (meetingStem) => (window as StenoWindow).stenoai.speakers.suggestForMeeting(meetingStem),
+    stem,
+  );
+  expect(suggestionsAfterFirstConfirm.diarization_run_id).toBe(
+    suggestions.diarization_run_id,
+  );
+  const secondResult = await page.evaluate(
+    (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
+    {
+      meetingStem: stem,
+      channel: 'mic',
+      diarizationSpeakerId: 'SPEAKER_1',
+      expectedRunId: suggestions.diarization_run_id as string,
+      newPersonName: 'Person Legacy Two',
+    },
+  );
+  expect(secondResult).toMatchObject({ success: true, display_name: 'Person Legacy Two' });
+  expect(readUserConfig(userDataDir).person_profiles).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ display_name: 'Person Legacy' }),
+      expect.objectContaining({ display_name: 'Person Legacy Two' }),
+    ]),
+  );
 });
 
 test('confirm-speaker --relabel-transcript persists a PersonProfile and relabels the saved transcript', async ({
@@ -164,7 +248,7 @@ test('confirm-speaker --relabel-transcript persists a PersonProfile and relabels
 
   const result = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Alpha' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Alpha' },
   );
   expect(result.success).toBe(true);
   expect(result.display_name).toBe('Person Alpha');
@@ -191,7 +275,7 @@ test('confirm-speaker --relabel-transcript persists a PersonProfile and relabels
   // so the mis-confirm can't keep poisoning cross-meeting matching.
   const secondResult = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Gamma' },
+    { meetingStem: stem, channel: 'system', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Gamma' },
   );
   expect(secondResult.success).toBe(true);
   expect(secondResult.reassigned_from).toEqual(['Person Alpha']);
@@ -308,8 +392,8 @@ test('identification aids: sample_text/is_likely_artifact/recording_available an
   expect(suggestions.channels.mic.SPEAKER_0.confirmed_by_user).toBeNull();
 
   const sample = await page.evaluate(
-    (args) => (window as StenoWindow).stenoai.speakers.getSampleAudio(args.stem, 'mic', args.sid),
-    { stem, sid: 'SPEAKER_0' },
+    (args) => (window as StenoWindow).stenoai.speakers.getSampleAudio(args.stem, 'mic', args.sid, args.runId),
+    { stem, sid: 'SPEAKER_0', runId: fixtureDiarizationRunId(stem) },
   );
   expect(sample.success).toBe(true);
   const bytes = Buffer.from(sample.audio_base64 as string, 'base64');
@@ -351,7 +435,7 @@ test('duplicate person names are rejected, and delete-person-profile removes a p
 
   const first = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_0', newPersonName: 'Person Alpha' },
+    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_0', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: 'Person Alpha' },
   );
   expect(first.success).toBe(true);
 
@@ -360,7 +444,7 @@ test('duplicate person names are rejected, and delete-person-profile removes a p
   // one real person must not get split across two person_ids.
   const duplicate = await page.evaluate(
     (params) => (window as StenoWindow).stenoai.speakers.confirm(params),
-    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_1', newPersonName: '  person alpha ' },
+    { meetingStem: stem, channel: 'mic', diarizationSpeakerId: 'SPEAKER_1', expectedRunId: fixtureDiarizationRunId(stem), newPersonName: '  person alpha ' },
   );
   expect(duplicate.success).toBe(false);
   expect(duplicate.error).toContain('already exists');

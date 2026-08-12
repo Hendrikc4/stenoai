@@ -248,6 +248,19 @@ class TranscribeWindowsMergeTests(unittest.TestCase):
         self.assertEqual(merged.windows_recognized, 1)
         self.assertEqual(onnx_backend._result_to_dict(merged, language=None)["window_coverage"], 0.5)
 
+    def test_misaligned_tokens_and_timestamps_do_not_count_as_recognized(self):
+        model = _FakeTsModel([
+            (["broken", " window"], [(0.0, 0.5)]),
+            (["Valid."], [(20.0, 20.5)]),
+        ])
+
+        merged = onnx_backend._transcribe_windows(model, self._eighty_seconds())
+
+        self.assertEqual(merged.tokens, ["Valid."])
+        self.assertEqual(merged.windows_attempted, 2)
+        self.assertEqual(merged.windows_recognized, 1)
+        self.assertEqual(onnx_backend._result_to_dict(merged, language=None)["window_coverage"], 0.5)
+
     def test_a_clean_run_reports_full_coverage(self):
         model = _FakeTsModel([
             (["Hello", " world."], [(0.0, 0.5), (1.0, 1.5)]),
@@ -323,6 +336,14 @@ class TranscribeWindowsHeartbeatTests(unittest.TestCase):
         ])
         onnx_backend._transcribe_windows(model, self._eighty_seconds())
         self.assertEqual(self.beats, [(2, 2)])
+
+    def test_malformed_result_still_emits_liveness_heartbeat(self):
+        model = _FakeTsModel([
+            (["broken", "window"], [(0.0, 0.5)]),
+            (["Valid."], [(20.0, 20.5)]),
+        ])
+        onnx_backend._transcribe_windows(model, self._eighty_seconds())
+        self.assertEqual(self.beats, [(1, 2), (2, 2)])
 
 
 class LoadWav16kMonoTests(unittest.TestCase):

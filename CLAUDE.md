@@ -55,11 +55,21 @@ pyinstaller stenoai.spec --noconfirm
 ```
 
 `stenoai.spec` bundles `bin/steno-diarize` only when it exists and only on
-macOS (`_IS_DARWIN`), so skipping the build step is safe — the app falls
-back to the legacy channel-only "You"/"Others" labeling whenever the binary
-or a diarization run is unavailable (missing binary, timeout, bad output);
-this never fails a meeting. Windows/Linux never get acoustic diarization —
+macOS (`_IS_DARWIN`). A local development build may omit it and falls back
+to legacy channel-only "You"/"Others" labeling. A macOS release build must
+build it first and assert both `bin/steno-diarize` and the bundled copy are
+executable; the release workflows enforce those checks. A failed individual
+diarization run still falls back without failing the meeting. Windows/Linux
+never get acoustic diarization;
 `_resolve_steno_diarize()` returns `None` immediately off-darwin.
+
+FluidAudio models are prepared explicitly during macOS onboarding with
+`prepare-speaker-models` and checked without writes via `speaker-model-status`.
+Normal meeting processing never downloads or repairs these models: the Swift
+sidecar enables FluidAudio's offline-only mode before loading them and falls
+back to channel labels when the cache is unavailable. The cache lives below
+the Steno user-data directory and therefore honors `STENOAI_USER_DATA_DIR` in
+tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 
 ### End-to-end tests (Playwright)
 The e2e suite drives the **real Electron app** (real window, real clicks) to catch
@@ -155,8 +165,9 @@ overrides an agent's own test-level defaults.
   so a test can never read/write the real `~/Library/Application Support/stenoai`. The
   launch fixture (`e2e/fixtures/electron.ts`) waits on `[data-app-ready]` (no fixed timeouts)
   and force-kills the app process tree if a graceful close hangs on teardown (Windows).
-- **CI:** `.github/workflows/e2e.yml` (T1 on Ubuntu/xvfb, macOS + Windows T2; non-blocking,
-  runs per-PR). `.github/workflows/e2e-nightly.yml` (scheduled) reuses that suite via
+- **CI:** `.github/workflows/e2e.yml` runs per PR. T1 on Ubuntu/xvfb plus the macOS T2 and
+  pipeline jobs are required checks for `main`; Windows T2 remains advisory.
+  `.github/workflows/e2e-nightly.yml` (scheduled) reuses that suite via
   `workflow_call` for flake/drift detection and adds the T3 long-meeting job. A CI-only
   Playwright `globalSetup` kills a stray Ollama + waits for a clean 11434 before the run.
 

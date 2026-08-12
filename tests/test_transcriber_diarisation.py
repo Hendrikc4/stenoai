@@ -14,6 +14,7 @@ import json
 import math
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -30,6 +31,7 @@ from src.transcriber import (
     MIN_RMS_THRESHOLD,
     STENO_DIARIZE_MERGE_GAP_S,
     WhisperTranscriber,
+    _assemble_diarised_turns,
     _apply_voiceprint_matches,
     _assign_asr_segments_to_diar_segments,
     _clamp_overlapping_diar_segments,
@@ -43,6 +45,7 @@ from src.transcriber import (
     _parse_duration_from_ffmpeg_stderr,
     _resolve_speaker_placeholders,
     _run_steno_diarize,
+    _terminate_process_tree,
     _tag_channel_segments,
     _token_jaccard,
     _voiceprint_distance,
@@ -212,10 +215,12 @@ class TranscribeDiarisedMultiSpeakerTests(unittest.TestCase):
         mic_embeddings = {"SPEAKER_0": [0.1, 0.2], "SPEAKER_1": [0.3, 0.4]}
         system_embeddings = {"SPEAKER_0": [0.5, 0.6]}
         with patch("src.transcriber._identity_matching_enabled", return_value=True), \
+             patch("src.config.get_config") as mock_get_config, \
              patch(
                 "src.transcriber._run_steno_diarize",
                 side_effect=[(mic_diar, mic_embeddings), (system_diar, system_embeddings)],
              ):
+            mock_get_config.return_value.get_voiceprints.return_value = []
             self.transcriber.transcribe_audio = Mock(side_effect=[
                 {"text": "Hi there. Not bad. Great.", "segments": [
                     {"text": "Hi there.", "start": 0.5, "end": 1.5},
@@ -1355,6 +1360,39 @@ class ResolveSpeakerPlaceholdersTests(unittest.TestCase):
         # channel/raw_sid pass through untouched -- only label is rewritten.
 
 
+class AssembleDiarisedTurnsTests(unittest.TestCase):
+    def test_merges_only_adjacent_segments_with_the_same_label_and_provenance(self):
+        assembled = _assemble_diarised_turns([
+            (1.0, "You", "first", "mic", "SPEAKER_0"),
+            (2.0, "You", "second", "mic", "SPEAKER_0"),
+            (3.0, "You", "unplaced", "mic", None),
+            (4.0, "Speaker 2", "guest", "mic", "SPEAKER_1"),
+        ])
+
+        self.assertEqual(assembled.plain_parts, ["first second", "unplaced", "guest"])
+        self.assertTrue(assembled.is_diarised)
+        self.assertEqual(
+            assembled.diarised_text,
+            "[00:01] [You] first second\n\n[00:03] [You] unplaced\n\n[00:04] [Speaker 2] guest",
+        )
+        self.assertEqual(assembled.turn_manifest, [
+            {"start": 1.0, "channel": "mic", "diarization_speaker_id": "SPEAKER_0"},
+            {"start": 3.0, "channel": "mic", "diarization_speaker_id": None},
+            {"start": 4.0, "channel": "mic", "diarization_speaker_id": "SPEAKER_1"},
+        ])
+
+    def test_one_visible_label_keeps_plain_text_without_diarised_metadata(self):
+        assembled = _assemble_diarised_turns([
+            (1.0, "You", "first", "mic", "SPEAKER_0"),
+            (2.0, "You", "second", "mic", "SPEAKER_1"),
+        ])
+
+        self.assertEqual(assembled.plain_parts, ["first", "second"])
+        self.assertFalse(assembled.is_diarised)
+        self.assertIsNone(assembled.diarised_text)
+        self.assertEqual(assembled.turn_manifest, [])
+
+
 class TagChannelSegmentsTests(unittest.TestCase):
     def test_empty_asr_segments_returns_empty_without_diarizing(self):
         with patch("src.transcriber._run_steno_diarize") as mock_run:
@@ -1804,6 +1842,26 @@ class ApplyVoiceprintMatchesTests(unittest.TestCase):
             )
         self.assertEqual(result, self.cluster_labels)
 
+    def test_malformed_self_voiceprint_never_aborts_a_meeting(self):
+        speaker_embeddings = {
+            "SPEAKER_0": [1.0, 0.0],
+            "SPEAKER_1": [0.0, 1.0],
+        }
+        voiceprints = [
+            {
+                "name": "damaged",
+                "centroid": [1.0],
+                "embeddings": [["not-a-number", 0.0]],
+                "is_self": True,
+            },
+        ]
+        with patch("src.config.get_config") as mock_get_config:
+            mock_get_config.return_value.get_voiceprints.return_value = voiceprints
+            result = _apply_voiceprint_matches(
+                speaker_embeddings, self.cluster_labels, "You", allow_self_match=True,
+            )
+        self.assertEqual(result, self.cluster_labels)
+
 
 class _FakePopen:
     """Stand-in for subprocess.Popen, matching only the surface
@@ -1820,6 +1878,7 @@ class _FakePopen:
         self._raise_timeout_once = raise_timeout_once
         self.returncode = None
         self.killed = False
+        self.pid = 12345
 
     def wait(self, timeout=None):
         if self._raise_timeout_once and timeout is not None:
@@ -1836,6 +1895,10 @@ def _patch_popen(**kwargs):
     return patch("subprocess.Popen", return_value=_FakePopen(**kwargs))
 
 
+def _sidecar_embedding(first: float, second: float) -> list[float]:
+    return [first, second] + [0.0] * 254
+
+
 class RunStenoDiarizeTests(unittest.TestCase):
     """_run_steno_diarize must survive the sidecar's real quirks: a
     diagnostic warning printed to stdout ahead of the JSON payload, and any
@@ -1845,6 +1908,13 @@ class RunStenoDiarizeTests(unittest.TestCase):
         with patch("src.transcriber._resolve_steno_diarize", return_value=None):
             self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
 
+    def test_windows_taskkill_failure_falls_back_to_parent_kill(self):
+        proc = _FakePopen()
+        with patch("src.transcriber.sys.platform", "win32"), \
+             patch("src.transcriber.subprocess.run", return_value=Mock(returncode=1)):
+            _terminate_process_tree(proc)
+        self.assertTrue(proc.killed)
+
     def test_parses_json_with_e5rt_warning_prefix_on_stdout(self):
         payload = json.dumps({
             "segments": [
@@ -1852,8 +1922,8 @@ class RunStenoDiarizeTests(unittest.TestCase):
                 {"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9},
             ],
             "speakers": {
-                "SPEAKER_0": [0.1, 0.2],
-                "SPEAKER_1": [0.3, 0.4],
+                "SPEAKER_0": _sidecar_embedding(0.1, 0.2),
+                "SPEAKER_1": _sidecar_embedding(0.3, 0.4),
             },
         }).encode()
         stdout = b"E5RT encountered an STL exception. msg = unordered_map::at: key not found." + payload
@@ -1868,7 +1938,10 @@ class RunStenoDiarizeTests(unittest.TestCase):
                 {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_1"},
             ],
         )
-        self.assertEqual(embeddings, {"SPEAKER_0": [0.1, 0.2], "SPEAKER_1": [0.3, 0.4]})
+        self.assertEqual(embeddings, {
+            "SPEAKER_0": _sidecar_embedding(0.1, 0.2),
+            "SPEAKER_1": _sidecar_embedding(0.3, 0.4),
+        })
 
     def test_cross_speaker_overlap_is_clamped_before_the_result_is_returned(self):
         # Sortformer really does emit overlapping segments on single-mic
@@ -1914,7 +1987,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
         # 18-minute diarization result. raw_decode() must tolerate this.
         payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
-            "speakers": {"SPEAKER_0": [0.1, 0.2]},
+            "speakers": {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)},
         }).encode()
         stdout = payload + b"\nMetal warning: some late teardown message"
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
@@ -1922,7 +1995,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
             result = _run_steno_diarize(Path("/fake/mic.wav"), 60)
         segments, embeddings = result
         self.assertEqual(segments, [{"start": 0.0, "end": 0.9, "speaker": "SPEAKER_0"}])
-        self.assertEqual(embeddings, {"SPEAKER_0": [0.1, 0.2]})
+        self.assertEqual(embeddings, {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)})
 
     def test_skips_an_interstitial_json_blob_that_is_not_the_real_payload(self):
         # A real ~18-minute diarization run measured a non-payload JSON-
@@ -1934,7 +2007,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
         # dict with a "segments" key and keep scanning for the real one.
         real_payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
-            "speakers": {"SPEAKER_0": [0.1, 0.2]},
+            "speakers": {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)},
         }).encode()
         stdout = b'{"status": "starting"}\n' + real_payload
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
@@ -1942,7 +2015,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
             result = _run_steno_diarize(Path("/fake/mic.wav"), 60)
         segments, embeddings = result
         self.assertEqual(segments, [{"start": 0.0, "end": 0.9, "speaker": "SPEAKER_0"}])
-        self.assertEqual(embeddings, {"SPEAKER_0": [0.1, 0.2]})
+        self.assertEqual(embeddings, {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)})
 
     def test_prefers_the_last_matching_payload_when_multiple_exist(self):
         # If more than one JSON blob in stdout DOES have a "segments" key
@@ -1952,11 +2025,11 @@ class RunStenoDiarizeTests(unittest.TestCase):
         # so prefer the LAST match.
         first_payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
-            "speakers": {"SPEAKER_0": [0.1, 0.2]},
+            "speakers": {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)},
         }).encode()
         second_payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_1", "start": 5.0, "end": 6.0}],
-            "speakers": {"SPEAKER_1": [0.9, 0.9]},
+            "speakers": {"SPEAKER_1": _sidecar_embedding(0.9, 0.9)},
         }).encode()
         stdout = first_payload + b"\n" + second_payload
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
@@ -1964,7 +2037,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
             result = _run_steno_diarize(Path("/fake/mic.wav"), 60)
         segments, embeddings = result
         self.assertEqual(segments, [{"start": 5.0, "end": 6.0, "speaker": "SPEAKER_1"}])
-        self.assertEqual(embeddings, {"SPEAKER_1": [0.9, 0.9]})
+        self.assertEqual(embeddings, {"SPEAKER_1": _sidecar_embedding(0.9, 0.9)})
 
     def test_falls_back_to_bare_segments_array_when_no_output_object_exists(self):
         # Traced against a REAL ~3.5h recording via a direct, wrapper-free
@@ -2003,7 +2076,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
         bare_array = b'[{"speakerId":"SPEAKER_0","start":0.0,"end":1.0}]'
         object_payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_1", "start": 5.0, "end": 6.0}],
-            "speakers": {"SPEAKER_1": [0.9, 0.9]},
+            "speakers": {"SPEAKER_1": _sidecar_embedding(0.9, 0.9)},
         }).encode()
         stdout = bare_array + b"\n" + object_payload
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/mic.wav"), \
@@ -2011,7 +2084,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
             result = _run_steno_diarize(Path("/fake/mic.wav"), 60)
         segments, embeddings = result
         self.assertEqual(segments, [{"start": 5.0, "end": 6.0, "speaker": "SPEAKER_1"}])
-        self.assertEqual(embeddings, {"SPEAKER_1": [0.9, 0.9]})
+        self.assertEqual(embeddings, {"SPEAKER_1": _sidecar_embedding(0.9, 0.9)})
 
     def test_missing_speakers_key_returns_empty_embeddings(self):
         payload = json.dumps({
@@ -2041,10 +2114,22 @@ class RunStenoDiarizeTests(unittest.TestCase):
              _patch_popen(stdout=payload, stderr=b"", returncode=0):
             self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
 
-    def test_nonzero_exit_returns_none(self):
+    def test_wrong_embedding_dimension_falls_back_instead_of_persisting_it(self):
+        payload = json.dumps({
+            "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
+            "speakers": {"SPEAKER_0": [0.1, 0.2]},
+        }).encode()
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
-             _patch_popen(stdout=b"", stderr=b"boom", returncode=1):
+             _patch_popen(stdout=payload, stderr=b"", returncode=0):
             self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
+
+    def test_nonzero_exit_returns_none(self):
+        fake = _FakePopen(stdout=b"", stderr=b"boom", returncode=1)
+        with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
+             patch("subprocess.Popen", return_value=fake):
+            self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
+        self.assertTrue(fake.stdout.closed)
+        self.assertTrue(fake.stderr.closed)
 
     def test_unparseable_json_returns_none(self):
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
@@ -2058,13 +2143,30 @@ class RunStenoDiarizeTests(unittest.TestCase):
 
     def test_timeout_returns_none(self):
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
+             patch("src.transcriber._terminate_process_tree") as terminate, \
              _patch_popen(stdout=b"", stderr=b"", returncode=0, raise_timeout_once=True):
             self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
+        terminate.assert_called_once()
+
+    def test_sidecar_starts_in_its_own_process_group(self):
+        payload = json.dumps({"segments": [], "speakers": {}}).encode()
+        fake = _FakePopen(stdout=payload)
+        with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \
+             patch("subprocess.Popen", return_value=fake) as popen:
+            self.assertIsNotNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
+
+        kwargs = popen.call_args.kwargs
+        if sys.platform == "win32":
+            self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NEW_PROCESS_GROUP)
+            self.assertNotIn("start_new_session", kwargs)
+        else:
+            self.assertIs(kwargs["start_new_session"], True)
+            self.assertNotIn("creationflags", kwargs)
 
     def test_progress_sink_called_with_parsed_embedding_progress(self):
         payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
-            "speakers": {"SPEAKER_0": [0.1, 0.2]},
+            "speakers": {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)},
         }).encode()
         stderr = b"PROGRESS:embedding:1/3\nPROGRESS:embedding:2/3\nPROGRESS:embedding:3/3\n"
         calls = []
@@ -2077,7 +2179,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
     def test_progress_sink_not_required_and_unmatched_stderr_lines_ignored(self):
         payload = json.dumps({
             "segments": [{"speakerId": "SPEAKER_0", "start": 0.0, "end": 0.9}],
-            "speakers": {"SPEAKER_0": [0.1, 0.2]},
+            "speakers": {"SPEAKER_0": _sidecar_embedding(0.1, 0.2)},
         }).encode()
         stderr = b"some unrelated diagnostic line\nsteno-diarize: 1 chunk(s) failed embedding extraction\n"
         with patch("src.transcriber._resolve_steno_diarize", return_value="/fake/steno-diarize"), \

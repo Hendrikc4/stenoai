@@ -1,6 +1,8 @@
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -64,6 +66,8 @@ class SuggestSpeakersCliTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(_last_json(result.output), {
                 "success": True,
+                "schema_version": 1,
+                "diarization_run_id": None,
                 "meeting_id": "mtg001",
                 "recording_available": False,
                 "minimum_speaker_count": 0,
@@ -77,11 +81,41 @@ class SuggestSpeakersCliTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(_last_json(result.output), {
                 "success": True,
+                "schema_version": 1,
+                "diarization_run_id": None,
                 "meeting_id": "missing",
                 "recording_available": False,
                 "minimum_speaker_count": 0,
                 "channels": {},
             })
+
+    def test_legacy_sidecar_exposes_a_stale_safe_review_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            legacy = {
+                "meeting_id": "legacy",
+                "channels": {
+                    "mic": {
+                        "recording_type": "in_person",
+                        "clusters": {
+                            "SPEAKER_0": {
+                                "embedding": [1.0, 0.0],
+                                "speech_duration_seconds": 30.0,
+                                "segment_count": 5,
+                            },
+                        },
+                    },
+                },
+            }
+            (output_dir / "legacy_speakers.json").write_text(json.dumps(legacy))
+
+            result = self._run(["legacy"], tmp)
+            data = _last_json(result.output)
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertRegex(data["diarization_run_id"], r"^legacy-[0-9a-f]{64}$")
+            self.assertIn("SPEAKER_0", data["channels"]["mic"])
 
     def test_includes_duration_segment_count_and_first_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -480,6 +514,43 @@ class GetSpeakerSampleAudioCliTests(unittest.TestCase):
                 self._run(["mtg001", "system", "SPEAKER_0"], tmp)
             self.assertFalse(captured_path["path"].exists())
 
+    def test_parallel_sample_requests_get_unique_temp_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_sidecar_and_recording(tmp)
+            dirs = {
+                "recordings": Path(tmp) / "recordings",
+                "transcripts": Path(tmp) / "transcripts",
+                "output": Path(tmp) / "output",
+            }
+            captured_paths = []
+            extraction_barrier = threading.Barrier(2)
+            capture_lock = threading.Lock()
+
+            def fake_extract(audio_path, channel, segments, output_path, segment_index=None):
+                with capture_lock:
+                    captured_paths.append(output_path)
+                extraction_barrier.wait(timeout=2.0)
+                output_path.write_bytes(b"stub")
+                return True
+
+            with mock.patch(
+                "src.speaker_suggestions.extract_speaker_sample_audio",
+                side_effect=fake_extract,
+            ), mock.patch(
+                "src.config.get_data_dirs", return_value=dirs,
+            ), mock.patch("builtins.print"):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    list(executor.map(
+                        lambda _index: simple_recorder.get_speaker_sample_audio.callback(
+                            "mtg001", "system", "SPEAKER_0", None, None,
+                        ),
+                        range(2),
+                    ))
+
+            self.assertEqual(len(captured_paths), 2)
+            self.assertNotEqual(captured_paths[0], captured_paths[1])
+            self.assertTrue(all(not path.exists() for path in captured_paths))
+
     def test_no_source_recording_fails_gracefully(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "output"
@@ -557,12 +628,11 @@ class GetSpeakerSampleAudioCliTests(unittest.TestCase):
             with mock.patch("src.speaker_suggestions.extract_speaker_sample_audio", side_effect=fake_extract):
                 # Requesting the lower-duration fragment resolves to the
                 # merge primary (SPEAKER_0), same as confirm-speaker --
-                # verify via the resolved temp-file name AND that both
-                # fragments' segments were pooled together.
+                # verify that both fragments' segments are pooled together.
+                # Temp-file names are intentionally opaque and unique.
                 result = self._run(["mtg001", "system", "SPEAKER_2"], tmp)
             data = _last_json(result.output)
             self.assertTrue(data["success"])
-            self.assertIn("SPEAKER_0", str(captured["output_path"]))
             self.assertEqual(len(captured["segments"]), 2)
 
 

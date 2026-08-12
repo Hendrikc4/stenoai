@@ -59,7 +59,10 @@ echo ""
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "Building required speaker-diarization sidecar..."
     "$SCRIPT_DIR/build-diarize-sidecar.sh" "$(uname -m)"
-    test -x bin/steno-diarize
+    if [ ! -x bin/steno-diarize ]; then
+        echo "Error: speaker-diarization sidecar was not built at bin/steno-diarize" >&2
+        exit 1
+    fi
     echo ""
 fi
 

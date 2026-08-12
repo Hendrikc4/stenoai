@@ -15,11 +15,13 @@ import {
   useSetClusterReviewState,
   meetingStemFromSummaryFile,
 } from '@/hooks/useSpeakerSuggestions';
+import { useBlobAudioPlayback } from '@/hooks/useBlobAudioPlayback';
 import type { SpeakerSuggestion, StaleAssignment } from '@/lib/ipc';
 
 interface SpeakerReviewPanelProps {
   summaryFile: string;
   isDiarised: boolean;
+  hasSpeakerSidecar: boolean;
 }
 
 interface Row {
@@ -62,8 +64,31 @@ function suggestionLabel(suggestion: SpeakerSuggestion): string {
 // comparison (src/config.py) -- lets the "New person" dialog warn BEFORE
 // a round trip to the backend, which enforces the same rule as the real
 // source of truth (defense against a stale/racy profiles list here).
-function namesCollide(a: string, b: string): boolean {
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
+function foldPersonName(value: string): string {
+  return value
+    .trim()
+    .normalize('NFKC')
+    .replace(/\s+/gu, ' ')
+    .toLowerCase()
+    .replaceAll('ß', 'ss')
+    .replaceAll('ς', 'σ');
+}
+
+export function namesCollide(a: string, b: string): boolean {
+  return foldPersonName(a) === foldPersonName(b);
+}
+
+const STALE_DIARIZATION_ERROR_CODE = 'stale_diarization_run';
+const STALE_DIARIZATION_FEEDBACK =
+  'The speaker analysis changed while you were reviewing. Refreshing the list. Check the row before trying again.';
+
+function isStaleDiarizationError(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && error.code === STALE_DIARIZATION_ERROR_CODE,
+  );
 }
 
 /** People already assigned somewhere in this meeting first, the rest after,
@@ -212,11 +237,6 @@ function identificationHint(channel: string, suggestion: SpeakerSuggestion): str
   return parts.join(' · ');
 }
 
-function base64ToBlobUrl(base64: string, mimeType = 'audio/wav'): string {
-  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-  return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
-}
-
 /** Seconds -> "MM:SS" / "H:MM:SS", matching the [MM:SS] markers in the
  * saved transcript (src.transcriber._format_timestamp) so an excerpt's
  * timestamp can be found by eye in the transcript above. */
@@ -232,6 +252,7 @@ interface PlaySampleButtonProps {
   meetingStem: string;
   channel: string;
   diarizationSpeakerId: string;
+  expectedRunId: string;
   /** Which of the row's `samples` to play. Omitted plays the cluster's
    * longest turn -- the collapsed row's single button. */
   segmentIndex?: number;
@@ -245,38 +266,17 @@ interface PlaySampleButtonProps {
  * a mutation (not cached) since nothing needs to stay fresh in the
  * background for a clip a human explicitly triggers. */
 function PlaySampleButton({
-  meetingStem, channel, diarizationSpeakerId, segmentIndex, disabled, label,
+  meetingStem, channel, diarizationSpeakerId, expectedRunId, segmentIndex, disabled, label,
 }: PlaySampleButtonProps) {
   const getSample = useGetSpeakerSampleAudio();
-  const audioRef = React.useRef<HTMLAudioElement | null>(null);
-  const [playing, setPlaying] = React.useState(false);
-
-  const stop = () => {
-    audioRef.current?.pause();
-    audioRef.current = null;
-    setPlaying(false);
-  };
-
-  React.useEffect(() => stop, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const toggle = async () => {
-    if (playing) {
-      stop();
-      return;
-    }
+  const playbackKey = segmentIndex === undefined ? 'cluster' : `excerpt-${segmentIndex}`;
+  const playback = useBlobAudioPlayback(async () => {
     const result = await getSample.mutateAsync({
-      meetingStem, channel, diarizationSpeakerId, segmentIndex,
+      meetingStem, channel, diarizationSpeakerId, expectedRunId, segmentIndex,
     });
-    const url = base64ToBlobUrl(result.audio_base64);
-    const audio = new Audio(url);
-    audio.onended = () => {
-      URL.revokeObjectURL(url);
-      setPlaying(false);
-    };
-    audioRef.current = audio;
-    setPlaying(true);
-    void audio.play();
-  };
+    return result.audio_base64;
+  });
+  const playing = playback.playingKey === playbackKey;
 
   const title = label ?? (playing ? 'Stop sample' : 'Play sample');
   // Distinct testid per excerpt: the whole point of the expanded list is
@@ -287,24 +287,52 @@ function PlaySampleButton({
     : `speaker-play-${channel}:${diarizationSpeakerId}-${segmentIndex}`;
 
   return (
-    <Button
-      size="sm"
-      variant="ghost"
-      aria-label={playing ? 'Stop sample' : title}
-      title={playing ? 'Stop sample' : title}
-      disabled={disabled || getSample.isPending}
-      onClick={() => void toggle()}
-      data-testid={testId}
-    >
-      {getSample.isPending ? (
-        <Loader2 className="size-[13px] animate-spin" />
-      ) : playing ? (
-        <Square className="size-[13px]" />
-      ) : (
-        <Play className="size-[13px]" />
+    <span className="inline-flex items-center gap-2">
+      <Button
+        size="sm"
+        variant="ghost"
+        aria-label={playing ? 'Stop sample' : title}
+        title={playing ? 'Stop sample' : title}
+        disabled={disabled || playback.pendingKey !== null}
+        onClick={() => void playback.toggle(playbackKey)}
+        data-testid={testId}
+      >
+        {playback.pendingKey !== null ? (
+          <Loader2 className="size-[13px] animate-spin" />
+        ) : playing ? (
+          <Square className="size-[13px]" />
+        ) : (
+          <Play className="size-[13px]" />
+        )}
+      </Button>
+      {playback.errorKey === playbackKey && (
+        <span role="alert" className="text-[12px]" style={{ color: 'var(--danger)' }}>
+          Could not play this sample. Try again.
+        </span>
       )}
-    </Button>
+    </span>
   );
+}
+
+export function channelClusterCapacity(
+  channels: Record<string, Record<string, SpeakerSuggestion>>,
+): number {
+  let highestMinimum = 0;
+  let matchingCapacity = 0;
+  for (const clusters of Object.values(channels)) {
+    const visibleClusters = Object.values(clusters);
+    const capacity = visibleClusters.length;
+    const minimum = capacity
+      + visibleClusters.filter((cluster) => cluster.contains_multiple_speakers).length;
+    if (
+      minimum > highestMinimum
+      || (minimum === highestMinimum && capacity > matchingCapacity)
+    ) {
+      highestMinimum = minimum;
+      matchingCapacity = capacity;
+    }
+  }
+  return matchingCapacity;
 }
 
 /**
@@ -326,12 +354,16 @@ function PlaySampleButton({
  * failure on this row read "Couldn't confirm", including a failed
  * more-than-one-person marking, which describes an operation the user did
  * not attempt. */
-type ConfirmFeedback = { message: string; action?: 'confirm' | 'mark' | 'unmark' };
+type ConfirmFeedback = { message: string; action?: 'confirm' | 'mark' | 'unmark' | 'review' };
 
-export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPanelProps) {
+export function SpeakerReviewPanel({
+  summaryFile,
+  isDiarised,
+  hasSpeakerSidecar,
+}: SpeakerReviewPanelProps) {
   const meetingStem = meetingStemFromSummaryFile(summaryFile);
-  const suggestionsQuery = useSpeakerSuggestions(meetingStem);
-  const profilesQuery = usePersonProfiles();
+  const suggestionsQuery = useSpeakerSuggestions(meetingStem, hasSpeakerSidecar);
+  const profilesQuery = usePersonProfiles(hasSpeakerSidecar);
   const confirmSpeaker = useConfirmSpeaker();
   const markCluster = useMarkSpeakerCluster();
   const setReviewState = useSetClusterReviewState();
@@ -344,7 +376,7 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
   const [personQuery, setPersonQuery] = React.useState('');
   const [newPersonRow, setNewPersonRow] = React.useState<Row | null>(null);
   const [newPersonName, setNewPersonName] = React.useState('');
-  const [newPersonAuthorized, setNewPersonAuthorized] = React.useState(false);
+  const [newPersonError, setNewPersonError] = React.useState<string | null>(null);
   const [showFiltered, setShowFiltered] = React.useState(false);
   // Error acknowledgment only -- a SUCCESSFUL confirm needs no separate
   // feedback state: useConfirmSpeaker's onSuccess awaits the suggestions
@@ -369,6 +401,8 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
     Boolean(suggestionsQuery.data),
     rows.length,
   )) return null;
+  const diarizationRunId = suggestionsQuery.data?.diarization_run_id;
+  if (!diarizationRunId) return null;
   // Most speaking time first. Reviewing is voluntary and can be abandoned at
   // any point, so the order decides how much of the transcript the first
   // couple of decisions actually cover -- and the more the diarizer splits a
@@ -437,6 +471,19 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
     ? (profilesQuery.data ?? []).find((p) => namesCollide(p.display_name, newPersonName))
     : undefined;
 
+  const reportMutationFailure = (
+    key: string,
+    error: unknown,
+    action?: ConfirmFeedback['action'],
+  ) => {
+    const stale = isStaleDiarizationError(error);
+    setFeedback((prev) => new Map(prev).set(key, {
+      message: stale ? STALE_DIARIZATION_FEEDBACK : 'Try again.',
+      action,
+    }));
+    if (stale) void suggestionsQuery.refetch();
+  };
+
   const confirm = (row: Row, args: { personId?: string; newPersonName?: string }) => {
     const key = rowKey(row);
     setFeedback((prev) => {
@@ -449,14 +496,13 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
         meetingStem,
         channel: row.channel,
         diarizationSpeakerId: row.diarizationSpeakerId,
+        expectedRunId: diarizationRunId,
         personId: args.personId,
         newPersonName: args.newPersonName,
         summaryFile,
       },
       {
-        onError: (error) => {
-          setFeedback((prev) => new Map(prev).set(key, { message: error.message }));
-        },
+        onError: (error) => reportMutationFailure(key, error),
       },
     );
   };
@@ -473,23 +519,77 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
         meetingStem,
         channel: row.channel,
         diarizationSpeakerId: row.diarizationSpeakerId,
+        expectedRunId: diarizationRunId,
         containsMultipleSpeakers,
         summaryFile,
       },
       {
-        onError: (error) => {
-          setFeedback((prev) => new Map(prev).set(key, {
-            message: error.message,
-            action: containsMultipleSpeakers ? 'mark' : 'unmark',
-          }));
-        },
+        onError: (error) => reportMutationFailure(
+          key,
+          error,
+          containsMultipleSpeakers ? 'mark' : 'unmark',
+        ),
       },
     );
   };
 
-  const totalClusters = Object.values(channels).reduce(
-    (sum, clusters) => sum + Object.keys(clusters).length, 0,
-  );
+  const setGenericReview = (row: Row, generic: boolean) => {
+    const key = rowKey(row);
+    setFeedback((prev) => {
+      const next = new Map(prev);
+      next.delete(key);
+      return next;
+    });
+    setReviewState.mutate(
+      {
+        meetingStem,
+        channel: row.channel,
+        diarizationSpeakerId: row.diarizationSpeakerId,
+        expectedRunId: diarizationRunId,
+        generic,
+      },
+      {
+        onError: (error) => reportMutationFailure(key, error, 'review'),
+      },
+    );
+  };
+
+  const submitNewPerson = async () => {
+    if (
+      !newPersonRow
+      || !newPersonName.trim()
+      || duplicateProfile
+      || confirmSpeaker.isPending
+    ) return;
+    setNewPersonError(null);
+    try {
+      await confirmSpeaker.mutateAsync({
+        meetingStem,
+        channel: newPersonRow.channel,
+        diarizationSpeakerId: newPersonRow.diarizationSpeakerId,
+        expectedRunId: diarizationRunId,
+        newPersonName: newPersonName.trim(),
+        summaryFile,
+      });
+      setNewPersonRow(null);
+    } catch (error) {
+      if (isStaleDiarizationError(error)) {
+        // This dialog holds a row object from the run that just became
+        // stale. Close it before refetching: keeping it open would combine
+        // its old cluster id with the next run id on retry, and diarizer ids
+        // are intentionally not stable across runs.
+        const staleRow = newPersonRow;
+        setNewPersonRow(null);
+        setNewPersonName('');
+        setNewPersonError(null);
+        reportMutationFailure(rowKey(staleRow), error);
+      } else {
+        setNewPersonError('Could not create this person. The name may already exist. Try another name.');
+      }
+    }
+  };
+
+  const clusterCapacity = channelClusterCapacity(channels);
   const minimumSpeakers = suggestionsQuery.data?.minimum_speaker_count ?? 0;
 
   return (
@@ -514,13 +614,13 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
           {staleNotice}
         </p>
       )}
-      {minimumSpeakers > totalClusters && (
+      {minimumSpeakers > clusterCapacity && (
         <p
           className="text-[11.5px]"
           style={{ color: 'var(--fg-2)', margin: 0 }}
           data-testid="speaker-minimum-count"
         >
-          {`At least ${minimumSpeakers} people spoke, but only ${totalClusters} could be told apart. `}
+          {`At least ${minimumSpeakers} people spoke, but only ${clusterCapacity} could be told apart on one channel. `}
           {'Speech from a group marked as more than one person is left unassigned.'}
         </p>
       )}
@@ -626,6 +726,8 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
                         ? "Couldn't mark this as more than one person"
                         : feedback.get(key)!.action === 'unmark'
                           ? "Couldn't undo the marking"
+                          : feedback.get(key)!.action === 'review'
+                            ? "Couldn't update the review state"
                           : "Couldn't confirm"
                     }: ${feedback.get(key)!.message}`}
                   </span>
@@ -637,6 +739,7 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
                     meetingStem={meetingStem}
                     channel={row.channel}
                     diarizationSpeakerId={row.diarizationSpeakerId}
+                    expectedRunId={diarizationRunId}
                     disabled={anyConfirmPending}
                   />
                 )}
@@ -775,7 +878,7 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
                   disabled={anyConfirmPending}
                   onClick={() => {
                     setNewPersonName('');
-                    setNewPersonAuthorized(false);
+                    setNewPersonError(null);
                     setNewPersonRow(row);
                   }}
                   data-testid={`speaker-new-person-${key}`}
@@ -830,14 +933,7 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
                     aria-label={isKept ? 'Reopen this speaker for naming' : 'Keep generic label'}
                     title={isKept ? 'Reopen this speaker for naming' : 'Keep generic label'}
                     disabled={anyConfirmPending}
-                    onClick={() =>
-                      setReviewState.mutate({
-                        meetingStem,
-                        channel: row.channel,
-                        diarizationSpeakerId: row.diarizationSpeakerId,
-                        generic: !isKept,
-                      })
-                    }
+                    onClick={() => setGenericReview(row, !isKept)}
                     data-testid={`speaker-keep-generic-${key}`}
                   >
                     {isKept ? <Undo2 className="size-[13px]" /> : <X className="size-[13px]" />}
@@ -895,6 +991,7 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
                           meetingStem={meetingStem}
                           channel={row.channel}
                           diarizationSpeakerId={row.diarizationSpeakerId}
+                          expectedRunId={diarizationRunId}
                           segmentIndex={index}
                           disabled={anyConfirmPending || sample.end <= sample.start}
                           label={
@@ -954,9 +1051,9 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
       <Dialog
         open={newPersonRow !== null}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !confirmSpeaker.isPending) {
             setNewPersonRow(null);
-            setNewPersonAuthorized(false);
+            setNewPersonError(null);
           }
         }}
       >
@@ -978,6 +1075,7 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
           <Input
             value={newPersonName}
             onChange={(e) => setNewPersonName(e.target.value)}
+            disabled={confirmSpeaker.isPending}
             placeholder="e.g. Person Alpha"
             autoFocus
             onKeyDown={(e) => {
@@ -986,11 +1084,8 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
                 && newPersonRow
                 && newPersonName.trim()
                 && !duplicateProfile
-                && newPersonAuthorized
               ) {
-                confirm(newPersonRow, { newPersonName: newPersonName.trim() });
-                setNewPersonRow(null);
-                setNewPersonAuthorized(false);
+                void submitNewPerson();
               }
             }}
             data-testid="speaker-new-person-input"
@@ -1000,44 +1095,25 @@ export function SpeakerReviewPanel({ summaryFile, isDiarised }: SpeakerReviewPan
               A person named "{duplicateProfile.display_name}" already exists -- use Change to pick them instead.
             </p>
           )}
-          <label
-            className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-border p-3 text-[13px] leading-[1.4]"
-            style={{ color: 'var(--fg-1)' }}
-          >
-            <input
-              type="checkbox"
-              checked={newPersonAuthorized}
-              onChange={(event) => setNewPersonAuthorized(event.target.checked)}
-              className="mt-0.5 size-4 shrink-0 accent-[color:var(--fg-1)]"
-              data-testid="speaker-profile-authorized"
-            />
-            <span>
-              I confirm that I have informed this person and am authorised to create and use their
-              voice profile.
-            </span>
-          </label>
+          {newPersonError && (
+            <p role="alert" className="text-[12px]" style={{ color: 'var(--danger)' }} data-testid="speaker-new-person-error">
+              {newPersonError}
+            </p>
+          )}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
+              <Button variant="outline" disabled={confirmSpeaker.isPending}>Cancel</Button>
             </DialogClose>
             <Button
               disabled={
-                !newPersonName.trim() || Boolean(duplicateProfile) || !newPersonAuthorized
+                !newPersonName.trim()
+                || Boolean(duplicateProfile)
+                || confirmSpeaker.isPending
               }
-              onClick={() => {
-                if (
-                  !newPersonRow
-                  || !newPersonName.trim()
-                  || duplicateProfile
-                  || !newPersonAuthorized
-                ) return;
-                confirm(newPersonRow, { newPersonName: newPersonName.trim() });
-                setNewPersonRow(null);
-                setNewPersonAuthorized(false);
-              }}
+              onClick={() => void submitNewPerson()}
               data-testid="speaker-new-person-submit"
             >
-              Create
+              {confirmSpeaker.isPending ? 'Creating…' : 'Create'}
             </Button>
           </DialogFooter>
         </DialogContent>

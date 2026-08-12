@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,19 +45,31 @@ class SpeakerTimestampsCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "output").mkdir(parents=True, exist_ok=True)
             result = self._run(["mtg_nonexistent", "mic", "SPEAKER_00"], tmp)
-            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(json.loads(result.output), {
+                "success": False,
+                "error": "No speakers sidecar found for 'mtg_nonexistent'",
+            })
 
     def test_missing_channel_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._seed_sidecar(tmp)
             result = self._run(["mtg001", "system", "SPEAKER_00"], tmp)
-            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(json.loads(result.output), {
+                "success": False,
+                "error": "No 'system' channel in sidecar for 'mtg001'",
+            })
 
     def test_missing_cluster_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._seed_sidecar(tmp)
             result = self._run(["mtg001", "mic", "SPEAKER_99"], tmp)
-            self.assertNotEqual(result.exit_code, 0)
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(json.loads(result.output), {
+                "success": False,
+                "error": "No cluster 'SPEAKER_99' in 'mic' channel of 'mtg001'",
+            })
 
     def test_cluster_with_no_segments_field_prints_empty_list_gracefully(self):
         # Sidecars written before the `segments` field existed shouldn't crash.

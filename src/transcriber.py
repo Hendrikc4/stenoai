@@ -34,10 +34,12 @@ import logging
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -771,6 +773,26 @@ def _heartbeat_while_waiting(label: str, interval_s: float = STENO_DIARIZE_HEART
         t.join(timeout=1.0)
 
 
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate the isolated sidecar process group, including ffmpeg."""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise OSError(f"taskkill exited {result.returncode}")
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+        return
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("Could not terminate steno-diarize process group; killing parent")
+    proc.kill()
+
+
 def _run_steno_diarize(
     channel_path: Path, timeout: int,
     progress_sink: Optional[Callable[[int, int], None]] = None,
@@ -814,11 +836,18 @@ def _run_steno_diarize(
     binary = _resolve_steno_diarize()
     if not binary:
         return None
+    proc: Optional[subprocess.Popen] = None
     try:
+        process_group_options = (
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if sys.platform == "win32"
+            else {"start_new_session": True}
+        )
         proc = subprocess.Popen(
-            [binary, str(channel_path)],
+            [binary, "diarize", str(channel_path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={**os.environ, **extra_env} if extra_env else None,
+            **process_group_options,
         )
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
@@ -848,8 +877,12 @@ def _run_steno_diarize(
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            _terminate_process_tree(proc)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             t_out.join(timeout=2.0)
             t_err.join(timeout=2.0)
             logger.warning("steno-diarize timed out after %ss", timeout)
@@ -923,6 +956,14 @@ def _run_steno_diarize(
     except (subprocess.TimeoutExpired, OSError, ValueError, KeyError) as e:
         logger.warning("steno-diarize failed: %s", e)
         return None
+    finally:
+        if proc is not None:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
     try:
         if not isinstance(raw_segments, list) or not isinstance(raw_embeddings, dict):
@@ -945,14 +986,11 @@ def _run_steno_diarize(
             segments.append({"start": start, "end": end, "speaker": speaker})
         segments.sort(key=lambda segment: segment["start"])
 
+        from src.speaker_schema import validate_embedding
+
         embeddings = {}
         for speaker, raw_embedding in raw_embeddings.items():
-            if not isinstance(raw_embedding, list) or not raw_embedding:
-                raise TypeError("each speaker embedding must be a non-empty list")
-            embedding = [float(value) for value in raw_embedding]
-            if not all(math.isfinite(value) for value in embedding):
-                raise ValueError("speaker embedding contains a non-finite value")
-            embeddings[str(speaker)] = embedding
+            embeddings[str(speaker)] = validate_embedding(raw_embedding)
 
         # Merge first so a same-speaker overlap (the flicker case) collapses
         # into one turn instead of being clamped into two touching ones.
@@ -1069,9 +1107,13 @@ def _voiceprint_distance(embedding: list, voiceprint: dict) -> float:
     centroid = voiceprint.get("centroid")
     if centroid:
         anchors.append(centroid)
-    if not anchors:
-        return float("inf")
-    return min(cosine_distance(embedding, a) for a in anchors)
+    distances = []
+    for anchor in anchors:
+        try:
+            distances.append(cosine_distance(embedding, anchor))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return min(distances, default=float("inf"))
 
 
 def _apply_voiceprint_matches(
@@ -1403,6 +1445,59 @@ def _resolve_speaker_placeholders(
             label = numbering[label]
         resolved.append((start, label, text, channel, raw_sid))
     return resolved
+
+
+@dataclass(frozen=True)
+class _DiarisedTurnAssembly:
+    plain_parts: list[str]
+    diarised_text: Optional[str]
+    is_diarised: bool
+    turn_manifest: list[dict]
+
+
+def _assemble_diarised_turns(
+    tagged: list[tuple[float, str, str, str, Optional[str]]],
+) -> _DiarisedTurnAssembly:
+    """Build the shared transcript and provenance representation.
+
+    A saved diarised line and its manifest entry are positionally paired.
+    Keeping turn collapse, visible-label detection, rendering, and manifest
+    creation in one helper prevents the mono and stereo paths from drifting.
+    Adjacent text is collapsed only when its visible label and full source
+    provenance match; unplaceable text therefore cannot inherit a cluster.
+    """
+    turns: list[tuple[float, str, list[str], str, Optional[str]]] = []
+    for start, speaker, text, channel, raw_sid in tagged:
+        if (
+            turns
+            and turns[-1][1] == speaker
+            and turns[-1][3] == channel
+            and turns[-1][4] == raw_sid
+        ):
+            turns[-1][2].append(text)
+        else:
+            turns.append((start, speaker, [text], channel, raw_sid))
+
+    plain_parts = [' '.join(parts) for _start, _speaker, parts, _channel, _raw_sid in turns]
+    distinct_labels = {speaker for _start, speaker, _parts, _channel, _raw_sid in turns}
+    is_diarised = len(distinct_labels) > 1
+    if not is_diarised:
+        return _DiarisedTurnAssembly(plain_parts, None, False, [])
+
+    labelled_parts = [
+        f"[{_format_timestamp(start)}] [{speaker}] {' '.join(parts)}"
+        for start, speaker, parts, _channel, _raw_sid in turns
+    ]
+    turn_manifest = [
+        {"start": start, "channel": channel, "diarization_speaker_id": raw_sid}
+        for start, _speaker, _parts, channel, raw_sid in turns
+    ]
+    return _DiarisedTurnAssembly(
+        plain_parts,
+        "\n\n".join(labelled_parts),
+        True,
+        turn_manifest,
+    )
 
 
 # Try Parakeet first (preferred — same engine as live, arm64 Macs only).
@@ -2319,72 +2414,13 @@ class WhisperTranscriber:
             # or transcript_text), so the summariser strips these [MM:SS] markers
             # back out on the way in (summarizer._strip_leading_timestamps) —
             # summarisation is unaffected by this display feature.
-            # A turn is one span of ONE provenance, so the run breaks on the
-            # raw cluster id as well as the label. Merging on the label alone
-            # was reachable and wrong: text the diarizer could not place is
-            # appended under the CHANNEL's own label (raw_sid None), and
-            # _cluster_channel_labels hands that same label to the channel's
-            # dominant cluster -- so an unplaceable sentence next to that
-            # cluster's turn was folded in and recorded as its speech, which
-            # is exactly the attribution the unplaceable path withholds it
-            # from. Same reasoning in the mono path's copy of this loop.
-            turns: list[tuple[float, str, list[str], str, Optional[str]]] = []
-            for start, speaker, text, channel, raw_sid in tagged:
-                if turns and turns[-1][1] == speaker and turns[-1][4] == raw_sid:
-                    turns[-1][2].append(text)
-                else:
-                    turns.append((start, speaker, [text], channel, raw_sid))
-
-            plain_parts = [' '.join(parts) for _start, _speaker, parts, _channel, _raw_sid in turns]
-            plain_text = "\n\n".join(plain_parts) if plain_parts else SILENCE_SENTINEL
-
-            # Diarised means "more than one voice is distinguishable in this
-            # transcript" — NOT "both channels had content". The old
-            # bool(mic_segments) and bool(system_segments) check predates
-            # per-channel acoustic diarization and silently discarded the
-            # whole labelled transcript whenever one channel was empty (e.g.
-            # an in-person conversation with no system audio playing at
-            # all), even when _tag_channel_segments had already split the
-            # OTHER channel into "You" + "Speaker 2". Counting distinct
-            # labels covers both the classic two-channel case (You + Others)
-            # and the new single-channel multi-speaker case correctly, and
-            # still suppresses labelling a genuine one-voice monologue.
-            distinct_labels = {speaker for _start, speaker, _parts, _channel, _raw_sid in turns}
-            is_diarised = len(distinct_labels) > 1
-            if is_diarised:
-                labelled_parts = [
-                    f"[{_format_timestamp(start)}] [{speaker}] {' '.join(parts)}"
-                    for start, speaker, parts, _channel, _raw_sid in turns
-                ]
-                diarised_text = "\n\n".join(labelled_parts)
-                # EXACT per-line speaker provenance, for
-                # src.speaker_suggestions.relabel_transcript_exact -- ONE
-                # ENTRY PER TURN, IN THE SAME ORDER AS labelled_parts, with
-                # NO FILTERING (a raw_sid of None is a real, meaningful
-                # "unknown" entry, not an omission) -- relabel_transcript_exact
-                # pairs diarised transcript lines to this list purely BY
-                # POSITION, so count and order must stay 1:1 with the
-                # transcript's own diarised lines, always. See the plan
-                # doc's Phase 8: this replaces having to reconstruct "which
-                # cluster produced this line" via fuzzy timestamp matching
-                # after the fact, which is what caused real cross-channel
-                # and same-channel mislabeling found this session -- and
-                # was ALSO why an earlier version of this exact-match
-                # design (matching by timestamp lookup instead of position)
-                # turned out to still be vulnerable to the same class of
-                # bug, just at finer granularity.
-                turn_manifest = [
-                    {"start": start, "channel": channel, "diarization_speaker_id": raw_sid}
-                    for start, _speaker, _parts, channel, raw_sid in turns
-                ]
-            else:
-                diarised_text = None
-                turn_manifest = []
+            assembled = _assemble_diarised_turns(tagged)
+            plain_text = "\n\n".join(assembled.plain_parts) if assembled.plain_parts else SILENCE_SENTINEL
 
             return {
                 "text": plain_text,
-                "diarised_text": diarised_text,
-                "is_diarised": is_diarised,
+                "diarised_text": assembled.diarised_text,
+                "is_diarised": assembled.is_diarised,
                 "duration_seconds": duration,
                 "detected_language": detected_language,
                 "detected_language_probability": detected_language_probability,
@@ -2396,7 +2432,7 @@ class WhisperTranscriber:
                 "speaker_clusters": speaker_clusters,
                 # list[{"start", "channel", "diarization_speaker_id"}], one
                 # per turn -- see comment above turn_manifest's construction.
-                "turn_manifest": turn_manifest,
+                "turn_manifest": assembled.turn_manifest,
                 # Worst channel wins: a meeting is only as complete as the
                 # side that lost the most. None when no channel reported a
                 # figure (whisper.cpp, parakeet-mlx, or a file short enough
@@ -2450,32 +2486,12 @@ class WhisperTranscriber:
         tagged.sort(key=lambda t: t[0])
         tagged = _resolve_speaker_placeholders(tagged)
 
-        # Breaks on the raw cluster id too -- see the stereo path's comment
-        # above its copy of this loop for the attribution that depends on it.
-        turns: list[tuple[float, str, list[str], str, Optional[str]]] = []
-        for start, speaker, text, channel, raw_sid in tagged:
-            if turns and turns[-1][1] == speaker and turns[-1][4] == raw_sid:
-                turns[-1][2].append(text)
-            else:
-                turns.append((start, speaker, [text], channel, raw_sid))
-
-        distinct_labels = {speaker for _start, speaker, _parts, _channel, _raw_sid in turns}
+        assembled = _assemble_diarised_turns(tagged)
         result['speaker_clusters'] = {}
-        result['turn_manifest'] = []
-        if len(distinct_labels) > 1:
-            labelled_parts = [
-                f"[{_format_timestamp(start)}] [{speaker}] {' '.join(parts)}"
-                for start, speaker, parts, _channel, _raw_sid in turns
-            ]
-            result['diarised_text'] = "\n\n".join(labelled_parts)
+        result['turn_manifest'] = assembled.turn_manifest
+        if assembled.is_diarised:
+            result['diarised_text'] = assembled.diarised_text
             result['is_diarised'] = True
-            # No filtering -- one entry per turn, same order as
-            # labelled_parts, paired by POSITION in relabel_transcript_exact
-            # (see the stereo path's comment above turn_manifest for why).
-            result['turn_manifest'] = [
-                {"start": start, "channel": channel, "diarization_speaker_id": raw_sid}
-                for start, _speaker, _parts, channel, raw_sid in turns
-            ]
             if mono_clusters:
                 # Same "mic" convention _transcribe_diarised_mono's own
                 # docstring documents: an unlabelled mono recording is

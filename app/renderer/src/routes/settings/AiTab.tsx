@@ -18,7 +18,7 @@ import { NvidiaIcon } from '@/components/ui/nvidia-icon';
 import { GoogleIcon } from '@/components/ui/google-icon';
 import { MetaIcon } from '@/components/ui/meta-icon';
 import { QwenIcon } from '@/components/ui/qwen-icon';
-import { cn } from '@/lib/utils';
+import { cn, isMac } from '@/lib/utils';
 import type { AiProvider, CloudProvider } from '@/lib/ipc';
 import {
   useAiProvider,
@@ -95,8 +95,6 @@ function TranscriptionSection() {
   const setLanguage = useSetLanguage();
   const keepRecordings = useKeepRecordingsSetting();
   const setKeepRecordings = useSetKeepRecordings();
-  const identityMatchingEnabled = useIdentityMatchingEnabledSetting();
-  const setIdentityMatchingEnabled = useSetIdentityMatchingEnabled();
   const engineQuery = useTranscriptionEngine();
 
   const engine = engineQuery.data ?? 'parakeet';
@@ -150,19 +148,32 @@ function TranscriptionSection() {
         />
       </SettingRow>
 
-      <SettingRow
-        label="Speaker identification"
-        description="Optional and off by default. When enabled, Steno stores numerical biometric voice profiles on this device to suggest people across meetings. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
-      >
-        <Switch
-          checked={identityMatchingEnabled.data ?? false}
-          onCheckedChange={(v) => setIdentityMatchingEnabled.mutate(v)}
-          disabled={identityMatchingEnabled.data === undefined}
-        />
-      </SettingRow>
+      {isMac && (
+        <SpeakerIdentificationSetting />
+      )}
 
       <TranscriptionModelList />
     </div>
+  );
+}
+
+export function SpeakerIdentificationSetting() {
+  const enabled = useIdentityMatchingEnabledSetting();
+  const setEnabled = useSetIdentityMatchingEnabled();
+  return (
+    <SettingRow
+      label="Speaker identification"
+      description="Optional and off by default. By enabling this, you confirm that you will inform the people you record and that you are authorised to create and use their numerical biometric voice profiles. Profiles stay on this device and are used only to suggest people across meetings. This opt-in does not by itself establish legal compliance. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
+      descriptionId="speaker-identification-description"
+    >
+      <Switch
+        aria-label="Speaker identification"
+        aria-describedby="speaker-identification-description"
+        checked={enabled.data ?? false}
+        onCheckedChange={(value) => setEnabled.mutate(value)}
+        disabled={enabled.data === undefined}
+      />
+    </SettingRow>
   );
 }
 

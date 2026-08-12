@@ -1290,7 +1290,11 @@ function DetailContent({
                 </section>
               )}
 
-              <SpeakerReviewPanel summaryFile={summaryFile} isDiarised={Boolean(meeting.is_diarised)} />
+              <SpeakerReviewPanel
+                summaryFile={summaryFile}
+                isDiarised={Boolean(meeting.is_diarised)}
+                hasSpeakerSidecar={Boolean(meeting.has_speaker_sidecar)}
+              />
             </div>
           )}
         </>
