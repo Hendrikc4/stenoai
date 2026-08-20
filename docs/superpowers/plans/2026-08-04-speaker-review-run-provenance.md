@@ -214,7 +214,7 @@ This slice changes a persisted format and the evidence-mutation path, so it earn
 
 - Run `/codex:review --base origin/feat/speaker-diarization` over the whole branch diff, not per task. The failure mode this slice can produce is silent and cross-file (evidence deleted or wrongly kept), which per-task review does not see.
 - Reconcile every finding: adopt it, or reject it with a stated reason. Never drop one silently.
-- Then stop. Pushing and opening the PR is Ben's call.
+- Then stop. Pushing and opening the PR is the maintainer's call.
 
 ## Self-review notes
 

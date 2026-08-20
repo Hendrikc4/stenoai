@@ -66,6 +66,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # T1 is already required by branch protection. Keep this scan here as
+      # well as in the standalone workflow that covers website-only changes.
+      - name: Scan tracked repository content for private fixtures
+        run: python dev/scripts/repository_privacy_guard.py
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:

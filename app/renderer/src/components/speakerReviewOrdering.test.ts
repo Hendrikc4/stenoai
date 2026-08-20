@@ -47,7 +47,7 @@ describe('orderProfilesForRow identity', () => {
 
 describe('filterProfilesByQuery', () => {
   it('matches anywhere in the name, not just the start', () => {
-    const found = filterProfilesByQuery([p('Zora Quinn'), p('Marie Kutza')], 'quinn');
+    const found = filterProfilesByQuery([p('Zora Quinn'), p('Rowan Example')], 'quinn');
     expect(found.map((x) => x.display_name)).toEqual(['Zora Quinn']);
   });
 
