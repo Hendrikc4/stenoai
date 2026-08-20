@@ -5652,6 +5652,7 @@ def confirm_speaker(
     relabeled_lines = 0
     if relabel_transcript:
         transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        previous_transcript_body = _saved_transcript_body(transcript_path)
         turn_manifest = sidecar.get("transcript_lines")
         if turn_manifest:
             # Exact recorded provenance -- immune to the fuzzy-matching
@@ -5681,6 +5682,13 @@ def confirm_speaker(
             for fragment_id in [resolved_id, *context.merged_from]:
                 pooled_segments.extend(raw_clusters_by_id.get(fragment_id, {}).get("segments") or [])
             relabeled_lines = relabel_transcript_speaker(transcript_path, pooled_segments, person["display_name"])
+        if relabeled_lines > 0 and previous_transcript_body is not None:
+            _update_summary_transcript(
+                output_dir,
+                meeting_stem,
+                transcript_path,
+                previous_transcript_body,
+            )
 
     # Naming the cluster supersedes "a human kept this generic": the row is
     # now decided, and leaving the marking would have the panel report a
@@ -6654,6 +6662,108 @@ def _enumerate_meeting_stems(output_dir):
 
 
 _MD_SECTION_HEADER_RE = re.compile(r"^## (.+?)\s*$")
+
+
+def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
+    """Read the user-facing body from a recorder-written transcript file.
+
+    `_write_transcript_file` prefixes metadata and a line of `=` characters.
+    Legacy/imported transcripts can be body-only, so a missing separator is a
+    valid fallback rather than an error.
+    """
+    try:
+        content = transcript_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"Could not read {transcript_path} to update summary transcript: {e}")
+        return None
+    lines = content.split("\n")
+    separator = (
+        next((i for i, line in enumerate(lines[:12]) if re.fullmatch(r"={20,}\s*", line)), None)
+        if lines and lines[0].startswith("Session:")
+        else None
+    )
+    body = "\n".join(lines[separator + 1:]) if separator is not None else content
+    return body.strip()
+
+
+def _update_summary_transcript(
+    output_dir: Path,
+    meeting_stem: str,
+    transcript_path: Path,
+    previous_transcript_body: str,
+) -> None:
+    """Keep a summary's embedded diarised transcript aligned after naming.
+
+    The separate transcript is the relabel operation's canonical artifact. An
+    embedded copy is replaced only when it still exactly matches the canonical
+    body from before relabeling. A user-edited or independently redacted copy is
+    preserved. JSON remains preferred when both summary formats exist, matching
+    the rest of the meeting-store code. Missing or unreadable artifacts are
+    best-effort no-ops because speaker-profile confirmation already succeeded.
+    """
+    transcript_body = _saved_transcript_body(transcript_path)
+    if not transcript_body:
+        return
+
+    json_path = output_dir / f"{meeting_stem}_summary.json"
+    md_path = output_dir / f"{meeting_stem}_summary.md"
+
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning(f"Could not read {json_path} to update transcript: {e}")
+            return
+        embedded_body = data.get("diarised_text")
+        if not isinstance(embedded_body, str) or embedded_body.strip() != previous_transcript_body.strip():
+            return
+        if embedded_body.strip() == transcript_body:
+            return
+        data["diarised_text"] = transcript_body
+        try:
+            _atomic_write_json(json_path, data)
+        except OSError as e:
+            logger.warning(f"Could not update transcript in {json_path}: {e}")
+        return
+
+    if not md_path.exists():
+        return
+    try:
+        original = md_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"Could not read {md_path} to update transcript: {e}")
+        return
+
+    lines = original.split("\n")
+    section_start = None
+    section_end = None
+    i = 0
+    while i < len(lines):
+        match = _MD_SECTION_HEADER_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        body_end = i + 1
+        while body_end < len(lines) and not _MD_SECTION_HEADER_RE.match(lines[body_end]):
+            body_end += 1
+        if match.group(1).strip().lower() == "transcript":
+            section_start, section_end = i, body_end
+            break
+        i = body_end
+
+    if section_start is None:
+        return
+    embedded_body = "\n".join(lines[section_start + 1:section_end]).strip()
+    if embedded_body != previous_transcript_body.strip():
+        return
+    new_section = ["## Transcript", "", *transcript_body.split("\n"), ""]
+    spliced = lines[:section_start] + new_section + lines[section_end:]
+    if spliced == lines:
+        return
+    try:
+        _atomic_write_text(md_path, "\n".join(spliced))
+    except OSError as e:
+        logger.warning(f"Could not update transcript in {md_path}: {e}")
 
 
 def _update_summary_participants(output_dir: Path, meeting_stem: str, participant_names: list) -> None:

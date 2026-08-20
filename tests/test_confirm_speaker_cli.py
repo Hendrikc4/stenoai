@@ -740,6 +740,14 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "output"
             output_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = output_dir / "mtg001_summary.md"
+            summary_path.write_text(
+                "---\nis_diarised: true\n---\n\n"
+                "## Summary\n\nA three-person meeting.\n\n"
+                "## Transcript\n\n"
+                "[00:05] [Speaker 2] hello there\n\n[00:20] [You] hi back\n",
+                encoding="utf-8",
+            )
             write_speakers_sidecar(output_dir, "mtg001", {
                 "mic": {
                     "recording_type": "in_person",
@@ -768,6 +776,45 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             text = transcript_path.read_text()
             self.assertIn("[00:05] [Person Gamma] hello there", text)
             self.assertIn("[00:20] [You] hi back", text)  # untouched
+            summary_text = summary_path.read_text()
+            self.assertIn("[00:05] [Person Gamma] hello there", summary_text)
+            self.assertNotIn("[00:05] [Speaker 2] hello there", summary_text)
+
+    def test_relabel_transcript_preserves_a_manually_edited_summary_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed_sidecar(tmp)
+            output_dir = Path(tmp) / "output"
+            summary_path = output_dir / "mtg001_summary.md"
+            edited_summary = (
+                "---\nis_diarised: true\n---\n\n## Summary\n\nEdited note.\n\n"
+                "## Transcript\n\n[00:00] [Speaker 2] manually corrected wording\n"
+            )
+            summary_path.write_text(edited_summary, encoding="utf-8")
+            transcripts_dir = Path(tmp) / "transcripts"
+            transcripts_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = transcripts_dir / "mtg001_transcript.txt"
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n[00:00] [Speaker 2] original wording",
+                encoding="utf-8",
+            )
+
+            result, _ = self._run(
+                ["mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma", "--relabel-transcript"],
+                tmp,
+            )
+
+            self.assertTrue(_last_json(result.output)["success"])
+            summary_text = summary_path.read_text(encoding="utf-8")
+            self.assertIn("[00:00] [Speaker 2] manually corrected wording", summary_text)
+            self.assertNotIn("[00:00] [Speaker 2] original wording", summary_text)
+
+    def test_saved_transcript_body_does_not_treat_a_body_divider_as_a_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript_path = Path(tmp) / "body-only.txt"
+            body = "[00:00] [You] before\n\n" + "=" * 60 + "\n\n[00:05] [Others] after"
+            transcript_path.write_text(body, encoding="utf-8")
+
+            self.assertEqual(simple_recorder._saved_transcript_body(transcript_path), body)
 
     def test_relabel_transcript_uses_exact_matching_when_sidecar_has_manifest(self):
         # See the plan doc's Phase 8: when the sidecar carries
