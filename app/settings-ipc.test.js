@@ -142,9 +142,9 @@ test('set-microphone inserts the `--` argv delimiter and coalesces null id/label
 
 test('set-user-name coerces nullish names to an empty string and trims the echoed fallback', async () => {
   const named = harness({ pyResult: 'noise' });
-  const r1 = await named.handlers['set-user-name']({}, '  Ben  ');
-  assert.deepStrictEqual(named.calls.py[0].args, ['set-user-name', '  Ben  ']);
-  assert.deepStrictEqual(r1, { success: true, user_name: 'Ben' });
+  const r1 = await named.handlers['set-user-name']({}, '  Casey Example  ');
+  assert.deepStrictEqual(named.calls.py[0].args, ['set-user-name', '  Casey Example  ']);
+  assert.deepStrictEqual(r1, { success: true, user_name: 'Casey Example' });
 
   const nullish = harness({ pyResult: 'noise' });
   const r2 = await nullish.handlers['set-user-name']({}, null);
