@@ -1,8 +1,5 @@
 import { test, expect } from '../fixtures/electron';
 import { writeMeetingMarkdown, writeTranscriptFile } from '../fixtures/user-config';
-import { mkdtempSync, rmSync, symlinkSync } from 'fs';
-import { tmpdir } from 'os';
-import path from 'path';
 
 /**
  * T2 — the meeting-DETAIL parser (get-meeting) must surface the optional
@@ -126,60 +123,28 @@ test('get-meeting leaves the markers unset for a normal summarised note', async 
   expect(res.meeting!.session_info.is_live_transcript).toBeFalsy();
 });
 
-test('get-meeting prefers the current diarised transcript over a stale embedded copy', async ({
+test('get-meeting keeps a manually redacted diarised summary transcript authoritative', async ({
   launchApp,
   userDataDir,
 }) => {
-  const file = writeMeetingMarkdown(userDataDir, 'named-speakers', {
-    name: 'Named speakers',
-    summaryMarkdown: '## Summary\nThree people discussed the plan.',
-    transcript: '[00:05] [Others] first remote speaker\n\n[00:10] [Speaker 2] second remote speaker',
+  const file = writeMeetingMarkdown(userDataDir, 'redacted-speakers', {
+    name: 'Redacted speakers',
+    summaryMarkdown: '## Summary\nSensitive wording was removed.',
+    transcript: '[00:05] [Speaker 2] [redacted]',
     frontmatter: { is_diarised: true },
   });
   writeTranscriptFile(
     userDataDir,
-    'named-speakers',
-    '[00:05] [Person Alpha] first remote speaker\n\n[00:10] [Speaker 2] second remote speaker',
+    'redacted-speakers',
+    '[00:05] [Person Alpha] sensitive wording that must stay hidden',
   );
 
   const { page } = await launchApp();
 
   const res = await getMeeting(page, file);
   expect(res.success, res.error).toBe(true);
-  expect(res.meeting!.diarised_text).toBe(
-    '[00:05] [Person Alpha] first remote speaker\n\n[00:10] [Speaker 2] second remote speaker',
-  );
-  expect(res.meeting!.diarised_text).not.toContain('[Others]');
-});
-
-test('get-meeting refuses a diarised transcript reached through a directory symlink', async ({
-  launchApp,
-  userDataDir,
-}) => {
-  const file = writeMeetingMarkdown(userDataDir, 'symlinked-transcript', {
-    name: 'Symlinked transcript',
-    summaryMarkdown: '## Summary\nThe embedded copy remains authoritative.',
-    transcript: '[00:05] [Others] embedded speaker',
-    frontmatter: { is_diarised: true },
-  });
-  const outsideDir = mkdtempSync(path.join(tmpdir(), 'stenoai-transcript-outside-'));
-  const transcriptLink = path.join(userDataDir, 'transcripts');
-  symlinkSync(outsideDir, transcriptLink, process.platform === 'win32' ? 'junction' : 'dir');
-
-  try {
-    writeTranscriptFile(
-      userDataDir,
-      'symlinked-transcript',
-      '[00:05] [Person Outside] content outside the user-data root',
-    );
-    const { page } = await launchApp();
-
-    const res = await getMeeting(page, file);
-    expect(res.success, res.error).toBe(true);
-    expect(res.meeting!.diarised_text).toBe('[00:05] [Others] embedded speaker');
-  } finally {
-    rmSync(outsideDir, { recursive: true, force: true });
-  }
+  expect(res.meeting!.diarised_text).toBe('[00:05] [Speaker 2] [redacted]');
+  expect(res.meeting!.diarised_text).not.toContain('sensitive wording that must stay hidden');
 });
 
 test('LIST (Python parser) and DETAIL (JS parser) agree on the session_info markers', async ({

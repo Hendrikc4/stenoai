@@ -816,6 +816,58 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
 
             self.assertEqual(simple_recorder._saved_transcript_body(transcript_path), body)
 
+    def test_update_summary_transcript_updates_a_matching_json_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = output_dir / "mtg001_summary.json"
+            previous = "[00:00] [Speaker 2] original wording"
+            summary_path.write_text(
+                json.dumps({"is_diarised": True, "diarised_text": previous}),
+                encoding="utf-8",
+            )
+            transcript_path = Path(tmp) / "mtg001_transcript.txt"
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n[00:00] [Person Gamma] original wording",
+                encoding="utf-8",
+            )
+
+            simple_recorder._update_summary_transcript(
+                output_dir,
+                "mtg001",
+                transcript_path,
+                previous,
+            )
+
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["diarised_text"], "[00:00] [Person Gamma] original wording")
+
+    def test_update_summary_transcript_preserves_a_redacted_json_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = output_dir / "mtg001_summary.json"
+            redacted = "[00:00] [Speaker 2] [redacted]"
+            summary_path.write_text(
+                json.dumps({"is_diarised": True, "diarised_text": redacted}),
+                encoding="utf-8",
+            )
+            transcript_path = Path(tmp) / "mtg001_transcript.txt"
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n[00:00] [Person Gamma] sensitive wording",
+                encoding="utf-8",
+            )
+
+            simple_recorder._update_summary_transcript(
+                output_dir,
+                "mtg001",
+                transcript_path,
+                "[00:00] [Speaker 2] sensitive wording",
+            )
+
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["diarised_text"], redacted)
+
     def test_relabel_transcript_uses_exact_matching_when_sidecar_has_manifest(self):
         # See the plan doc's Phase 8: when the sidecar carries
         # transcript_lines (written by a post-Phase-8 live pipeline run),

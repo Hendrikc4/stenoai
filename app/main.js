@@ -2842,58 +2842,6 @@ function parseMeetingMarkdown(content, mdPath) {
   };
 }
 
-/** Return the transcript body from the saved `*_transcript.txt` artifact.
- * Recorder-written files carry a short metadata header followed by a line of
- * `=` characters. Older/imported fixtures may contain only the body, so fall
- * back to the complete trimmed file when no separator is present. */
-function savedTranscriptBody(content) {
-  const lines = content.split('\n');
-  const separator = lines[0]?.startsWith('Session:')
-    ? lines.slice(0, 12).findIndex((line) => /^={20,}\s*$/.test(line))
-    : -1;
-  return (separator === -1 ? content : lines.slice(separator + 1).join('\n')).trim();
-}
-
-/** Prefer the separately saved diarised transcript over the copy embedded in
- * a summary. Speaker confirmation rewrites the separate artifact, and older
- * releases did not keep the embedded copy in sync. The path is derived from
- * an already validated summary and is realpath-checked inside the matching
- * user-data root before reading, so a transcript symlink cannot escape it. */
-async function withCurrentDiarisedTranscript(meeting, summaryPath, allowedOutputDirs) {
-  if (!meeting?.is_diarised) return meeting;
-  const suffix = summaryPath.endsWith('_summary.md')
-    ? '_summary.md'
-    : summaryPath.endsWith('_summary.json')
-      ? '_summary.json'
-      : null;
-  if (!suffix) return meeting;
-
-  const matchingOutputDir = allowedOutputDirs.find(
-    (base) => base && summaryPath.startsWith(base),
-  );
-  if (!matchingOutputDir) return meeting;
-
-  const stem = path.basename(summaryPath).slice(0, -suffix.length);
-  const dataRoot = path.dirname(matchingOutputDir.slice(0, -path.sep.length));
-  const transcriptDir = path.join(dataRoot, 'transcripts');
-  const candidate = path.join(transcriptDir, `${stem}_transcript.txt`);
-
-  try {
-    const [realDataRoot, realTranscriptDir, realTranscript] = await Promise.all([
-      fs.promises.realpath(dataRoot),
-      fs.promises.realpath(transcriptDir),
-      fs.promises.realpath(candidate),
-    ]);
-    if (realTranscriptDir !== path.join(realDataRoot, 'transcripts')) return meeting;
-    if (!realTranscript.startsWith(realTranscriptDir + path.sep)) return meeting;
-    const body = savedTranscriptBody(await fs.promises.readFile(realTranscript, 'utf-8'));
-    if (!body) return meeting;
-    return { ...meeting, diarised_text: body };
-  } catch {
-    return meeting;
-  }
-}
-
 /**
  * Validate a renderer-supplied meeting summary path (symlink-safe containment).
  *
@@ -2972,21 +2920,11 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
       // pages route through here. Unlike the list payload, the detail page
       // needs the full data INCLUDING the transcript (for the AskBar /
       // TranscriptPanel), so we return everything parseMeetingMarkdown yields.
-      const parsedMeeting = parseMeetingMarkdown(content, realResolved);
-      const mdMeeting = await withCurrentDiarisedTranscript(
-        parsedMeeting,
-        realResolved,
-        allowedOutputDirs,
-      );
+      const mdMeeting = parseMeetingMarkdown(content, realResolved);
       const mdSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
       return { success: true, meeting: { ...mdMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
     }
-    const parsedMeeting = JSON.parse(content);
-    const jsonMeeting = await withCurrentDiarisedTranscript(
-      parsedMeeting,
-      realResolved,
-      allowedOutputDirs,
-    );
+    const jsonMeeting = JSON.parse(content);
     const jsonSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
     return { success: true, meeting: { ...jsonMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
   } catch (error) {
