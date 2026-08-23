@@ -782,8 +782,19 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
 
     def test_relabel_transcript_preserves_a_manually_edited_summary_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._seed_sidecar(tmp)
             output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0], "speech_duration_seconds": 30.0, "segment_count": 5,
+                            "segments": [{"start": 0.0, "end": 1.0}],
+                        },
+                    },
+                },
+            })
             summary_path = output_dir / "mtg001_summary.md"
             edited_summary = (
                 "---\nis_diarised: true\n---\n\n## Summary\n\nEdited note.\n\n"
@@ -803,9 +814,13 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 tmp,
             )
 
-            self.assertTrue(_last_json(result.output)["success"])
+            data = _last_json(result.output)
+            self.assertTrue(data["success"])
+            self.assertEqual(data["relabeled_lines"], 1)
+            self.assertIn("[00:00] [Person Gamma] original wording", transcript_path.read_text(encoding="utf-8"))
             summary_text = summary_path.read_text(encoding="utf-8")
             self.assertIn("[00:00] [Speaker 2] manually corrected wording", summary_text)
+            self.assertNotIn("[00:00] [Person Gamma] manually corrected wording", summary_text)
             self.assertNotIn("[00:00] [Speaker 2] original wording", summary_text)
 
     def test_saved_transcript_body_does_not_treat_a_body_divider_as_a_header(self):
