@@ -36,7 +36,8 @@ import {
   IGNORED_FILES,
   COPY_ATTRIBUTES,
   isCopy,
-  looksLikeCopy,
+  definitelyNotCopy,
+  readsAsCopy,
   globToRegExp,
   decodeEntities,
   toPosixPath,
@@ -79,69 +80,149 @@ function collectFromSource(file) {
     /* setParentNodes */ true,
     ts.ScriptKind.TSX
   );
-  const found = new Set();
 
-  const addLiteral = (node, accept) => {
-    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
-      const text = normalize(node.text);
-      if (accept(text)) found.add(text);
-    }
+  // Two partitions, not two files: `copy` is the contract a migration diff must hold,
+  // `uncertain` is the safety net. One diff for a reviewer to read, and an uncertain-only
+  // change in a styling PR is a five-second glance.
+  //
+  // Multisets, not Sets. Deduplicating hid the very edit this file exists to catch: if a
+  // string appears twice in a file and one occurrence becomes another string already
+  // present there, a Set-backed inventory does not change at all.
+  const copy = new Map();
+  const uncertain = new Map();
+  const record = (text, certain) => {
+    const bucket = certain || readsAsCopy(text) ? copy : uncertain;
+    bucket.set(text, (bucket.get(text) ?? 0) + 1);
   };
 
-  // Import specifiers, property keys and the like are strings but never copy; skipping the
-  // whole subtree is cheaper and safer than pattern-matching their contents afterwards.
+  // Position settles most of it. These node types hold strings that are never rendered:
+  // module specifiers, member names, object keys, enum members, literal types, switch
+  // labels and equality comparisons. Skipping the subtree beats filtering its text later.
   const isStructural = (node) =>
     ts.isImportDeclaration(node) ||
     ts.isExportDeclaration(node) ||
     ts.isModuleDeclaration(node) ||
     ts.isPropertyAccessExpression(node) ||
     ts.isElementAccessExpression(node) ||
+    ts.isEnumMember(node) ||
+    ts.isLiteralTypeNode(node) ||
+    ts.isCaseClause(node) ||
+    (ts.isBinaryExpression(node) &&
+      [
+        ts.SyntaxKind.EqualsEqualsEqualsToken,
+        ts.SyntaxKind.ExclamationEqualsEqualsToken,
+        ts.SyntaxKind.EqualsEqualsToken,
+        ts.SyntaxKind.ExclamationEqualsToken,
+      ].includes(node.operatorToken.kind)) ||
     (ts.isCallExpression(node) &&
       ['require', 'import'].includes(node.expression.getText(source)));
+
+  // `{ 'some-key': value }` — the key is structure, the value may well be copy.
+  const isObjectKey = (node) =>
+    node.parent &&
+    (ts.isPropertyAssignment(node.parent) || ts.isPropertySignature(node.parent)) &&
+    node.parent.name === node;
+
+  const addLiteral = (node, accept, certain = false) => {
+    if (!ts.isStringLiteral(node) && !ts.isNoSubstitutionTemplateLiteral(node)) return;
+    if (isObjectKey(node)) return;
+    const text = normalize(node.text);
+    if (accept(text)) record(text, certain);
+  };
 
   const walk = (node) => {
     if (isStructural(node)) return;
 
     if (ts.isJsxText(node)) {
       const text = normalize(node.text);
-      // JSX text is copy by construction — take it on the narrow rule, no heuristic.
-      if (isCopy(text)) found.add(text);
-    } else if (ts.isJsxAttribute(node) && COPY_ATTRIBUTES.includes(node.name.getText(source))) {
-      // Covers both `title="Copy"` and `title={cond ? 'Hide' : 'Show'}` — the ternary form
-      // is common here, so walking the whole initializer matters.
+      // Rendered by construction — no heuristic, and always the `copy` partition.
+      if (isCopy(text)) record(text, true);
+      return;
+    }
+
+    if (ts.isJsxAttribute(node)) {
+      const name = node.name.getText(source);
+      if (!COPY_ATTRIBUTES.includes(name)) return; // className, data-*, variant, href…
       if (node.initializer) {
+        // Covers `title="Copy"` and `title={cond ? 'Hide' : 'Show'}` alike.
         const walkAttr = (n) => {
-          addLiteral(n, isCopy);
+          addLiteral(n, isCopy, true);
           ts.forEachChild(n, walkAttr);
         };
         walkAttr(node.initializer);
       }
-    } else {
-      // Everything else: a plain literal anywhere in the file, judged by the wider
-      // heuristic. This is what catches `const heading = 'Nothing to process'`.
-      addLiteral(node, looksLikeCopy);
+      // Do not fall through: descending again would count every copy attribute twice and
+      // make the per-occurrence counts meaningless.
+      return;
     }
+
+    if (ts.isJsxExpression(node) && node.parent && ts.isJsxElement(node.parent)) {
+      // A literal in children position — `{count === 1 ? 'note' : 'notes'}` — is rendered
+      // exactly like JSX text. Structural knowledge, so no heuristic and no uncertainty.
+      //
+      // But stop at any nested JSX: `{items.map(x => <div className="p-1">…</div>)}` is
+      // also a children expression, and descending into it would hand every className to
+      // the certain-copy branch. Hand those back to the normal walk.
+      const walkChild = (n) => {
+        if (
+          ts.isJsxElement(n) ||
+          ts.isJsxSelfClosingElement(n) ||
+          ts.isJsxFragment(n) ||
+          ts.isJsxAttribute(n)
+        ) {
+          walk(n);
+          return;
+        }
+        addLiteral(n, isCopy, true);
+        ts.forEachChild(n, walkChild);
+      };
+      ts.forEachChild(node, walkChild);
+      return;
+    }
+
+    // Everything else: a literal anywhere in the file, kept unless provably not copy.
+    addLiteral(node, (text) => !definitelyNotCopy(text));
     ts.forEachChild(node, walk);
   };
   walk(source);
 
-  return [...found].sort((a, b) => a.localeCompare(b));
+  // Repeats are emitted as repeats so a change in occurrence count shows in the diff.
+  // Plain sort, not localeCompare: collation is locale-dependent, so contributors and CI
+  // on different host locales would each see the other's file as stale. Generated output
+  // must be byte-identical everywhere.
+  const flatten = (bucket) =>
+    [...bucket.entries()]
+      .flatMap(([text, count]) => Array.from({ length: count }, () => text))
+      .sort();
+
+  return { copy: flatten(copy), uncertain: flatten(uncertain) };
 }
 
 const inventory = {};
 for (const file of sourceFiles(SRC_DIR).sort()) {
-  const strings = collectFromSource(file);
-  if (strings.length) inventory[toPosixPath(path.relative(APP_DIR, file))] = strings;
+  const { copy, uncertain } = collectFromSource(file);
+  if (copy.length === 0 && uncertain.length === 0) continue;
+  const entry = {};
+  if (copy.length) entry.copy = copy;
+  if (uncertain.length) entry.uncertain = uncertain;
+  inventory[toPosixPath(path.relative(APP_DIR, file))] = entry;
 }
 
-const total = Object.values(inventory).reduce((sum, list) => sum + list.length, 0);
+const count = (key) =>
+  Object.values(inventory).reduce((sum, entry) => sum + (entry[key]?.length ?? 0), 0);
+const copyTotal = count('copy');
+const uncertainTotal = count('uncertain');
+const total = copyTotal + uncertainTotal;
 const rendered =
   JSON.stringify(
     {
       // Read by humans in review; regenerate rather than hand-edit.
       _comment:
-        'Generated by app/scripts/i18n-copy-inventory.mjs. In an i18n migration diff, strings must MOVE, never CHANGE.',
+        'Generated by app/scripts/i18n-copy-inventory.mjs. In an i18n migration diff, strings must MOVE, never CHANGE. ' +
+        '"copy" is the contract; "uncertain" is the recall safety net and may hold technical strings.',
       total,
+      copyTotal,
+      uncertainTotal,
       files: inventory,
     },
     null,
@@ -151,7 +232,9 @@ const rendered =
 if (update) {
   fs.mkdirSync(path.dirname(INVENTORY), { recursive: true });
   fs.writeFileSync(INVENTORY, rendered);
-  console.log(`i18n inventory: written — ${total} string(s) across ${Object.keys(inventory).length} file(s).`);
+  console.log(
+    `i18n inventory: written — ${copyTotal} copy + ${uncertainTotal} uncertain across ${Object.keys(inventory).length} file(s).`
+  );
   process.exit(0);
 }
 
@@ -166,4 +249,6 @@ if (fs.readFileSync(INVENTORY, 'utf8') !== rendered) {
   console.error('During the i18n migration it must show strings moving, never changing.\n');
   process.exit(1);
 }
-console.log(`i18n inventory: up to date — ${total} string(s) across ${Object.keys(inventory).length} file(s).`);
+console.log(
+  `i18n inventory: up to date — ${copyTotal} copy + ${uncertainTotal} uncertain across ${Object.keys(inventory).length} file(s).`
+);

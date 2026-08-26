@@ -37,13 +37,30 @@ const eslint = new ESLint({ cwd: APP_DIR, overrideConfigFile: CONFIG });
 const results = await eslint.lintFiles([path.join(APP_DIR, 'renderer/src')]);
 
 const counts = {};
+const fatal = [];
 for (const r of results) {
+  // A file that fails to parse yields a fatal diagnostic with NO ruleId, so filtering on
+  // the rule id alone silently counted it as zero violations and the gate went green on a
+  // file it never actually inspected. Surface those instead of counting them — a gate that
+  // reports success on input it could not read is the failure this whole PR is about.
+  for (const m of r.messages) {
+    if (m.fatal) fatal.push(`${toPosixPath(path.relative(APP_DIR, r.filePath))}:${m.line ?? '?'} ${m.message}`);
+  }
   const n = r.messages.filter((m) => m.ruleId === 'i18next/no-literal-string').length;
   // POSIX keys so the checked-in baseline matches on Windows too.
   if (n > 0) counts[toPosixPath(path.relative(APP_DIR, r.filePath))] = n;
 }
+
+if (fatal.length > 0) {
+  console.error('\ni18n gate: could not parse the following file(s), so they were not checked:\n');
+  for (const line of fatal) console.error(`  ${line}`);
+  console.error('');
+  process.exit(1);
+}
 const total = Object.values(counts).reduce((a, b) => a + b, 0);
-const sorted = Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+// Plain sort, not localeCompare: collation is locale-dependent, and a checked-in baseline
+// must be byte-identical whichever host regenerates it.
+const sorted = Object.fromEntries(Object.entries(counts).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 
 if (update) {
   fs.writeFileSync(

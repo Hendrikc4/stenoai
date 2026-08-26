@@ -83,7 +83,7 @@ test('exclusion patterns are RegExp objects, not strings', async () => {
 // both were silent: the tooling reported success while quietly covering less than it
 // claimed. That is the failure mode a gate must not have.
 
-import { globToRegExp, looksLikeCopy } from './scripts/i18n-copy-rules.mjs';
+import { globToRegExp, definitelyNotCopy, readsAsCopy } from './scripts/i18n-copy-rules.mjs';
 
 test('globToRegExp expands a double-star segment across path depth', async () => {
   const rx = globToRegExp('**/*.test.ts');
@@ -99,32 +99,39 @@ test('globToRegExp expands a double-star segment across path depth', async () =>
   assert.ok(!sandbox.test('renderer/src/routes/Home.tsx'));
 });
 
-test('looksLikeCopy keeps prose and drops markup', async () => {
-  // 'Nothing to process' is the string whose silent rewrite in PR #494 broke three specs.
-  // It is a plain TS literal, invisible to the linter — the inventory is what covers it.
+test('the inventory keeps prose and rejects only provable markup', async () => {
+  // Burden of proof is inverted here: a string is copy unless provably not. The previous
+  // accept-list dropped all of these, each discovered in a separate review round.
   for (const copy of [
     'Nothing to process',
     'Ready to capture beautiful notes',
-    'Transcribe and summarise in Portuguese',
+    'Ask AI',
+    'AI provider',
+    'AI',
+    'note',
+    'notes',
+    'Re-run first-time setup',
+    'permission denied',
     'Processing',
-    'Cancelled',
   ]) {
-    assert.ok(looksLikeCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
+    assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
   }
 
   for (const markup of [
     'flex flex-col items-center gap-3 rounded-xl',
-    'text-[18px] font-normal',
-    'truncate text-[11.5px] italic',
+    'text-[11.5px]',
+    'hover:bg-red-500',
+    'var(--fg-1)',
+    '0 14px',
+    '#FAF9F5',
     'M514.833,1703.333h1228.316c18.901,0.096,37.335-5.874',
-    'CardContent',
-    'ArrowDown',
-    'aria-label',
+    'camelCaseThing',
+    'SCREAMING_CONST',
     'https://example.com/x',
     './relative/path',
     '--fg-1',
   ]) {
-    assert.ok(!looksLikeCopy(markup), `expected NOT copy: ${JSON.stringify(markup)}`);
+    assert.ok(definitelyNotCopy(markup), `expected NOT copy: ${JSON.stringify(markup)}`);
   }
 });
 
@@ -170,12 +177,84 @@ test('copy-bearing component props are gated, not just DOM attributes', async ()
   assert.equal(structural.length, 0);
 });
 
-test('acronym labels are inventoried', async () => {
-  // `label: 'AI'` in SettingsNav.tsx is a plain TS literal the linter cannot see, so the
-  // inventory is its only cover — and the single-word rule used to drop all-caps words.
-  for (const acronym of ['AI', 'PDF', 'URL']) {
-    assert.ok(looksLikeCopy(acronym), `expected ${acronym} to be inventoried`);
+test('the copy partition holds the contract, uncertain holds the safety net', async () => {
+  // `copy` is what a migration diff must hold string-for-string; `uncertain` is recall
+  // insurance, so a styling PR that only moves uncertain lines is a five-second read.
+  for (const certain of ['Ask AI', 'Nothing to process', 'Delete', 'AI']) {
+    assert.ok(readsAsCopy(certain), `expected copy partition: ${JSON.stringify(certain)}`);
   }
-  // Long all-caps runs are constants, not labels.
-  assert.ok(!looksLikeCopy('SCREAMINGCONSTANT'));
+  for (const hedged of ['keydown', 'dragover', 'gallery']) {
+    assert.ok(!readsAsCopy(hedged), `expected uncertain partition: ${JSON.stringify(hedged)}`);
+  }
+});
+
+// --- fixes from the cubic review on PR #497 -------------------------------------------
+
+import fs from 'node:fs';
+
+test('the inventory is a multiset, so a duplicate swap cannot hide', async () => {
+  // With Set-backed collection, changing one of two identical strings in a file to another
+  // string already present there left the inventory byte-identical — the guard missed
+  // exactly the rewording it exists to catch. 40 files here carry repeated copy.
+  const inventory = JSON.parse(
+    fs.readFileSync(new URL('../docs/i18n/copy-inventory.json', import.meta.url), 'utf8')
+  );
+  const withRepeats = Object.values(inventory.files)
+    .flatMap((entry) => [entry.copy ?? [], entry.uncertain ?? []])
+    .filter((strings) => new Set(strings).size < strings.length);
+  assert.ok(
+    withRepeats.length > 0,
+    'repeated copy must be recorded per occurrence, not collapsed'
+  );
+});
+
+test('generated output is ordered independently of host locale', async () => {
+  // localeCompare collates per locale, so a contributor and CI on different locales would
+  // each see the other's generated file as stale. Both generators use a plain sort now.
+  for (const script of ['scripts/i18n-copy-inventory.mjs', 'scripts/i18n-lint-gate.mjs']) {
+    const source = fs.readFileSync(new URL(`./${script}`, import.meta.url), 'utf8');
+    const code = source.replace(/^\s*\/\/.*$/gm, ''); // ignore the comments explaining this
+    assert.ok(!code.includes('localeCompare'), `${script} must not sort with localeCompare`);
+  }
+});
+
+test('no copy-sounding JSX prop escapes classification (allowlist tripwire)', async () => {
+  // COPY_ATTRIBUTES is an allowlist, and an allowlist's incompleteness is invisible — that
+  // is how label=/description= stayed outside the gate while it reported green. So make
+  // the gap mechanically detectable: every copy-sounding prop the renderer actually uses
+  // must be deliberately classified as copy or as data.
+  const { KNOWN_NON_COPY_ATTRIBUTES, COPY_SOUNDING_PROP } = await import(
+    './scripts/i18n-copy-rules.mjs'
+  );
+  const srcDir = new URL('./renderer/src/', import.meta.url);
+
+  const names = new Set();
+  const walkDir = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const child = new URL(entry.name + (entry.isDirectory() ? '/' : ''), dir);
+      if (entry.isDirectory()) walkDir(child);
+      else if (entry.name.endsWith('.tsx') && !entry.name.includes('.test.')) {
+        const source = fs.readFileSync(child, 'utf8');
+        for (const [, name] of source.matchAll(/\s([a-zA-Z][a-zA-Z0-9]*(?:-[a-z]+)?)=[{"]/g)) {
+          names.add(name);
+        }
+      }
+    }
+  };
+  walkDir(srcDir);
+
+  const unclassified = [...names]
+    .filter((name) => COPY_SOUNDING_PROP.test(name))
+    .filter((name) => !/^on[A-Z]/.test(name)) // event handlers are never copy
+    .filter(
+      (name) => !COPY_ATTRIBUTES.includes(name) && !KNOWN_NON_COPY_ATTRIBUTES.includes(name)
+    );
+
+  assert.deepEqual(
+    unclassified,
+    [],
+    `copy-sounding prop(s) classified in neither list: ${unclassified.join(', ')}. ` +
+      `Add each to COPY_ATTRIBUTES (it shows words to a user) or to ` +
+      `KNOWN_NON_COPY_ATTRIBUTES (it carries data), in app/scripts/i18n-copy-rules.mjs.`
+  );
 });

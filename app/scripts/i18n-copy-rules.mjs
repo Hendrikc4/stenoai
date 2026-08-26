@@ -49,6 +49,37 @@ export const COPY_ATTRIBUTES = [
 ];
 
 /**
+ * JSX props whose NAME sounds like copy but whose value is data, an id, or a handler.
+ *
+ * This list exists so the copy-attribute allowlist cannot rot silently. `COPY_ATTRIBUTES`
+ * is an allowlist, and an allowlist's incompleteness is invisible by nature — that is how
+ * `label=` and `description=` (~170 sites of visible copy) sat outside the gate while it
+ * reported green. The tripwire test in i18n-gate.test.mjs walks every JSX prop name the
+ * renderer actually uses, and fails if a copy-sounding one is in neither list. An allowlist
+ * is acceptable exactly when its gaps are mechanically detectable; this is that mechanism.
+ *
+ * Adding a name here is a deliberate statement: this prop carries data, not words.
+ */
+export const KNOWN_NON_COPY_ATTRIBUTES = [
+  'className', // structure
+  'descriptionId', // aria wiring, an id
+  'name', // form field / entity name
+  'folderName', // user-entered data
+  'meetingName', // user-entered data
+  'summaryFile', // file path
+  'activeSummaryFile', // file path
+  'routeSummaryFile', // file path
+  'text', // transcript body, not UI copy
+  'liveText', // live transcript data
+  'streamText', // streamed model output
+  'messages', // chat message objects
+  'sizeLabel', // a formatted byte size, e.g. "2.1 GB"
+];
+
+/** Props matching this look like copy; each must be classified in one of the two lists. */
+export const COPY_SOUNDING_PROP = /label|title|text|description|message|caption|hint|placeholder|tooltip|heading|subtitle|summary/i;
+
+/**
  * Normalise a path for comparison against globs and checked-in baselines.
  *
  * `path.relative()` yields backslashes on Windows, so the slash-based ignore patterns stop
@@ -85,16 +116,30 @@ export function isCopy(text) {
 }
 
 // ---------------------------------------------------------------------------
-// The inventory needs a WIDER net than the lint gate, and this asymmetry is
-// deliberate. The gate BLOCKS, so a false positive costs a contributor real time and
-// a noisy rule gets downgraded to `warn` — precision wins. The inventory only WITNESSES,
-// so a false positive is a harmless extra line in a generated file while a false negative
-// is a string that can be silently reworded — recall wins.
+// The inventory needs a WIDER net than the lint gate, and the direction of its default
+// is the whole point.
 //
-// Concretely: the string that started all of this, 'Nothing to process', is a plain
-// TypeScript literal assigned to a variable and rendered as {heading}. It is neither JSX
-// text nor a JSX attribute, so the linter cannot see it in any mode short of 'all' (which
-// would flag every id, key and class name in the codebase). The heuristic below catches it.
+// The gate BLOCKS, so a false positive costs a contributor real time and a noisy rule gets
+// downgraded to `warn` — precision wins, an allowlist is right. The inventory only
+// WITNESSES, so a false positive is a harmless extra line in a generated file while a
+// false negative is a string that can be reworded with nothing to notice — recall wins.
+//
+// The first version of this file stated that principle and then implemented its opposite:
+// an allowlist of copy *shapes*, which excludes anything it does not recognise. Its
+// failure mode is silent omission, which is the exact failure the inventory exists to
+// prevent — and it showed. Across three review rounds the same defect surfaced in a new
+// disguise every time: "All notes", all-caps `AI`, lowercase `note`/`notes`, `Ask AI`,
+// `Re-run first-time setup`. An allowlist here has to enumerate every shape English copy
+// can take, which is unwinnable.
+//
+// So the burden of proof is inverted: a string is copy unless it is PROVABLY not. Position
+// in the AST does most of the work (see collectFromSource), and what position cannot
+// settle — `const cls = 'flex items-center'` and `const heading = 'Nothing to process'`
+// sit in identical positions — is settled by the reject list below. Its incompleteness
+// produces visible clutter a reviewer can trim, not invisible holes.
+
+/** An SVG path payload: a command letter followed by coordinate soup. */
+const SVG_PATH = /^[MmLlHhVvCcSsQqTtAaZz][\d\s,.eE+-]{8,}/;
 
 /** Strings that are structurally technical: ids, keys, paths, CSS, URLs, class names. */
 const TECHNICAL_PATTERNS = [
@@ -106,69 +151,59 @@ const TECHNICAL_PATTERNS = [
   /^[a-z0-9]+(-[a-z0-9]+)+$/, // kebab-case / css classes / data attributes
   /^[a-z0-9]+(\.[a-z0-9]+)+$/i, // dotted keys and file names
   /^[a-z]+:/i, // protocol-ish and css shorthand ("var:", "data:")
-  /^\d+(\.\d+)*(px|rem|em|%|s|ms)?$/, // numbers and css lengths
 ];
 
-/** An SVG path payload: a command letter followed by coordinate soup. */
-const SVG_PATH = /^[MmLlHhVvCcSsQqTtAaZz][\d\s,.eE+-]{8,}/;
+/** A CSS value, selector, or utility-class list — the dominant noise in a Tailwind app. */
+const CSS_LIKE = [
+  /^[a-z-]+\([^)]*\)$/i, // var(--fg-1), rotate(90deg), translateY(-2px)
+  /^#[0-9a-f]{3,8}$/i, // hex colours
+  /^-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg|fr|ch)$/i, // single css length
+  /^(-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg)?\s+)+-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg)?$/i, // "0 14px"
+];
 
-/** A single token that is markup rather than a word: css class, id fragment, unit, key. */
-function isTechnicalToken(token) {
-  if (!token) return true;
-  if (/[[\]{}()<>/\\|@#$~^*=]/.test(token)) return true; // punctuation only code uses
-  if (/\d/.test(token) && !/^\d+([.,]\d+)?$/.test(token)) return true; // px-4, gap-1.5, h-[13px]
-  if (/^[a-z0-9]+(-[a-z0-9]+)+$/.test(token)) return true; // kebab-case
-  if (/^[a-z]+:[a-z0-9-]+$/.test(token)) return true; // tailwind variants: hover:bg-x
-  if (/^[a-z]+([A-Z][a-z0-9]*)+$/.test(token)) return true; // camelCase
-  if (/^\p{Lu}\p{Ll}*(\p{Lu}\p{Ll}*)+$/u.test(token)) return true; // PascalCase identifiers
+/**
+ * True when `text` is provably not user-facing copy.
+ *
+ * Everything this returns false for lands in the inventory. Keep the tests here narrow and
+ * literal: a rule that is too eager reintroduces the silent-omission failure above.
+ */
+export function definitelyNotCopy(text) {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return true;
+  if (!/\p{L}/u.test(trimmed)) return true; // no letters at all: numbers, glyphs, symbols
+  if (!isCopy(trimmed)) return true; // brand names and symbol-only text
+  if (TECHNICAL_PATTERNS.some((pattern) => pattern.test(trimmed))) return true;
+  if (SVG_PATH.test(trimmed)) return true;
+  if (CSS_LIKE.some((pattern) => pattern.test(trimmed))) return true;
+
+  // A utility class or list of them: all lower case, markup-shaped, no sentence casing.
+  // "text-[11.5px]" and "flex items-center gap-1.5" are out; "permission denied" and
+  // "notes" stay in, having no markup-shaped token at all.
+  const tokens = trimmed.split(/\s+/);
+  if (
+    !/\p{Lu}/u.test(trimmed) &&
+    tokens.some((token) => /[-:[\]/]/.test(token) || /\d/.test(token)) &&
+    tokens.every((token) => /^[a-z0-9[\]:/._%-]+$/.test(token))
+  ) {
+    return true;
+  }
+
   return false;
 }
 
 /**
- * Sentence punctuation, as opposed to punctuation inside a number or a CSS value: the mark
- * must be followed by whitespace or end the string. Without that qualifier the `.` in
- * `text-[11.5px]` reads as a full stop and a className list passes as prose.
- */
-const READS_AS_PROSE = /[.!?;:…'’"](\s|$)|,\s/;
-
-/**
- * True when `text` might be copy a user reads, judged generously but not blindly.
+ * Positive signal that a string is copy rather than merely not-provably-technical.
  *
- * Recall matters more than precision here (see the note above), but unfiltered recall
- * buries the signal: className strings, CSS values and SVG paths outnumbered real copy
- * in the first version of this heuristic, which would have made a migration diff
- * unreadable — and an unreadable diff proves nothing.
- *
- * A string qualifies when it reads like language: it carries sentence punctuation, or it
- * is a phrase whose words are mostly real words, or it is a single capitalised word.
+ * This decides which partition of the inventory a string lands in, never whether it is
+ * recorded at all. `copy` is the contract a migration diff must hold; `uncertain` is the
+ * safety net, so an uncertain-only diff in a styling PR is a five-second read.
  */
-export function looksLikeCopy(text) {
+export function readsAsCopy(text) {
   const trimmed = String(text ?? '').trim();
-  if (!isCopy(trimmed)) return false;
-  if (trimmed.length < 2) return false;
-  if (TECHNICAL_PATTERNS.some((pattern) => pattern.test(trimmed))) return false;
-  if (SVG_PATH.test(trimmed)) return false;
-
+  if (definitelyNotCopy(trimmed)) return false;
   const tokens = trimmed.split(/\s+/);
-  if (tokens.length === 1) {
-    // One word: accept Sentence-case words ("Processing", "Cancelled") and short all-caps
-    // acronyms that are real labels ("AI", "PDF") — the nav item `label: 'AI'` is a plain
-    // TS literal the linter cannot see either, so dropping it here left it uncovered by
-    // both gates. Reject the PascalCase identifiers that look just like sentence-case
-    // words ("CardContent", "ArrowDown").
-    if (/^\p{Lu}{2,5}$/u.test(trimmed)) return true;
-    return /^\p{Lu}\p{Ll}+$/u.test(trimmed);
-  }
-
-  const technical = tokens.filter(isTechnicalToken).length;
-  if (technical > tokens.length / 2) return false; // a className list, not a sentence
-
-  // Utility-class strings are entirely lower case ("truncate text-[11.5px] italic"), and
-  // they mix real words with markup tokens, so a simple majority vote lets them through.
-  // Sentence copy in this app essentially always carries a capital somewhere.
-  if (technical > 0 && !/\p{Lu}/u.test(trimmed)) return false;
-
-  return READS_AS_PROSE.test(trimmed) || technical === 0;
+  if (tokens.length > 1) return true; // a phrase that survived the reject list is prose
+  return /^\p{Lu}/u.test(trimmed); // one word: capitalised reads as a label
 }
 
 // Minimal glob-to-RegExp for the subset IGNORED_FILES uses.
