@@ -153,6 +153,23 @@ const TECHNICAL_PATTERNS = [
 ];
 
 /** A CSS value, selector, or utility-class list — the dominant noise in a Tailwind app. */
+/**
+ * The utility-class vocabulary: Tailwind's prefixes, its bare utilities, and this app's
+ * own `mv-` component classes. Used only to prove that a lowercase, hyphen-bearing string
+ * is markup rather than English. Extend it when a new class prefix appears; forgetting to
+ * costs an `uncertain` entry, never a dropped string.
+ */
+const UTILITY_PREFIX =
+  /^(bg|text|font|border|rounded|shadow|flex|grid|gap|space|items|justify|self|place|content|p|px|py|pt|pb|pl|pr|m|mx|my|mt|mb|ml|mr|w|h|min|max|size|overflow|opacity|z|top|bottom|left|right|inset|translate|rotate|scale|transform|transition|duration|ease|delay|animate|cursor|select|pointer|whitespace|break|truncate|leading|tracking|list|table|tabular|ring|outline|divide|backdrop|blur|object|aspect|col|row|order|basis|grow|shrink|sr|not|first|last|odd|even|hover|focus|active|disabled|group|peer|dark|sm|md|lg|xl|inline|block|hidden|static|fixed|absolute|relative|sticky|mv)-/;
+
+const BARE_UTILITIES = new Set([
+  'flex', 'grid', 'block', 'inline', 'hidden', 'static', 'fixed', 'absolute', 'relative',
+  'sticky', 'border', 'truncate', 'italic', 'underline', 'uppercase', 'lowercase',
+  'capitalize', 'group', 'peer', 'active', 'open', 'contents', 'isolate', 'antialiased',
+]);
+
+const utilityShaped = (token) => UTILITY_PREFIX.test(token) || BARE_UTILITIES.has(token);
+
 const CSS_LIKE = [
   /^[a-z-]+\([^)]*\)$/i, // var(--fg-1), rotate(90deg), translateY(-2px)
   /^#[0-9a-f]{3,8}$/i, // hex colours
@@ -179,16 +196,30 @@ export function definitelyNotCopy(text) {
   //
   // A bare hyphen is NOT enough evidence. An earlier revision rejected every lowercase
   // kebab-case token, which threw away ordinary English copy — "e-mail", "opt-in",
-  // "built-in", "sign-in", "follow-up", "drag-and-drop". So a single hyphenated word is
-  // kept (it lands in `uncertain` at worst); markup has to prove itself with a digit,
-  // bracket, slash, colon, or by appearing in a multi-token class list.
+  // "built-in", "sign-in", "follow-up", "drag-and-drop". The revision after that kept a
+  // single hyphenated word but rejected the whole string as soon as a second token
+  // followed, which threw away the same words in a sentence: "sign-in required" was
+  // dropped just like "flex items-center". Markup now has to prove itself twice over —
+  // either a token carries a digit, bracket, slash or colon, or EVERY token comes from
+  // the utility vocabulary below.
+  //
+  // That vocabulary is a reject list, so its gaps fail safe: an unrecognised class prefix
+  // means the string is recorded as `uncertain`, which is noise. An unrecognised English
+  // word would otherwise mean a string that can be reworded with nothing to notice.
+  //
+  // The all-utility branch additionally requires one hyphenated token, so a phrase built
+  // only from bare utilities that are also English words ("open group") stays copy. Every
+  // class list in this renderer carries at least one, so nothing is given up for it.
   const tokens = trimmed.split(/\s+/);
   const markupShaped = (token) => /[:[\]/]/.test(token) || /\d/.test(token);
   const classListShaped = (token) => /^[a-z0-9[\]:/._%-]+$/.test(token);
   if (
     !/\p{Lu}/u.test(trimmed) &&
     tokens.every(classListShaped) &&
-    (tokens.some(markupShaped) || (tokens.length > 1 && tokens.some((t) => t.includes('-'))))
+    (tokens.some(markupShaped) ||
+      (tokens.length > 1 &&
+        tokens.every(utilityShaped) &&
+        tokens.some((t) => t.includes('-'))))
   ) {
     return true;
   }

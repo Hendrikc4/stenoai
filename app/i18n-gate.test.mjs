@@ -135,6 +135,48 @@ test('the inventory keeps prose and rejects only provable markup', async () => {
   }
 });
 
+test('lowercase copy with a hyphenated word is kept; class lists are still rejected', async () => {
+  // A hyphen alone was treated as proof of markup as soon as a second token followed, so
+  // every lowercase multi-word phrase containing one fell out of the inventory -- exactly
+  // the "e-mail"/"opt-in"/"sign-in" family the rule above claims to protect. No such copy
+  // exists in the renderer today, which is why nothing went red: the hole is a trap for
+  // the copy that gets written next, not a loss that already happened.
+  for (const copy of [
+    'sign-in required',
+    'opt-in only',
+    'built-in template',
+    'read-only mode',
+    'follow-up notes',
+    'drag-and-drop a file',
+    'e-mail address',
+    'per-channel labels',
+    // Both tokens are bare utilities that are also English words -- only the missing
+    // hyphen keeps this out of the class-list branch.
+    'open group',
+  ]) {
+    assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
+  }
+
+  // Every one of these is a real class list from the renderer, and each is rejected by
+  // the utility vocabulary rather than by the bare presence of a hyphen.
+  for (const markup of [
+    'flex items-center',
+    'flex flex-col',
+    'text-sm font-medium',
+    'bg-muted text-foreground',
+    'inline-flex items-stretch overflow-hidden rounded-full',
+    'border border-border bg-card shadow-sm',
+    'min-h-screen bg-background text-foreground',
+    'h-full max-w-full flex flex-col',
+    'font-mono text-sm tabular-nums',
+    'mv-transcript-wave mv-transcript-wave-static',
+    'mv-title group',
+    'mv-transcript open',
+  ]) {
+    assert.ok(definitelyNotCopy(markup), `expected NOT copy: ${JSON.stringify(markup)}`);
+  }
+});
+
 // --- fixes from the Codex review ------------------------------------------------------
 
 import { decodeEntities, toPosixPath, COPY_ATTRIBUTES } from './scripts/i18n-copy-rules.mjs';
