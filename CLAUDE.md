@@ -171,6 +171,54 @@ overrides an agent's own test-level defaults.
   `workflow_call` for flake/drift detection and adds the T3 long-meeting job. A CI-only
   Playwright `globalSetup` kills a stray Ollama + waits for a clean 11434 before the run.
 
+## Interface copy and i18n
+
+The app ships English-only today, but the groundwork is gated so that adding a language
+stays a matter of adding a locale file rather than rebuilding the interface.
+
+**Why the gate exists.** An i18n migration rewrites hundreds of hardcoded strings into
+`t()` lookups. That edit is supposed to be pure motion — same words, new home. In practice
+it is where copy changes silently: an attempt at this rewrote `Nothing to process` into
+`Nothing was recorded.` in passing, three e2e specs went red, and nothing in the diff said
+why. Roughly two thirds of this app's copy is asserted by no test at all, so the same slip
+elsewhere would land unseen.
+
+**Two checks, run per PR (`npm run lint:i18n`, `npm run i18n:inventory`):**
+
+- **No new hardcoded copy.** `renderer/eslint.config.i18n.mjs` runs
+  `i18next/no-literal-string` at `error` over JSX text and the copy-bearing attributes
+  (`placeholder`, `title`, `alt`, `aria-label`). It is a *separate* config from
+  `eslint.config.mjs` on purpose: a codebase with no i18n yet trips it hundreds of times,
+  and folding that into the main lint run would make it permanently red — which this repo
+  has already seen end in four react-hooks rules downgraded to `warn`, where they are now
+  write-only. Instead `scripts/i18n-lint-gate.mjs` compares per-file counts against
+  `renderer/i18n-lint-baseline.json` and fails on any divergence, in both directions: a
+  higher count is new hardcoded copy, a lower one is progress that should be committed
+  (`npm run lint:i18n:update`) so the burn-down number stays honest.
+- **The English copy inventory.** `scripts/i18n-copy-inventory.mjs` extracts every English
+  string the renderer shows into `docs/i18n/copy-inventory.json`. It blocks nothing; it
+  witnesses. The review rule for an i18n migration is then one sentence: *the inventory
+  diff must show strings moving, never changing.* Afterwards it keeps working as a copy
+  changelog — an intentional wording change shows up as a one-file diff in the PR that
+  makes it.
+
+**e2e selectors stay in English — that is a feature.** 25 specs match on English copy
+(`getByRole('button', { name: 'Delete' })` and friends). Do not convert them to
+`data-testid`: they are the runtime half of the baseline oracle, and they are what caught
+the rewrite above. `e2e/fixtures/electron.ts` pins `STENOAI_UI_LANGUAGE=en` for the whole
+suite so they are deterministic regardless of the host's OS locale or a stored preference.
+Per-language coverage belongs in one dedicated locale-smoke spec (switch language, assert
+a handful of translated strings, assert no raw dotted keys leak into the UI), not in
+translating existing specs.
+
+**What the gate does not catch,** so nobody mistakes green for complete: strings assembled
+at runtime from fragments, copy in the Electron main process (menus, tray, native
+dialogs), user-facing text emitted by the Python CLI, date and number formatting, and
+translation quality. The linter also cannot see a plain TypeScript literal that is later
+rendered — `const heading = 'Nothing to process'` — which is precisely why the inventory
+casts a wider net than the linter.
+
+
 ## Production Readiness
 This app ships as a signed DMG to real users. Before considering any change complete:
 - **Packaged app test**: Dev mode (`npm start`) is not sufficient. Always rebuild the DMG (`npm run build`) and test the installed app from `/Applications`.
