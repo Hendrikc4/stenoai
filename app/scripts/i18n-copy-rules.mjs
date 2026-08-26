@@ -148,7 +148,6 @@ const TECHNICAL_PATTERNS = [
   /^--/, // CSS custom properties
   /^[a-z]+([A-Z][a-z0-9]*)+$/, // camelCase identifiers
   /^[A-Z0-9]+(_[A-Z0-9]+)+$/, // SCREAMING_SNAKE_CASE
-  /^[a-z0-9]+(-[a-z0-9]+)+$/, // kebab-case / css classes / data attributes
   /^[a-z0-9]+(\.[a-z0-9]+)+$/i, // dotted keys and file names
   /^[a-z]+:/i, // protocol-ish and css shorthand ("var:", "data:")
 ];
@@ -177,13 +176,19 @@ export function definitelyNotCopy(text) {
   if (CSS_LIKE.some((pattern) => pattern.test(trimmed))) return true;
 
   // A utility class or list of them: all lower case, markup-shaped, no sentence casing.
-  // "text-[11.5px]" and "flex items-center gap-1.5" are out; "permission denied" and
-  // "notes" stay in, having no markup-shaped token at all.
+  //
+  // A bare hyphen is NOT enough evidence. An earlier revision rejected every lowercase
+  // kebab-case token, which threw away ordinary English copy — "e-mail", "opt-in",
+  // "built-in", "sign-in", "follow-up", "drag-and-drop". So a single hyphenated word is
+  // kept (it lands in `uncertain` at worst); markup has to prove itself with a digit,
+  // bracket, slash, colon, or by appearing in a multi-token class list.
   const tokens = trimmed.split(/\s+/);
+  const markupShaped = (token) => /[:[\]/]/.test(token) || /\d/.test(token);
+  const classListShaped = (token) => /^[a-z0-9[\]:/._%-]+$/.test(token);
   if (
     !/\p{Lu}/u.test(trimmed) &&
-    tokens.some((token) => /[-:[\]/]/.test(token) || /\d/.test(token)) &&
-    tokens.every((token) => /^[a-z0-9[\]:/._%-]+$/.test(token))
+    tokens.every(classListShaped) &&
+    (tokens.some(markupShaped) || (tokens.length > 1 && tokens.some((t) => t.includes('-'))))
   ) {
     return true;
   }

@@ -191,21 +191,61 @@ test('the copy partition holds the contract, uncertain holds the safety net', as
 // --- fixes from the cubic review on PR #497 -------------------------------------------
 
 import fs from 'node:fs';
+import os from 'node:os';
 
-test('the inventory is a multiset, so a duplicate swap cannot hide', async () => {
-  // With Set-backed collection, changing one of two identical strings in a file to another
-  // string already present there left the inventory byte-identical — the guard missed
-  // exactly the rewording it exists to catch. 40 files here carry repeated copy.
-  const inventory = JSON.parse(
-    fs.readFileSync(new URL('../docs/i18n/copy-inventory.json', import.meta.url), 'utf8')
+test('a duplicate swap changes the inventory (multiset, not Set)', async () => {
+  // The real failure: a file holds the same string twice and one occurrence is changed to
+  // another string ALREADY present in that file. Set-backed collection produced identical
+  // output before and after, so the guard missed exactly the rewording it exists to catch.
+  // Drive the real extractor over a fixture rather than asserting on the generated file.
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  const write = (body) => {
+    const file = path.join(dir, 'Fixture.tsx');
+    fs.writeFileSync(file, body);
+    return collectFromSource(file);
+  };
+
+  const before = write(
+    `export function C() {
+       return (<div><span>All notes</span><span>All notes</span><span>Shared notes</span></div>);
+     }`
   );
-  const withRepeats = Object.values(inventory.files)
-    .flatMap((entry) => [entry.copy ?? [], entry.uncertain ?? []])
-    .filter((strings) => new Set(strings).size < strings.length);
-  assert.ok(
-    withRepeats.length > 0,
-    'repeated copy must be recorded per occurrence, not collapsed'
+  const after = write(
+    `export function C() {
+       return (<div><span>All notes</span><span>Shared notes</span><span>Shared notes</span></div>);
+     }`
   );
+
+  assert.deepEqual(before.copy, ['All notes', 'All notes', 'Shared notes']);
+  assert.deepEqual(after.copy, ['All notes', 'Shared notes', 'Shared notes']);
+  assert.notDeepEqual(before.copy, after.copy, 'a duplicate swap must change the inventory');
+  // The set of distinct strings is identical — this is what a Set-backed version saw.
+  assert.deepEqual([...new Set(before.copy)].sort(), [...new Set(after.copy)].sort());
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a switch body is inventoried, only the case label is skipped', async () => {
+  // Skipping the whole CaseClause dropped every string inside a switch along with the label.
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  const file = path.join(dir, 'Switch.tsx');
+  fs.writeFileSync(
+    file,
+    `export function C({ state }) {
+       switch (state) {
+         case 'saved':
+           return <p>All changes saved</p>;
+         default:
+           return null;
+       }
+     }`
+  );
+  const { copy, uncertain } = collectFromSource(file);
+  assert.ok(copy.includes('All changes saved'), 'copy inside a case body must be recorded');
+  assert.ok(![...copy, ...uncertain].includes('saved'), 'the case label itself is structure');
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test('generated output is ordered independently of host locale', async () => {
