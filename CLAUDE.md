@@ -186,10 +186,12 @@ elsewhere would land unseen.
 **Two checks, run per PR (`npm run lint:i18n`, `npm run i18n:inventory`):**
 
 - **No new hardcoded copy.** `renderer/eslint.config.i18n.mjs` runs
-  `i18next/no-literal-string` at `error` over JSX text and the copy-bearing attributes
-  (`placeholder`, `title`, `alt`, `aria-label`). It is a *separate* config from
+  `i18next/no-literal-string` at `error` over JSX text and the copy-bearing attributes —
+  the DOM ones (`placeholder`, `title`, `alt`, `aria-label`) and this app's own component
+  props (`label`, `description`, `hint`, `confirmLabel`, …), which carry ~170 sites of
+  visible copy. It is a *separate* config from
   `eslint.config.mjs` on purpose: a codebase with no i18n yet trips it hundreds of times,
-  and folding that into the main lint run would make it permanently red — which this repo
+  and folding those 713 into the main lint run would make it permanently red — which this repo
   has already seen end in four react-hooks rules downgraded to `warn`, where they are now
   write-only. Instead `scripts/i18n-lint-gate.mjs` compares per-file counts against
   `renderer/i18n-lint-baseline.json` and fails on any divergence, in both directions: a
@@ -210,6 +212,11 @@ suite so they are deterministic regardless of the host's OS locale or a stored p
 Per-language coverage belongs in one dedicated locale-smoke spec (switch language, assert
 a handful of translated strings, assert no raw dotted keys leak into the UI), not in
 translating existing specs.
+
+One gap is deliberate and covered by the other half: swapping a literal for a different
+one inside the same file leaves the per-file count unchanged, so `lint:i18n` stays green.
+That is the copy-rewrite case, and `i18n:inventory` fails on it — the two checks are built
+to cover each other rather than to duplicate each other.
 
 **What the gate does not catch,** so nobody mistakes green for complete: strings assembled
 at runtime from fragments, copy in the Electron main process (menus, tray, native

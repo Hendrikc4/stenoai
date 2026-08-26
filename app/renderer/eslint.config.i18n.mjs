@@ -7,14 +7,14 @@ import { IGNORED_FILES, COPY_ATTRIBUTES, NON_COPY_PATTERNS } from '../scripts/i1
 // i18n gate config — deliberately SEPARATE from eslint.config.mjs.
 //
 // `no-literal-string` fires on every user-facing string in a codebase that has no
-// i18n yet — 611 of them when this landed. Putting it in the main config would
+// i18n yet — 713 of them when this landed. Putting it in the main config would
 // make `npm run lint:renderer` permanently red, and this repo's own history says what
 // happens next: eslint.config.mjs documents four react-hooks rules that were downgraded
 // to `warn` for exactly that reason, where they are now write-only.
 //
 // So the rule lives here at `error` and is run by scripts/i18n-lint-gate.mjs, which
 // compares per-file counts against renderer/i18n-lint-baseline.json and fails only when
-// a count diverges. New hardcoded copy is blocked from day one; the pre-existing 611
+// a count diverges. New hardcoded copy is blocked from day one; the pre-existing 713
 // are a burn-down number rather than a wall. Once the i18n migration drains the baseline,
 // this config can fold into the main one as a plain global `error`.
 export default [

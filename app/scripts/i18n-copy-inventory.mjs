@@ -32,7 +32,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { IGNORED_FILES, COPY_ATTRIBUTES, isCopy, looksLikeCopy, globToRegExp } from './i18n-copy-rules.mjs';
+import {
+  IGNORED_FILES,
+  COPY_ATTRIBUTES,
+  isCopy,
+  looksLikeCopy,
+  globToRegExp,
+  decodeEntities,
+  toPosixPath,
+} from './i18n-copy-rules.mjs';
 
 const APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_DIR = path.join(APP_DIR, 'renderer/src');
@@ -40,7 +48,8 @@ const INVENTORY = path.resolve(APP_DIR, '../docs/i18n/copy-inventory.json');
 const update = process.argv.includes('--update');
 
 function ignored(relPath) {
-  return IGNORED_FILES.some((pattern) => globToRegExp(pattern).test(relPath));
+  const posix = toPosixPath(relPath);
+  return IGNORED_FILES.some((pattern) => globToRegExp(pattern).test(posix));
 }
 
 function sourceFiles(dir, acc = []) {
@@ -56,9 +65,11 @@ function sourceFiles(dir, acc = []) {
   return acc;
 }
 
-// JSX collapses whitespace, so the inventory must too — otherwise a reflowed line reads as
-// a copy change and the "moved, not changed" rule stops meaning anything.
-const normalize = (text) => text.replace(/\s+/g, ' ').trim();
+// Record what the user actually sees. JSX collapses whitespace, so the inventory must too
+// — otherwise a reflowed line reads as a copy change and the "moved, not changed" rule
+// stops meaning anything. Entities are decoded for the same reason: React renders `&amp;`
+// as `&`, so storing the entity would make untouched copy look edited during the migration.
+const normalize = (text) => decodeEntities(text.replace(/\s+/g, ' ').trim());
 
 function collectFromSource(file) {
   const source = ts.createSourceFile(
@@ -120,7 +131,7 @@ function collectFromSource(file) {
 const inventory = {};
 for (const file of sourceFiles(SRC_DIR).sort()) {
   const strings = collectFromSource(file);
-  if (strings.length) inventory[path.relative(APP_DIR, file)] = strings;
+  if (strings.length) inventory[toPosixPath(path.relative(APP_DIR, file))] = strings;
 }
 
 const total = Object.values(inventory).reduce((sum, list) => sum + list.length, 0);

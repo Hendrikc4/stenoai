@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 // Shared definition of "what counts as user-facing copy".
 //
 // Two tools consume this: the lint gate (renderer/eslint.config.i18n.mjs) which blocks NEW
@@ -16,8 +18,49 @@ export const IGNORED_FILES = [
   '**/*.test.tsx',
 ];
 
-/** JSX attributes whose value a user actually reads. */
-export const COPY_ATTRIBUTES = ['placeholder', 'title', 'alt', 'aria-label', 'aria-description'];
+/**
+ * JSX attributes whose value a user actually reads.
+ *
+ * Both the DOM ones and this app's own component props: `<SettingRow label="…" />` and
+ * `<ConfirmDialog confirmLabel="…" />` are copy every bit as much as `placeholder`, and
+ * there are ~170 such sites in the renderer. Leaving them out let new hardcoded copy in
+ * through the front door — the gate would go green on it.
+ */
+export const COPY_ATTRIBUTES = [
+  // DOM attributes
+  'placeholder',
+  'title',
+  'alt',
+  'aria-label',
+  'aria-description',
+  // This app's own copy-bearing component props
+  'label',
+  'description',
+  'hint',
+  'heading',
+  'subtitle',
+  'caption',
+  'tooltip',
+  'emptyText',
+  'message',
+  'confirmLabel',
+  'cancelLabel',
+  'submitLabel',
+];
+
+/**
+ * Normalise a path for comparison against globs and checked-in baselines.
+ *
+ * `path.relative()` yields backslashes on Windows, so the slash-based ignore patterns stop
+ * matching and every baseline key differs from the committed one — both gates would fail on
+ * an untouched Windows checkout. CLAUDE.md requires the two platforms to behave the same.
+ *
+ * `sep` is injectable purely so the Windows behaviour is testable from a POSIX machine,
+ * where `path.sep` is already '/' and the function would otherwise be a silent no-op.
+ */
+export function toPosixPath(relPath, sep = path.sep) {
+  return String(relPath).split(sep).join('/');
+}
 
 /**
  * Text that looks like a string but is not copy.
@@ -108,8 +151,12 @@ export function looksLikeCopy(text) {
 
   const tokens = trimmed.split(/\s+/);
   if (tokens.length === 1) {
-    // One word: accept Sentence-case words ("Processing", "Cancelled"), reject the
-    // PascalCase identifiers that look just like them ("CardContent", "ArrowDown").
+    // One word: accept Sentence-case words ("Processing", "Cancelled") and short all-caps
+    // acronyms that are real labels ("AI", "PDF") — the nav item `label: 'AI'` is a plain
+    // TS literal the linter cannot see either, so dropping it here left it uncovered by
+    // both gates. Reject the PascalCase identifiers that look just like sentence-case
+    // words ("CardContent", "ArrowDown").
+    if (/^\p{Lu}{2,5}$/u.test(trimmed)) return true;
     return /^\p{Lu}\p{Ll}+$/u.test(trimmed);
   }
 
@@ -146,4 +193,47 @@ export function globToRegExp(pattern) {
     .replaceAll(GLOBSTAR, '.*')
     .replaceAll(STAR, '[^/]*');
   return new RegExp(`^${source}$`);
+}
+
+/**
+ * Decode the HTML entities JSX source may carry.
+ *
+ * `JsxText` hands back the raw source text, so `Summarisation &amp; Chat` is stored with
+ * the entity intact while React renders `Summarisation & Chat`. That breaks the one rule
+ * the inventory exists to support: during the migration to locale strings, copy that never
+ * changed would show up as changed — and anyone copying the inventory text into a locale
+ * file would ship the literal entity to the UI.
+ */
+const NAMED_ENTITIES = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: '\u00a0',
+  ldquo: '\u201c',
+  rdquo: '\u201d',
+  lsquo: '\u2018',
+  rsquo: '\u2019',
+  mdash: '\u2014',
+  ndash: '\u2013',
+  hellip: '\u2026',
+  times: '\u00d7',
+  middot: '\u00b7',
+};
+
+export function decodeEntities(text) {
+  return String(text).replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (match, body) => {
+    if (body[0] === '#') {
+      const codePoint =
+        body[1] === 'x' || body[1] === 'X'
+          ? Number.parseInt(body.slice(2), 16)
+          : Number.parseInt(body.slice(1), 10);
+      return Number.isFinite(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+        ? String.fromCodePoint(codePoint)
+        : match;
+    }
+    // `&` is decoded last by construction: a single pass never rewrites its own output.
+    return Object.hasOwn(NAMED_ENTITIES, body) ? NAMED_ENTITIES[body] : match;
+  });
 }

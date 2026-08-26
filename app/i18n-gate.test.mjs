@@ -127,3 +127,55 @@ test('looksLikeCopy keeps prose and drops markup', async () => {
     assert.ok(!looksLikeCopy(markup), `expected NOT copy: ${JSON.stringify(markup)}`);
   }
 });
+
+// --- fixes from the Codex review ------------------------------------------------------
+
+import { decodeEntities, toPosixPath, COPY_ATTRIBUTES } from './scripts/i18n-copy-rules.mjs';
+
+test('records what the user sees, not the JSX source entity', async () => {
+  // The inventory stored `Summarisation &amp; Chat` while React renders `Summarisation &
+  // Chat`. Untouched copy would then read as changed in a migration diff — the exact
+  // comparison the inventory exists to make.
+  assert.equal(decodeEntities('Summarisation &amp; Chat'), 'Summarisation & Chat');
+  assert.equal(decodeEntities('Settings &gt; People'), 'Settings > People');
+  assert.equal(decodeEntities('it&apos;s'), "it's");
+  assert.equal(decodeEntities('&#39;x&#39;'), "'x'");
+  assert.equal(decodeEntities('&#x2014;'), '—');
+  // An entity nobody declared stays put rather than turning into something wrong.
+  assert.equal(decodeEntities('&unknown;'), '&unknown;');
+});
+
+test('baseline and glob keys are POSIX on every platform', async () => {
+  // On Windows path.relative() returns backslashes: the slash-based ignore globs stop
+  // matching and every baseline key differs from the committed one, so both gates fail on
+  // an untouched checkout.
+  assert.equal(toPosixPath('renderer\\src\\routes\\Home.tsx', '\\'), 'renderer/src/routes/Home.tsx');
+  assert.equal(toPosixPath('renderer/src/routes/Home.tsx', '/'), 'renderer/src/routes/Home.tsx');
+
+  const rx = globToRegExp('**/*.test.ts');
+  assert.ok(rx.test(toPosixPath('renderer\\src\\lib\\hero.test.ts', '\\')));
+});
+
+test('copy-bearing component props are gated, not just DOM attributes', async () => {
+  // ~170 sites in the renderer use label=/description=/hint=/confirmLabel=. Leaving them
+  // out let new hardcoded copy in through the front door with the gate reporting green.
+  for (const attr of ['label', 'description', 'hint', 'confirmLabel']) {
+    const messages = await flagged(`    <SettingRow ${attr}="Shown to users" />`);
+    assert.equal(messages.length, 1, `expected ${attr} to be flagged`);
+  }
+  assert.ok(COPY_ATTRIBUTES.includes('label'));
+
+  // Still no false positive on the structural props sitting right next to them.
+  const structural = await flagged(`    <SettingRow id="general" variant="compact" />`);
+  assert.equal(structural.length, 0);
+});
+
+test('acronym labels are inventoried', async () => {
+  // `label: 'AI'` in SettingsNav.tsx is a plain TS literal the linter cannot see, so the
+  // inventory is its only cover — and the single-word rule used to drop all-caps words.
+  for (const acronym of ['AI', 'PDF', 'URL']) {
+    assert.ok(looksLikeCopy(acronym), `expected ${acronym} to be inventoried`);
+  }
+  // Long all-caps runs are constants, not labels.
+  assert.ok(!looksLikeCopy('SCREAMINGCONSTANT'));
+});

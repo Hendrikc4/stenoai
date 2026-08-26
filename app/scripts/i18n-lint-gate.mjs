@@ -7,6 +7,14 @@
 // Counts, not line numbers: line numbers churn on every unrelated edit and would turn the
 // baseline into a merge-conflict magnet across the many renderer PRs in flight.
 //
+// KNOWN LIMIT, covered elsewhere on purpose: swapping one literal for another inside the
+// same file leaves the count unchanged, so this gate reports "none added". That is the
+// copy-rewrite case, and the copy inventory is what catches it — verified by simulating
+// exactly the PR #494 edit ('Nothing to process' -> 'Nothing was recorded.'): this gate
+// stays green, `npm run i18n:inventory` fails. Storing per-violation identities here
+// instead would duplicate the inventory and reintroduce the merge churn that made counts
+// the right choice in the first place.
+//
 // Semantics are lockfile-like — ANY divergence from the baseline fails, in both directions:
 //   * a count went UP   → new hardcoded copy; use t() (or justify a baseline bump in review)
 //   * a count went DOWN → progress; commit it with --update so the burn-down stays honest
@@ -18,6 +26,7 @@ import { ESLint } from 'eslint';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { toPosixPath } from './i18n-copy-rules.mjs';
 
 const APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG = path.join(APP_DIR, 'renderer/eslint.config.i18n.mjs');
@@ -30,7 +39,8 @@ const results = await eslint.lintFiles([path.join(APP_DIR, 'renderer/src')]);
 const counts = {};
 for (const r of results) {
   const n = r.messages.filter((m) => m.ruleId === 'i18next/no-literal-string').length;
-  if (n > 0) counts[path.relative(APP_DIR, r.filePath)] = n;
+  // POSIX keys so the checked-in baseline matches on Windows too.
+  if (n > 0) counts[toPosixPath(path.relative(APP_DIR, r.filePath))] = n;
 }
 const total = Object.values(counts).reduce((a, b) => a + b, 0);
 const sorted = Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
