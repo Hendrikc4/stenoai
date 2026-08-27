@@ -146,6 +146,11 @@ test('lowercase copy containing a number is kept', async () => {
     'up to 10 notes',
     'step 2 of 3',
     '1 of 5',
+    // Reported by cubic after the first pass: every token carries a digit, so the
+    // marker test alone was satisfied and the string fell out. None of them is a
+    // utility class, which is what now tells the two apart.
+    'v2 beta3',
+    '1080p 60fps',
   ]) {
     assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
   }

@@ -214,6 +214,10 @@ export function definitelyNotCopy(text) {
   // least one has to carry a marker or a hyphen, so a phrase built only from bare
   // utilities that are also English words ("open group") stays copy too.
   //
+  // Markers alone are still not enough, or a version label like "v2 beta3" would match on
+  // digits the way "h-8 w-28" does: at least one token has to come from the vocabulary,
+  // and a class list always has one while a version string has none.
+  //
   // The cost is paid in the safe direction: CSS transitions ("height 80ms linear"), CSS
   // animation names and this app's own component classes ("scrollbar-clean flex ...") no
   // longer look like markup and are recorded. That is noise in a generated file, which is
@@ -225,7 +229,8 @@ export function definitelyNotCopy(text) {
     !/\p{Lu}/u.test(trimmed) &&
     tokens.every(classListShaped) &&
     tokens.every((t) => utilityShaped(t) || markupShaped(t)) &&
-    tokens.some((t) => markupShaped(t) || t.includes('-'))
+    tokens.some((t) => markupShaped(t) || t.includes('-')) &&
+    tokens.some(utilityShaped)
   ) {
     return true;
   }

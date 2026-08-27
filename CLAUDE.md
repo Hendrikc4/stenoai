@@ -199,7 +199,7 @@ elsewhere would land unseen.
   (`npm run lint:i18n:update`) so the burn-down number stays honest.
 - **The English copy inventory.** `app/scripts/i18n-copy-inventory.mjs` extracts every
   English string the renderer shows into `docs/i18n/copy-inventory.json` (1122 `copy` +
-  1086 `uncertain`, repeated copy recorded per occurrence). It blocks nothing; it
+  1108 `uncertain`, repeated copy recorded per occurrence). It blocks nothing; it
   witnesses. The review rule for an i18n migration is then one sentence: *the inventory
   diff must show strings moving, never changing.* Afterwards it keeps working as a copy
   changelog — an intentional wording change shows up as a one-file diff in the PR that
