@@ -135,6 +135,33 @@ test('the inventory keeps prose and rejects only provable markup', async () => {
   }
 });
 
+test('lowercase copy containing a number is kept', async () => {
+  // The digit branch was the same hole one level over: any lowercase string with a
+  // number in it counted as markup, so "last 7 days" was dropped like "mt-2 flex-1".
+  // Numbers are more common in copy than hyphens, which made this the wider gap.
+  for (const copy of [
+    'last 7 days',
+    '2 speakers detected',
+    'top 3 results',
+    'up to 10 notes',
+    'step 2 of 3',
+    '1 of 5',
+  ]) {
+    assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
+  }
+
+  for (const markup of [
+    'mt-2 flex-1',
+    'text-[11.5px]',
+    'h-8 w-28 text-sm',
+    'absolute inset-0 bg-ink-900/40 backdrop-blur-sm',
+    'px-2 py-1.5 text-sm',
+    'gap-1.5 rounded-full',
+  ]) {
+    assert.ok(definitelyNotCopy(markup), `expected NOT copy: ${JSON.stringify(markup)}`);
+  }
+});
+
 test('lowercase copy with a hyphenated word is kept; class lists are still rejected', async () => {
   // A hyphen alone was treated as proof of markup as soon as a second token followed, so
   // every lowercase multi-word phrase containing one fell out of the inventory -- exactly

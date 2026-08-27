@@ -160,7 +160,7 @@ const TECHNICAL_PATTERNS = [
  * costs an `uncertain` entry, never a dropped string.
  */
 const UTILITY_PREFIX =
-  /^(bg|text|font|border|rounded|shadow|flex|grid|gap|space|items|justify|self|place|content|p|px|py|pt|pb|pl|pr|m|mx|my|mt|mb|ml|mr|w|h|min|max|size|overflow|opacity|z|top|bottom|left|right|inset|translate|rotate|scale|transform|transition|duration|ease|delay|animate|cursor|select|pointer|whitespace|break|truncate|leading|tracking|list|table|tabular|ring|outline|divide|backdrop|blur|object|aspect|col|row|order|basis|grow|shrink|sr|not|first|last|odd|even|hover|focus|active|disabled|group|peer|dark|sm|md|lg|xl|inline|block|hidden|static|fixed|absolute|relative|sticky|mv)-/;
+  /^(bg|text|font|border|rounded|shadow|flex|grid|gap|space|items|justify|self|place|content|p|px|py|pt|pb|pl|pr|m|mx|my|mt|mb|ml|mr|w|h|min|max|size|overflow|opacity|z|top|bottom|left|right|inset|translate|rotate|scale|transform|transition|duration|ease|delay|animate|cursor|select|pointer|whitespace|break|truncate|leading|tracking|list|table|tabular|ring|outline|divide|decoration|backdrop|blur|object|aspect|col|row|order|basis|grow|shrink|sr|not|first|last|odd|even|hover|focus|active|disabled|group|peer|dark|sm|md|lg|xl|inline|block|hidden|static|fixed|absolute|relative|sticky|mv)-/;
 
 const BARE_UTILITIES = new Set([
   'flex', 'grid', 'block', 'inline', 'hidden', 'static', 'fixed', 'absolute', 'relative',
@@ -207,19 +207,25 @@ export function definitelyNotCopy(text) {
   // means the string is recorded as `uncertain`, which is noise. An unrecognised English
   // word would otherwise mean a string that can be reworded with nothing to notice.
   //
-  // The all-utility branch additionally requires one hyphenated token, so a phrase built
-  // only from bare utilities that are also English words ("open group") stays copy. Every
-  // class list in this renderer carries at least one, so nothing is given up for it.
+  // A digit used to be proof on its own, which was the same hole one level over: "last 7
+  // days" and "2 speakers detected" were dropped exactly like "mt-2 flex-1". Numbers turn
+  // up in copy more often than hyphens do, so that gap was the wider of the two. Now EVERY
+  // token has to look like markup — from the vocabulary or carrying a marker — and at
+  // least one has to carry a marker or a hyphen, so a phrase built only from bare
+  // utilities that are also English words ("open group") stays copy too.
+  //
+  // The cost is paid in the safe direction: CSS transitions ("height 80ms linear"), CSS
+  // animation names and this app's own component classes ("scrollbar-clean flex ...") no
+  // longer look like markup and are recorded. That is noise in a generated file, which is
+  // what this file's inverted burden of proof asks us to prefer over a dropped string.
   const tokens = trimmed.split(/\s+/);
   const markupShaped = (token) => /[:[\]/]/.test(token) || /\d/.test(token);
   const classListShaped = (token) => /^[a-z0-9[\]:/._%-]+$/.test(token);
   if (
     !/\p{Lu}/u.test(trimmed) &&
     tokens.every(classListShaped) &&
-    (tokens.some(markupShaped) ||
-      (tokens.length > 1 &&
-        tokens.every(utilityShaped) &&
-        tokens.some((t) => t.includes('-'))))
+    tokens.every((t) => utilityShaped(t) || markupShaped(t)) &&
+    tokens.some((t) => markupShaped(t) || t.includes('-'))
   ) {
     return true;
   }
