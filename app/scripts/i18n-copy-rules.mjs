@@ -149,15 +149,12 @@ const TECHNICAL_PATTERNS = [
   /^[a-z]+([A-Z][a-z0-9]*)+$/, // camelCase identifiers
   /^[A-Z0-9]+(_[A-Z0-9]+)+$/, // SCREAMING_SNAKE_CASE
   /^[a-z0-9]+(\.[a-z0-9]+)+$/i, // dotted keys and file names
-  // A leading word plus a colon, and no whitespace anywhere: "var:", "data:",
-  // "sm:hidden", "PROGRESS:transcribe:". The earlier form of this rule was
-  // case-insensitive and had no whitespace bound, so it also swallowed every sentence
-  // that opens with a label -- "Error: Try again", "Duration: 3 min", "Speaker: You".
-  // Casing alone cannot separate the two ("Duration:" is a label, "PROGRESS:x:" is a
-  // marker), so the whitespace bound carries the sentences and casing splits the rest:
-  // all-lower and all-upper words are technical, a capitalised word is copy. A bare
-  // all-caps label ("URL:") has nothing after the colon, which is what keeps it copy.
-  /^[a-z]+:\S*$/, // protocol-ish and css shorthand ("var:", "data:")
+  // Casing is not proof that a colon-shaped literal is technical: lowercase labels such
+  // as "status:" and "note:" are ordinary copy too. Reject only protocol/CSS prefixes
+  // and Tailwind variants that are known to be structural. Missing a variant adds safe
+  // inventory noise; accepting arbitrary lowercase prefixes would silently drop copy.
+  /^(?:https?|data|var):\S*$/,
+  /^(?:(?:sm|hover|focus-visible):)+\S+$/,
   /^[A-Z][A-Z0-9_]*:\S+$/, // screaming markers ("PROGRESS:transcribe:"), never a bare "URL:"
 ];
 

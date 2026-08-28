@@ -221,9 +221,12 @@ test('copy that opens with a label is kept; colon-shaped identifiers are still r
     'Note: Changes are saved automatically',
     'Duration: 3 min',
     'Speaker: You',
-    // A bare label is copy too, and only its capital tells it from "sm:hidden".
+    // Bare labels are copy too. Casing cannot prove that a colon-shaped literal is
+    // technical, so lowercase labels must stay in the inventory as well.
     'Duration:',
     'URL:',
+    'status:',
+    'note:',
   ]) {
     assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
   }
