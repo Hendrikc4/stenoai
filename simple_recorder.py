@@ -6069,11 +6069,20 @@ def mark_speaker_cluster(
         # A previous attempt can commit profile cleanup and then fail its
         # sidecar write. Retrying then has no newly-cleared person to report,
         # but it must still repair the transcript and Participants section.
+        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        previous_transcript_body = _saved_transcript_body(transcript_path)
         restored_lines = restore_transcript_labels(
-            get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt",
+            transcript_path,
             sidecar.get("transcript_lines") or [],
             {(channel, fid) for fid in fragment_ids},
         )
+        if restored_lines > 0 and previous_transcript_body is not None:
+            _update_summary_transcript(
+                output_dir,
+                meeting_stem,
+                transcript_path,
+                previous_transcript_body,
+            )
         _update_summary_participants(
             output_dir, meeting_stem,
             confirmed_participant_names(meeting_stem, config.get_person_profiles()),

@@ -1293,6 +1293,14 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     {"start": 20.0, "channel": "mic", "diarization_speaker_id": "SPEAKER_01"},
                 ],
             )
+            summary = Path(tmp) / "output" / "mtg001_summary.md"
+            summary.write_text(
+                "---\nis_diarised: true\n---\n\n"
+                "## Summary\n\nA two-person meeting.\n\n"
+                "## Transcript\n\n"
+                "[00:05] [Speaker 2] hello there\n\n[00:20] [You] hi back\n",
+                encoding="utf-8",
+            )
             cfg = Config(config_path=Path(tmp) / "config.json")
             cfg.set_identity_matching_enabled(True)
             with mock.patch("src.config.get_config", return_value=cfg), \
@@ -1303,6 +1311,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 ])
             self.assertTrue(_last_json(confirmed.output)["success"])
             self.assertIn("[00:05] [Person Alpha] hello there", transcript.read_text())
+            self.assertIn("[00:05] [Person Alpha] hello there", summary.read_text())
 
             result = self._run(
                 simple_recorder.mark_speaker_cluster,
@@ -1319,6 +1328,12 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 "and the label the line carried before the confirmation comes back",
             )
             self.assertIn("[00:20] [You] hi back", text)  # never this cluster's line
+            summary_text = summary.read_text()
+            self.assertNotIn(
+                "Person Alpha", summary_text,
+                "the withdrawn name must leave the embedded transcript too",
+            )
+            self.assertIn("[00:05] [Speaker 2] hello there", summary_text)
 
     def test_retry_after_sidecar_failure_repairs_transcript_and_participants(self):
         with tempfile.TemporaryDirectory() as tmp:
