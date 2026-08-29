@@ -6115,6 +6115,12 @@ def mark_speaker_cluster(
                 "error": "Could not read the transcript. Retry the speaker marking.",
             }))
             sys.exit(1)
+        if prepared_transcript_body is None:
+            print(json.dumps({
+                "success": False,
+                "error": "The transcript is missing. Restore it before marking the speaker.",
+            }))
+            sys.exit(1)
         prepared_restore_target_ids = {(channel, fid) for fid in fragment_ids}
         if not _reconcile_pending_summary_transcript_sync(
             output_dir,
@@ -7014,11 +7020,13 @@ def _prepare_summary_transcript_sync(
     target_ids: set,
     replacement_label: Optional[str],
 ) -> tuple[bool, Optional[dict]]:
-    """Persist exact pre-write proof for a possible summary retry.
+    """Persist exact pre-write provenance for an interrupted operation.
 
     The marker contains hashes and operation identity only. It is written to
     the already crash-safe speaker sidecar while the caller holds its meeting
-    lock, before either transcript artifact changes.
+    lock, before either transcript artifact changes. The operation identity is
+    durable even when the Summary is absent or already divergent, so a failed
+    canonical write can still retry the exact committed profile operation.
     """
     from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
 
@@ -7044,18 +7052,15 @@ def _prepare_summary_transcript_sync(
     summary_format, embedded_body, io_failed = _summary_transcript_copy(output_dir, meeting_stem)
     if io_failed:
         return False, None
-    if summary_format is None or embedded_body is None:
-        return True, None
-    if embedded_body != previous_transcript_body:
-        # The embedded copy already diverged before this operation. Preserve it
-        # and do not mint provenance that could make a later retry overwrite it.
-        return True, None
 
     marker = {
         "version": _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
         "summary_format": summary_format,
         "canonical_before_sha256": _transcript_body_hash(previous_transcript_body),
-        "embedded_before_sha256": _transcript_body_hash(embedded_body),
+        "embedded_before_sha256": (
+            _transcript_body_hash(embedded_body)
+            if isinstance(embedded_body, str) else None
+        ),
         "canonical_after_sha256": _transcript_body_hash(expected_transcript_body),
         "operation_sha256": operation_hash,
     }
@@ -7100,10 +7105,27 @@ def _reconcile_pending_summary_transcript_sync(
 
     operation_hash = _summary_sync_operation_hash(target_ids, replacement_label)
     transcript_body = _saved_transcript_body(transcript_path)
+    if transcript_body is None:
+        logger.warning("Could not safely reconcile pending transcript sync for %s", meeting_stem)
+        return False
+
+    if (
+        isinstance(marker, dict)
+        and marker.get("version") in {
+            _LEGACY_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+            _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+        }
+        and marker.get("operation_sha256") == operation_hash
+    ):
+        # This is the exact interrupted operation. Its later update path
+        # preserves an absent Summary and still verifies the original embedded
+        # hash before changing a divergent one.
+        return True
+
     summary_format, embedded_body, io_failed = _summary_transcript_copy(
         output_dir, meeting_stem,
     )
-    if transcript_body is None or io_failed or summary_format is None or embedded_body is None:
+    if io_failed or summary_format is None or embedded_body is None:
         logger.warning("Could not safely reconcile pending transcript sync for %s", meeting_stem)
         return False
 
@@ -7123,18 +7145,6 @@ def _reconcile_pending_summary_transcript_sync(
             return True
         logger.warning("Could not clear completed pending transcript sync for %s", meeting_stem)
         return False
-
-    if (
-        isinstance(marker, dict)
-        and marker.get("version") in {
-            _LEGACY_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
-            _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
-        }
-        and marker.get("operation_sha256") == operation_hash
-    ):
-        # This is the exact interrupted operation.  Its later update path
-        # still verifies the original embedded hash before changing anything.
-        return True
 
     logger.warning("Pending transcript sync for %s cannot be safely reconciled", meeting_stem)
     return False
