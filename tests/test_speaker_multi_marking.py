@@ -1336,6 +1336,86 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             )
             self.assertIn("[00:05] [Speaker 2] hello there", summary_text)
 
+    def test_marker_write_failure_rolls_back_marking_and_reports_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Participants\n\nPerson Alpha\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+
+            transcript_before = transcript.read_text(encoding="utf-8")
+            summary_before = summary.read_text(encoding="utf-8")
+            profiles_before = cfg.get_person_profiles()
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
+            import src.speaker_suggestions as speaker_suggestions
+            real_write = speaker_suggestions.write_sidecar_document
+
+            def fail_only_marker_write(output, stem, document, **kwargs):
+                if "pending_summary_transcript_sync" in document:
+                    raise OSError("simulated marker write failure")
+                return real_write(output, stem, document, **kwargs)
+
+            with mock.patch.object(
+                speaker_suggestions,
+                "write_sidecar_document",
+                side_effect=fail_only_marker_write,
+            ):
+                failed = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles(), profiles_before)
+            self.assertEqual(read_speakers_sidecar(output_dir, "mtg001"), sidecar_before)
+            self.assertEqual(transcript.read_text(encoding="utf-8"), transcript_before)
+            self.assertEqual(summary.read_text(encoding="utf-8"), summary_before)
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertEqual(cfg.get_person_profiles()[0]["prototypes"], [])
+            sidecar_after = read_speakers_sidecar(output_dir, "mtg001")
+            self.assertTrue(
+                sidecar_after["channels"]["mic"]["clusters"]["SPEAKER_00"][
+                    MULTI_SPEAKER_KEY
+                ]
+            )
+            self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
+            self.assertNotIn("## Participants", summary.read_text(encoding="utf-8"))
+
     def test_mark_reconciles_a_completed_marker_before_profile_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = self._seed_with_transcript(

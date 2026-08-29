@@ -5439,6 +5439,11 @@ def confirm_speaker(
     embedding, context = clusters[resolved_id]
     fragment_ids = {resolved_id, *context.merged_from}
     channel_recording_type = channel_data.get("recording_type")
+    prepared_transcript_path = None
+    prepared_transcript_body = None
+    prepared_turn_manifest = None
+    prepared_relabel_target_ids = None
+    prepared_summary_sync_marker = None
 
     if not config.begin_transaction():
         print(json.dumps({
@@ -5461,12 +5466,16 @@ def confirm_speaker(
             sys.exit(1)
 
     if relabel_transcript and sidecar.get("transcript_lines"):
-        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        prepared_transcript_path = (
+            get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        )
+        prepared_transcript_body = _saved_transcript_body(prepared_transcript_path)
+        prepared_turn_manifest = sidecar.get("transcript_lines")
         target_ids = {(channel, sid) for sid in fragment_ids}
         if not _reconcile_pending_summary_transcript_sync(
             output_dir,
             meeting_stem,
-            transcript_path,
+            prepared_transcript_path,
             target_ids,
             person["display_name"],
         ):
@@ -5476,6 +5485,55 @@ def confirm_speaker(
                 "error": "Could not safely reconcile a pending transcript update.",
             }))
             sys.exit(1)
+        if prepared_transcript_body is not None:
+            expected_transcript_body, _ = restore_transcript_text_labels(
+                prepared_transcript_body,
+                prepared_turn_manifest,
+                target_ids,
+                replacement_label=person["display_name"],
+            )
+            summary_sync_ready, prepared_summary_sync_marker = (
+                _prepare_summary_transcript_sync(
+                    output_dir,
+                    meeting_stem,
+                    prepared_transcript_body,
+                    expected_transcript_body,
+                    target_ids,
+                    person["display_name"],
+                )
+            )
+            if not summary_sync_ready:
+                config.rollback_transaction()
+                print(json.dumps({
+                    "success": False,
+                    "error": "Could not prepare the transcript update. Retry the confirmation.",
+                }))
+                sys.exit(1)
+
+        # Only persist reversible transcript provenance after the pending
+        # marker is durable. A marker failure must leave the sidecar, profile,
+        # transcript, summary and Participants state exactly as they were.
+        try:
+            record_original_labels(
+                output_dir,
+                meeting_stem,
+                prepared_transcript_path,
+                target_ids,
+                lock_held=True,
+            )
+        except OSError as error:
+            config.rollback_transaction()
+            logger.warning("Could not record transcript provenance for %s: %s", meeting_stem, error)
+            print(json.dumps({
+                "success": False,
+                "error": "Could not prepare the transcript update. Retry the confirmation.",
+            }))
+            sys.exit(1)
+        refreshed_sidecar = store.read(meeting_stem)
+        if isinstance(refreshed_sidecar, dict):
+            sidecar = refreshed_sidecar
+            prepared_turn_manifest = sidecar.get("transcript_lines") or prepared_turn_manifest
+        prepared_relabel_target_ids = target_ids
 
     # Reassignment: if this exact cluster (or one of its merged fragments)
     # was already confirmed as someone, this confirm supersedes that -- the
@@ -5669,61 +5727,31 @@ def confirm_speaker(
         sys.exit(1)
 
     relabeled_lines = 0
-    summary_artifacts_ready = True
     if relabel_transcript:
-        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
-        previous_transcript_body = _saved_transcript_body(transcript_path)
-        turn_manifest = sidecar.get("transcript_lines")
-        retry_relabel_target_ids = None
-        summary_sync_ready = True
-        summary_sync_marker = None
+        transcript_path = prepared_transcript_path or (
+            get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        )
+        previous_transcript_body = (
+            prepared_transcript_body
+            if prepared_transcript_path is not None
+            else _saved_transcript_body(transcript_path)
+        )
+        turn_manifest = prepared_turn_manifest or sidecar.get("transcript_lines")
+        retry_relabel_target_ids = prepared_relabel_target_ids
+        summary_sync_marker = prepared_summary_sync_marker
         if turn_manifest:
             # Exact recorded provenance -- immune to the fuzzy-matching
             # cross-channel/same-channel mislabeling below (see
             # relabel_transcript_exact's docstring and the plan doc's
             # Phase 8). Only meetings processed after this manifest
             # existed have one; everything else falls back.
-            target_ids = {(channel, sid) for sid in [resolved_id, *context.merged_from]}
+            target_ids = prepared_relabel_target_ids or {
+                (channel, sid) for sid in [resolved_id, *context.merged_from]
+            }
             retry_relabel_target_ids = target_ids
-            # BEFORE the rename, so the label each line carries today is
-            # still readable. Without it, naming a cluster is irreversible
-            # in the transcript and marking it as mixed later would leave
-            # the name standing. First write wins, so re-confirming (the
-            # "Change" flow) never records a person's name as the original.
-            record_original_labels(
-                output_dir,
-                meeting_stem,
-                transcript_path,
-                target_ids,
-                lock_held=True,
+            relabeled_lines = relabel_transcript_exact(
+                transcript_path, turn_manifest, target_ids, person["display_name"],
             )
-            # record_original_labels rewrites the sidecar. Refresh the manifest
-            # before persisting the pending transition so this write cannot
-            # accidentally put its pre-write copy back on disk.
-            refreshed_sidecar = store.read(meeting_stem)
-            if isinstance(refreshed_sidecar, dict):
-                sidecar = refreshed_sidecar
-                turn_manifest = sidecar.get("transcript_lines") or turn_manifest
-            if previous_transcript_body is not None:
-                expected_transcript_body, _ = restore_transcript_text_labels(
-                    previous_transcript_body,
-                    turn_manifest,
-                    target_ids,
-                    replacement_label=person["display_name"],
-                )
-                summary_sync_ready, summary_sync_marker = _prepare_summary_transcript_sync(
-                    output_dir,
-                    meeting_stem,
-                    previous_transcript_body,
-                    expected_transcript_body,
-                    target_ids,
-                    person["display_name"],
-                )
-                summary_artifacts_ready = summary_sync_ready
-            if summary_sync_ready:
-                relabeled_lines = relabel_transcript_exact(
-                    transcript_path, turn_manifest, target_ids, person["display_name"],
-                )
         else:
             raw_clusters_by_id = channel_data.get("clusters") or {}
             pooled_segments = []
@@ -5732,7 +5760,6 @@ def confirm_speaker(
             relabeled_lines = relabel_transcript_speaker(transcript_path, pooled_segments, person["display_name"])
         if (
             previous_transcript_body is not None
-            and summary_sync_ready
             and (relabeled_lines > 0 or summary_sync_marker is not None)
         ):
             sync_outcome = _update_summary_transcript(
@@ -5778,8 +5805,7 @@ def confirm_speaker(
     # gate this behind a flag) -- keeps the meeting's Participants chip in
     # sync with every confirm, including plain CLI/backfill-validation use.
     participant_names = confirmed_participant_names(meeting_stem, config.get_person_profiles())
-    if summary_artifacts_ready:
-        _update_summary_participants(output_dir, meeting_stem, participant_names)
+    _update_summary_participants(output_dir, meeting_stem, participant_names)
 
     print(json.dumps({
         "success": True,
@@ -6033,15 +6059,22 @@ def mark_speaker_cluster(
     fragment_ids = {diarization_speaker_id}
     if resolved_id in clusters:
         fragment_ids = {resolved_id, *clusters[resolved_id][1].merged_from}
+    prepared_transcript_path = None
+    prepared_transcript_body = None
+    prepared_restore_target_ids = None
+    prepared_summary_sync_marker = None
 
     if multiple and fragment_ids and sidecar.get("transcript_lines"):
-        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
-        restore_target_ids = {(channel, fid) for fid in fragment_ids}
+        prepared_transcript_path = (
+            get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        )
+        prepared_transcript_body = _saved_transcript_body(prepared_transcript_path)
+        prepared_restore_target_ids = {(channel, fid) for fid in fragment_ids}
         if not _reconcile_pending_summary_transcript_sync(
             output_dir,
             meeting_stem,
-            transcript_path,
-            restore_target_ids,
+            prepared_transcript_path,
+            prepared_restore_target_ids,
             None,
         ):
             print(json.dumps({
@@ -6049,6 +6082,28 @@ def mark_speaker_cluster(
                 "error": "Could not safely reconcile a pending transcript update.",
             }))
             sys.exit(1)
+        if prepared_transcript_body is not None:
+            expected_transcript_body, _ = restore_transcript_text_labels(
+                prepared_transcript_body,
+                sidecar.get("transcript_lines") or [],
+                prepared_restore_target_ids,
+            )
+            summary_sync_ready, prepared_summary_sync_marker = (
+                _prepare_summary_transcript_sync(
+                    output_dir,
+                    meeting_stem,
+                    prepared_transcript_body,
+                    expected_transcript_body,
+                    prepared_restore_target_ids,
+                    None,
+                )
+            )
+            if not summary_sync_ready:
+                print(json.dumps({
+                    "success": False,
+                    "error": "Could not prepare the transcript update. Retry the speaker marking.",
+                }))
+                sys.exit(1)
 
     # Marking a cluster mixed must UNDO any name already on it, not just
     # stop future ones. Order matters: someone typically confirms a cluster
@@ -6068,7 +6123,6 @@ def mark_speaker_cluster(
     config = get_config()
     cleared_from = []
     restored_lines = 0
-    summary_artifacts_ready = True
     if multiple and fragment_ids:
         if not config.begin_transaction():
             print(json.dumps({
@@ -6159,35 +6213,25 @@ def mark_speaker_cluster(
         # A previous attempt can commit profile cleanup and then fail its
         # sidecar write. Retrying then has no newly-cleared person to report,
         # but it must still repair the transcript and Participants section.
-        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
-        previous_transcript_body = _saved_transcript_body(transcript_path)
-        restore_target_ids = {(channel, fid) for fid in fragment_ids}
-        summary_sync_ready = True
-        summary_sync_marker = None
-        if previous_transcript_body is not None and sidecar.get("transcript_lines"):
-            expected_transcript_body, _ = restore_transcript_text_labels(
-                previous_transcript_body,
-                sidecar.get("transcript_lines") or [],
-                restore_target_ids,
-            )
-            summary_sync_ready, summary_sync_marker = _prepare_summary_transcript_sync(
-                output_dir,
-                meeting_stem,
-                previous_transcript_body,
-                expected_transcript_body,
-                restore_target_ids,
-                None,
-            )
-            summary_artifacts_ready = summary_sync_ready
-        if summary_sync_ready:
-            restored_lines = restore_transcript_labels(
-                transcript_path,
-                sidecar.get("transcript_lines") or [],
-                restore_target_ids,
-            )
+        transcript_path = prepared_transcript_path or (
+            get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        )
+        previous_transcript_body = (
+            prepared_transcript_body
+            if prepared_transcript_path is not None
+            else _saved_transcript_body(transcript_path)
+        )
+        restore_target_ids = prepared_restore_target_ids or {
+            (channel, fid) for fid in fragment_ids
+        }
+        summary_sync_marker = prepared_summary_sync_marker
+        restored_lines = restore_transcript_labels(
+            transcript_path,
+            sidecar.get("transcript_lines") or [],
+            restore_target_ids,
+        )
         if (
             previous_transcript_body is not None
-            and summary_sync_ready
             and (restored_lines > 0 or summary_sync_marker is not None)
         ):
             sync_outcome = _update_summary_transcript(
@@ -6215,11 +6259,10 @@ def mark_speaker_cluster(
                         "cleared_confirmation_from": cleared_from,
                     }))
                     sys.exit(1)
-        if summary_artifacts_ready:
-            _update_summary_participants(
-                output_dir, meeting_stem,
-                confirmed_participant_names(meeting_stem, config.get_person_profiles()),
-            )
+        _update_summary_participants(
+            output_dir, meeting_stem,
+            confirmed_participant_names(meeting_stem, config.get_person_profiles()),
+        )
 
     print(json.dumps({
         "success": True,

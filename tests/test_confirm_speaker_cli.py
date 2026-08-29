@@ -1225,7 +1225,7 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             )
             self.assertIn("[Speaker 2] hello there", md_path.read_text(encoding="utf-8"))
 
-    def test_marker_write_failure_leaves_both_transcript_artifacts_unchanged(self):
+    def test_marker_write_failure_rolls_back_confirmation_and_reports_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "output"
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1257,6 +1257,7 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             transcript_file_before = "Session: mtg001\n\n" + "=" * 60 + "\n\n" + before
             transcript_path.write_text(transcript_file_before, encoding="utf-8")
             summary_before = summary_path.read_text(encoding="utf-8")
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
             import src.speaker_suggestions as speaker_suggestions
             real_write = speaker_suggestions.write_sidecar_document
 
@@ -1276,12 +1277,15 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 ], tmp)
 
             first_data = _last_json(first.output)
-            self.assertTrue(first_data["success"])
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(first_data["success"])
+            self.assertEqual(cfg.get_person_profiles(), [])
             self.assertEqual(transcript_path.read_text(encoding="utf-8"), transcript_file_before)
             self.assertEqual(summary_path.read_text(encoding="utf-8"), summary_before)
+            self.assertEqual(read_speakers_sidecar(output_dir, "mtg001"), sidecar_before)
 
             retry, _ = self._run([
-                "mtg001", "mic", "SPEAKER_00", "--person-id", first_data["person_id"],
+                "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
                 "--relabel-transcript",
             ], tmp, cfg=cfg)
             self.assertTrue(_last_json(retry.output)["success"])
