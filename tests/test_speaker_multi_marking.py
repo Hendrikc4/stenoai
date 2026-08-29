@@ -1113,6 +1113,51 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 [p["diarization_run_id"] for p in profile["prototypes"]], [run1],
             )
 
+    def test_reserved_you_profile_fails_before_marking_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = self._seed(tmp)
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            person = cfg.create_person_profile("Person Alpha")
+            cfg.add_speaker_prototype(
+                person["person_id"], [1.0, 0.0], recording_type="remote",
+                meeting_id="mtg001", diarization_speaker_id="SPEAKER_0",
+                speech_duration_seconds=60.0, segment_count=10,
+                created_from="user_confirmed", channel="system",
+                diarization_run_id=self._seeded_run_id(tmp),
+            )
+            cfg._config["person_profiles"][0]["display_name"] = "You"
+            self.assertTrue(cfg._save())
+            set_cluster_review_state(
+                output_dir, "mtg001", "system", "SPEAKER_0", REVIEW_STATE_GENERIC,
+            )
+            transcript_dir = Path(tmp) / "transcripts"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            transcript = transcript_dir / "mtg001_transcript.txt"
+            transcript.write_text("[00:03] [You] own words", encoding="utf-8")
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Participants\n\nYou\n\n## Transcript\n\n[00:03] [You] own words\n",
+                encoding="utf-8",
+            )
+            profiles_before = cfg.get_person_profiles()
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
+            transcript_before = transcript.read_text(encoding="utf-8")
+            summary_before = summary.read_text(encoding="utf-8")
+
+            failed = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "system", "SPEAKER_0"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles(), profiles_before)
+            self.assertEqual(read_speakers_sidecar(output_dir, "mtg001"), sidecar_before)
+            self.assertEqual(transcript.read_text(encoding="utf-8"), transcript_before)
+            self.assertEqual(summary.read_text(encoding="utf-8"), summary_before)
+
     def test_marking_withdraws_this_runs_negatives_and_keeps_an_older_runs(self):
         # The other two removals in the same loop, which the test above never
         # reaches (it stops at a positive removal that matches nothing). A
@@ -1567,6 +1612,194 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
             self.assertNotIn("## Participants", summary.read_text(encoding="utf-8"))
 
+    def test_legacy_mark_restores_transcript_and_summary_and_retries_io_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                            "segments": [{"start": 4.0, "end": 6.0}],
+                        },
+                    },
+                },
+            })
+            summary = output_dir / "mtg001_summary.md"
+            generic_body = "[00:05] [Speaker 2] hello there"
+            summary.write_text(
+                "## Summary\n\nText.\n\n## Transcript\n\n" + generic_body + "\n",
+                encoding="utf-8",
+            )
+            transcripts_dir = Path(tmp) / "transcripts"
+            transcripts_dir.mkdir(parents=True, exist_ok=True)
+            transcript = transcripts_dir / "mtg001_transcript.txt"
+            transcript.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n" + generic_body,
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            self.assertIn("[Person Alpha] hello there", transcript.read_text())
+            set_cluster_review_state(
+                output_dir,
+                "mtg001",
+                "mic",
+                "SPEAKER_00",
+                REVIEW_STATE_GENERIC,
+            )
+            real_atomic_write = simple_recorder._atomic_write_text
+            failed_once = False
+
+            def fail_first_summary_restore(path, text, *args, **kwargs):
+                nonlocal failed_once
+                if path == summary and not failed_once and "[Multiple speakers]" in text:
+                    failed_once = True
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text",
+                side_effect=fail_first_summary_restore,
+            ):
+                failed = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertTrue(failed_once)
+            self.assertEqual(cfg.get_person_profiles()[0]["prototypes"], [])
+            self.assertIn("[Multiple speakers] hello there", transcript.read_text())
+            self.assertIn("[Person Alpha] hello there", summary.read_text())
+            self.assertNotIn("## Participants", summary.read_text())
+            sidecar_after_failure = read_speakers_sidecar(output_dir, "mtg001")
+            self.assertIn("pending_summary_transcript_sync", sidecar_after_failure)
+            self.assertTrue(
+                sidecar_after_failure["channels"]["mic"]["clusters"]["SPEAKER_00"][
+                    MULTI_SPEAKER_KEY
+                ]
+            )
+            self.assertNotIn(
+                REVIEW_STATE_KEY,
+                sidecar_after_failure["channels"]["mic"]["clusters"]["SPEAKER_00"],
+            )
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertIn("[Multiple speakers] hello there", summary.read_text())
+            self.assertNotIn("Person Alpha", summary.read_text())
+            self.assertNotIn("## Participants", summary.read_text())
+            sidecar_after_retry = read_speakers_sidecar(output_dir, "mtg001")
+            self.assertNotIn("pending_summary_transcript_sync", sidecar_after_retry)
+            self.assertNotIn(
+                REVIEW_STATE_KEY,
+                sidecar_after_retry["channels"]["mic"]["clusters"]["SPEAKER_00"],
+            )
+
+    def test_legacy_mark_retries_after_canonical_write_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                            "segments": [{"start": 4.0, "end": 6.0}],
+                        },
+                    },
+                },
+            })
+            generic_body = "[00:05] [Speaker 2] hello there"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Transcript\n\n" + generic_body + "\n",
+                encoding="utf-8",
+            )
+            transcripts_dir = Path(tmp) / "transcripts"
+            transcripts_dir.mkdir(parents=True, exist_ok=True)
+            transcript = transcripts_dir / "mtg001_transcript.txt"
+            transcript.write_text(generic_body, encoding="utf-8")
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            transcript_tmp = transcript.with_name(transcript.name + ".tmp")
+            real_write_text = Path.write_text
+
+            def fail_canonical_tmp_write(path, text, *args, **kwargs):
+                if path == transcript_tmp and "[Multiple speakers]" in text:
+                    raise OSError("simulated canonical transcript write failure")
+                return real_write_text(path, text, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", new=fail_canonical_tmp_write):
+                failed = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles()[0]["prototypes"], [])
+            self.assertIn("[Person Alpha] hello there", transcript.read_text())
+            self.assertIn("[Person Alpha] hello there", summary.read_text())
+            self.assertIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertIn("[Multiple speakers] hello there", transcript.read_text())
+            self.assertIn("[Multiple speakers] hello there", summary.read_text())
+            self.assertNotIn("Person Alpha", summary.read_text())
+            self.assertNotIn("## Participants", summary.read_text())
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
     def test_canonical_transcript_write_failure_keeps_marker_and_retries_mark(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = self._seed_with_transcript(
@@ -1683,6 +1916,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             sidecar = read_speakers_sidecar(output_dir, "mtg001")
             sidecar["pending_summary_transcript_sync"] = {
                 "version": simple_recorder._PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+                "target_ids": [["mic", "SPEAKER_00"]],
                 "summary_format": "md",
                 "canonical_before_sha256": simple_recorder._transcript_body_hash(canonical_body),
                 "embedded_before_sha256": simple_recorder._transcript_body_hash(canonical_body),

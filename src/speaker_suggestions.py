@@ -1590,6 +1590,61 @@ def relabel_transcript_text_speaker(
     return "\n".join(lines), changed
 
 
+def restore_transcript_text_speaker(
+    transcript_text: str,
+    segments: list,
+    display_names: set,
+) -> tuple[str, int]:
+    """Withdraw legacy fuzzy labels only for the confirmed names being removed."""
+    if not segments or not display_names:
+        return transcript_text, 0
+
+    lines = transcript_text.split("\n")
+    changed = 0
+    for index, line in enumerate(lines):
+        match = _TRANSCRIPT_LINE_RE.match(line)
+        if not match:
+            continue
+        timestamp_str, label, text = match.groups()
+        if label not in display_names:
+            continue
+        try:
+            timestamp_seconds = _parse_transcript_timestamp(timestamp_str)
+        except ValueError:
+            continue
+        in_range = any(
+            segment.get("start", 0) - RELABEL_TIMESTAMP_TOLERANCE_SECONDS
+            <= timestamp_seconds
+            <= segment.get("end", 0) + RELABEL_TIMESTAMP_TOLERANCE_SECONDS
+            for segment in segments
+        )
+        if in_range:
+            lines[index] = (
+                f"[{timestamp_str}] [{MULTI_SPEAKER_TRANSCRIPT_LABEL}] {text}"
+            )
+            changed += 1
+    return "\n".join(lines), changed
+
+
+def restore_transcript_speaker_labels(
+    transcript_path: Path,
+    segments: list,
+    display_names: set,
+) -> int:
+    """Atomically apply legacy segment-based label withdrawal to a file."""
+    if not segments or not display_names or not transcript_path.exists():
+        return 0
+    original = transcript_path.read_text(encoding="utf-8")
+    restored_text, changed = restore_transcript_text_speaker(
+        original, segments, display_names,
+    )
+    if changed:
+        tmp_path = transcript_path.with_name(transcript_path.name + ".tmp")
+        tmp_path.write_text(restored_text, encoding="utf-8")
+        tmp_path.replace(transcript_path)
+    return changed
+
+
 def restore_transcript_labels(
     transcript_path: Path, turn_manifest: list, target_ids: set,
 ) -> int:
