@@ -18,10 +18,12 @@
 //   node scripts/i18n-copy-inventory.mjs           # check (CI) — fails if stale
 //   node scripts/i18n-copy-inventory.mjs --update  # rewrite the inventory
 //
-// SCOPE, honestly stated: this reads JSX text and the copy-bearing JSX attributes listed
-// in i18n-copy-rules.mjs. It does NOT see strings assembled at runtime from fragments,
-// copy that lives in the Electron main process, or text the Python backend emits. Coverage
-// is a floor, not a proof of completeness.
+// SCOPE, honestly stated: this reads JSX text and copy-bearing JSX attributes, including
+// visible callback, helper, and ReactNode branches below them. That broad recall is
+// deliberate: the blocking ESLint rule only owns syntactically direct JSX templates.
+// It does NOT see strings assembled at runtime from fragments, copy that lives in the
+// Electron main process, or text the Python backend emits. Coverage is a floor, not a
+// proof of completeness.
 //
 // AFTER THE FOUNDATION LANDS: teach `collectFromSource` to also resolve `t('some.key')`
 // call sites against locales/en.json and emit the resolved English value. That keeps the
@@ -35,6 +37,7 @@ import ts from 'typescript';
 import {
   IGNORED_FILES,
   COPY_ATTRIBUTES,
+  RENDERED_NODE_ATTRIBUTES,
   isCopy,
   definitelyNotCopy,
   readsAsCopy,
@@ -102,8 +105,6 @@ export function collectFromSource(file) {
     ts.isImportDeclaration(node) ||
     ts.isExportDeclaration(node) ||
     ts.isModuleDeclaration(node) ||
-    ts.isPropertyAccessExpression(node) ||
-    ts.isElementAccessExpression(node) ||
     ts.isEnumMember(node) ||
     ts.isLiteralTypeNode(node) ||
     (ts.isBinaryExpression(node) &&
@@ -125,12 +126,33 @@ export function collectFromSource(file) {
   // `case 'saved': return <p>All changes saved</p>` — the label is structure, but the body
   // is ordinary code that often renders copy. Skipping the whole CaseClause (as an earlier
   // revision did) silently dropped every string inside a switch.
-  const isCaseLabel = (node) =>
-    node.parent && ts.isCaseClause(node.parent) && node.parent.expression === node;
+  const isCaseLabel = (node) => {
+    let child = node;
+    let parent = node.parent;
+    while (
+      parent &&
+      (ts.isParenthesizedExpression(parent) ||
+        ts.isAsExpression(parent) ||
+        ts.isSatisfiesExpression(parent) ||
+        ts.isTypeAssertionExpression(parent) ||
+        ts.isNonNullExpression(parent)) &&
+      parent.expression === child
+    ) {
+      child = parent;
+      parent = parent.parent;
+    }
+    return parent && ts.isCaseClause(parent) && parent.expression === child;
+  };
+
+  // `items['technical-key']` has a structural string argument, but the expression may
+  // also be followed by a callback with visible copy. Skip only that key, never the whole
+  // access expression, so `promise.then(() => 'Saved')` remains reachable.
+  const isElementAccessArgument = (node) =>
+    node.parent && ts.isElementAccessExpression(node.parent) && node.parent.argumentExpression === node;
 
   const addLiteral = (node, accept, certain = false) => {
     if (!ts.isStringLiteral(node) && !ts.isNoSubstitutionTemplateLiteral(node)) return;
-    if (isObjectKey(node) || isCaseLabel(node)) return;
+    if (isObjectKey(node) || isCaseLabel(node) || isElementAccessArgument(node)) return;
     const text = normalize(node.text);
     if (accept(text)) record(text, certain);
   };
@@ -141,6 +163,7 @@ export function collectFromSource(file) {
   // diff exactly that contract: `At least {{…}} people spoke`.
   const addTemplate = (node, accept, certain = false) => {
     if (!ts.isTemplateExpression(node)) return;
+    if (isCaseLabel(node) || isElementAccessArgument(node)) return;
     const text = normalize(
       node.templateSpans.reduce((out, span) => `${out}{{…}}${span.literal.text}`, node.head.text)
     );
@@ -159,7 +182,54 @@ export function collectFromSource(file) {
 
     if (ts.isJsxAttribute(node)) {
       const name = node.name.getText(source);
-      if (!COPY_ATTRIBUTES.includes(name)) return; // className, data-*, variant, href…
+      if (RENDERED_NODE_ATTRIBUTES.includes(name)) {
+        // ReactNode props are rendered even when their value is a direct string or a
+        // conditional/call expression. Give those values the same certain-copy treatment
+        // as JSX children, while delegating nested JSX and callbacks to their normal
+        // structural handling so attributes such as className stay out of the inventory.
+        const walkRenderedNode = (n) => {
+          if (
+            ts.isArrowFunction(n) ||
+            ts.isFunctionExpression(n) ||
+            ts.isJsxElement(n) ||
+            ts.isJsxSelfClosingElement(n) ||
+            ts.isJsxFragment(n) ||
+            ts.isJsxAttribute(n)
+          ) {
+            walk(n);
+            return;
+          }
+          addLiteral(n, isCopy, true);
+          addTemplate(n, isCopy, true);
+          ts.forEachChild(n, walkRenderedNode);
+        };
+        if (node.initializer) walkRenderedNode(node.initializer);
+        return;
+      }
+      if (!COPY_ATTRIBUTES.includes(name)) {
+        // A non-copy prop's literal value is structural (`variant="danger"`,
+        // `data-testid="save"`), but the prop can still carry a callback or a JSX action
+        // that renders visible copy. Descend only into those executable/rendered branches:
+        // walking the initializer wholesale would turn every structural prop into inventory
+        // noise, while returning here would make callback copy disappear silently.
+        const walkNonCopyAttribute = (n) => {
+          if (
+            ts.isArrowFunction(n) ||
+            ts.isFunctionExpression(n) ||
+            ts.isJsxElement(n) ||
+            ts.isJsxSelfClosingElement(n) ||
+            ts.isJsxFragment(n)
+          ) {
+            walk(n);
+            return;
+          }
+          ts.forEachChild(n, walkNonCopyAttribute);
+        };
+        if (node.initializer && ts.isJsxExpression(node.initializer) && node.initializer.expression) {
+          walkNonCopyAttribute(node.initializer.expression);
+        }
+        return;
+      }
       if (node.initializer) {
         // Covers `title="Copy"` and `title={cond ? 'Hide' : 'Show'}` alike.
         const walkAttr = (n) => {

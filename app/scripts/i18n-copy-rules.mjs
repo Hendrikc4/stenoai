@@ -48,6 +48,16 @@ export const COPY_ATTRIBUTES = [
   'submitLabel',
 ];
 
+/**
+ * Props that render a ReactNode, but are too polymorphic to treat as ordinary string props.
+ *
+ * `action` sometimes carries an element and sometimes a direct string or the argument to a
+ * node-producing helper. The inventory must record those latter two as rendered copy, while
+ * adding the broad prop name to COPY_ATTRIBUTES would make unrelated data-shaped action
+ * props look like copy to the blocking lint gate.
+ */
+export const RENDERED_NODE_ATTRIBUTES = ['action'];
+
 /** Every ESLint rule whose findings make up the blocking per-file ratchet. */
 export const I18N_GATE_RULE_IDS = [
   'i18next/no-literal-string',
@@ -191,6 +201,9 @@ const CSS_LIKE = [
   /^(-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg)?\s+)+-?\d*\.?\d+(px|rem|em|vh|vw|%|s|ms|deg)?$/i, // "0 14px"
 ];
 
+/** Storage units are technical tokens, not words a translator should move. */
+const STORAGE_UNIT = /^(?:B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)$/;
+
 /**
  * True when `text` is provably not user-facing copy.
  *
@@ -262,6 +275,7 @@ export function definitelyNotCopy(text) {
 export function readsAsCopy(text) {
   const trimmed = String(text ?? '').trim();
   if (definitelyNotCopy(trimmed)) return false;
+  if (STORAGE_UNIT.test(trimmed)) return false;
   const tokens = trimmed.split(/\s+/);
   if (tokens.length > 1) return true; // a phrase that survived the reject list is prose
   return /^\p{Lu}/u.test(trimmed); // one word: capitalised reads as a label

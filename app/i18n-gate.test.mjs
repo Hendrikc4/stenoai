@@ -9,6 +9,8 @@
 // So: assert the semantics, not the count. The count lives in i18n-lint-baseline.json.
 import { test } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ESLint } from 'eslint';
@@ -22,11 +24,43 @@ const eslint = new ESLint({
 // Lint a JSX snippet as if it were a renderer component; return the flagged strings.
 async function flagged(jsx) {
   const source = `export function C() {\n  return (\n${jsx}\n  );\n}\n`;
+  return flaggedSource(source);
+}
+
+async function flaggedSource(source) {
   const [result] = await eslint.lintText(source, {
     filePath: path.join(APP_DIR, 'renderer/src/__fixture__.tsx'),
   });
   const { I18N_GATE_RULE_IDS } = await import('./scripts/i18n-copy-rules.mjs');
   return (result?.messages ?? []).filter((m) => I18N_GATE_RULE_IDS.includes(m.ruleId));
+}
+
+async function assertCombinedCopyGate({
+  label, beforeSource, afterSource, beforeCopy, afterCopy, expectedLint = 0,
+}) {
+  // The inventory changes make `npm run i18n:inventory` fail until reviewed, including
+  // paths intentionally outside the syntax-only lint rule.
+  assert.equal((await flaggedSource(beforeSource)).length, expectedLint, `${label} lint ownership changed`);
+  assert.equal(
+    (await flaggedSource(afterSource)).length,
+    expectedLint,
+    `${label} lint ownership changed on the after side`
+  );
+
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Fixture.tsx');
+    fs.writeFileSync(file, beforeSource);
+    const before = collectFromSource(file);
+    fs.writeFileSync(file, afterSource);
+    const after = collectFromSource(file);
+    assert.ok(before.copy.includes(beforeCopy), `${label} must enter the inventory before the change`);
+    assert.ok(after.copy.includes(afterCopy), `${label} must enter the inventory after the change`);
+    assert.notDeepEqual(before.copy, after.copy, `${label} wording must change the combined gate`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 test('flags ordinary user-facing JSX text', async () => {
@@ -295,6 +329,8 @@ test('interpolated copy is blocked by the real JSX linter', async () => {
     '    <span>{`At least ${count} people spoke`}</span>',
     '    <button aria-label={`Delete ${name}`} />',
     '    <SettingRow description={`Connected to ${provider}`} />',
+    '    <Card action={`Retry export for ${name}`} />',
+    '    <Card action="Retry export" />',
   ]) {
     const messages = await flagged(jsx);
     assert.equal(messages.length, 1, `expected interpolated copy to be flagged: ${jsx}`);
@@ -303,6 +339,154 @@ test('interpolated copy is blocked by the real JSX linter', async () => {
 
   const structural = await flagged('    <span className={`size-${size} flex`} />');
   assert.equal(structural.length, 0, 'an interpolated structural attribute must stay out');
+});
+
+test('purely dynamic JSX templates are not treated as hardcoded copy', async () => {
+  for (const jsx of [
+    '    <span>{`${done} / ${total}`}</span>',
+    '    <span>{`${dynamicTitle}`}</span>',
+    '    <SettingRow description={`${completed} / ${available}`} />',
+  ]) {
+    const messages = await flagged(jsx);
+    assert.equal(messages.length, 0, `expected a dynamic-only template to pass: ${jsx}`);
+  }
+
+  // Mutation guard: adding even one authored word must make the same shape fail again.
+  const messages = await flagged('    <span>{`${done} of ${total} complete`}</span>');
+  assert.equal(messages.length, 1, 'authored template copy must still be blocked');
+  assert.equal(messages[0].ruleId, 'steno-i18n/no-interpolated-literal');
+});
+
+test('template linting follows only direct transparent JSX wrappers', async () => {
+  for (const [jsx, expected] of [
+    ['    <span>{ready && `Visible row ${item.id}`}</span>', 1],
+    ['    <span>{ready ? `Visible row ${item.id}` : `Hidden row ${item.id}`}</span>', 2],
+    ['    <span>{fallback ?? `Visible row ${item.id}`}</span>', 1],
+    ['    <span>{(`Visible row ${item.id}` as string)}</span>', 1],
+  ]) {
+    const messages = await flaggedSource(`export function C({ ready, fallback, item }) { return (${jsx}); }`);
+    assert.equal(messages.length, expected, `transparent JSX wrapper must stay blocked: ${jsx}`);
+  }
+
+  for (const source of [
+    `export function C({ item }) { return <span>{format(\`Visible row \${item.id}\`)}</span>; }`,
+    `export function C({ context }) { return <ContextMenu action={context} />; }`,
+    `export function C({ item }) { return <ContextMenu action={\`row-\${item.id}\`} />; }`,
+    `export function C({ item }) { return <span className={\`row-\${item.id}\`} />; }`,
+    `export function C({ done, total }) { return <span>{\`\${done} / \${total}\`}</span>; }`,
+    `export function C({ items }) { return <div>{items.map((item) => { const rowClass = \`row-\${item.id}\`; return <span className={rowClass}>{item.name}</span>; })}</div>; }`,
+    `export function C({ items }) { return <div>{items.filter((item) => item.key === \`Visible row \${item.id}\`).map((item) => item.name)}</div>; }`,
+    `export function C({ items }) { return <div>{items.some((item) => item.key === \`Visible row \${item.id}\`) ? items[0]?.name : null}</div>; }`,
+    `export function C({ items }) { return <div>{items.find((item) => item.key === \`Visible row \${item.id}\`)?.name}</div>; }`,
+  ]) {
+    assert.equal(
+      (await flaggedSource(source)).length,
+      0,
+      'calls, callbacks, predicates, ReactNode props, and technical/dynamic templates pass'
+    );
+  }
+});
+
+test('the combined gate covers direct wrappers, callbacks, and ReactNode template copy', async () => {
+  const cases = [
+    {
+      label: 'logical JSX wrapper', expectedLint: 1,
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ ready, item }) { return <div>{ready && \`Visible row \${item.id}\`}</div>; }`,
+      afterSource: `export function C({ ready, item }) { return <div>{ready && \`Updated row \${item.id}\`}</div>; }`,
+    },
+    {
+      label: 'ternary JSX wrapper', expectedLint: 2,
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ ready, item }) { return <div>{ready ? \`Visible row \${item.id}\` : \`Hidden row \${item.id}\`}</div>; }`,
+      afterSource: `export function C({ ready, item }) { return <div>{ready ? \`Updated row \${item.id}\` : \`Hidden row \${item.id}\`}</div>; }`,
+    },
+    {
+      label: 'nullish JSX wrapper', expectedLint: 1,
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ fallback, item }) { return <div>{fallback ?? \`Visible row \${item.id}\`}</div>; }`,
+      afterSource: `export function C({ fallback, item }) { return <div>{fallback ?? \`Updated row \${item.id}\`}</div>; }`,
+    },
+    {
+      label: 'type assertion JSX wrapper', expectedLint: 1,
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ item }) { return <div>{(\`Visible row \${item.id}\` as string)}</div>; }`,
+      afterSource: `export function C({ item }) { return <div>{(\`Updated row \${item.id}\` as string)}</div>; }`,
+    },
+    {
+      label: 'optional map callback',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items?.map((item) => \`Visible row \${item.id}\`)}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items?.map((item) => \`Updated row \${item.id}\`)}</div>; }`,
+    },
+    {
+      label: 'nested map callback',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ groups }) { return <div>{groups.map((group) => group.items.map((item) => \`Visible row \${item.id}\`))}</div>; }`,
+      afterSource: `export function C({ groups }) { return <div>{groups.map((group) => group.items.map((item) => \`Updated row \${item.id}\`))}</div>; }`,
+    },
+    {
+      label: 'filter then map callback',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.filter(Boolean).map((item) => \`Visible row \${item.id}\`)}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.filter(Boolean).map((item) => \`Updated row \${item.id}\`)}</div>; }`,
+    },
+    {
+      label: 'map then filter callback',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => \`Visible row \${item.id}\`).filter(Boolean)}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => \`Updated row \${item.id}\`).filter(Boolean)}</div>; }`,
+    },
+    {
+      label: 'joined map callback',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => \`Visible row \${item.id}\`).join(', ')}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => \`Updated row \${item.id}\`).join(', ')}</div>; }`,
+    },
+    {
+      label: 'ReactNode action helper',
+      beforeCopy: 'Retry export for {{…}}', afterCopy: 'Retry save for {{…}}',
+      beforeSource: `export function C({ name }) { return <Card action={renderAction(\`Retry export for \${name}\`)} />; }`,
+      afterSource: `export function C({ name }) { return <Card action={renderAction(\`Retry save for \${name}\`)} />; }`,
+    },
+    {
+      label: 'property-access callback',
+      beforeCopy: 'PDF export ready for {{…}}', afterCopy: 'PDF save ready for {{…}}',
+      beforeSource: `export function C({ name }) { return <div>{notesPdf.render().then(() => \`PDF export ready for \${name}\`)}</div>; }`,
+      afterSource: `export function C({ name }) { return <div>{notesPdf.render().then(() => \`PDF save ready for \${name}\`)}</div>; }`,
+    },
+    {
+      label: 'block callback return',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => { return \`Visible row \${item.id}\`; })}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => { return \`Updated row \${item.id}\`; })}</div>; }`,
+    },
+    {
+      label: 'if callback return',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => { if (item.visible) return \`Visible row \${item.id}\`; return \`Hidden row \${item.id}\`; })}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => { if (item.visible) return \`Updated row \${item.id}\`; return \`Hidden row \${item.id}\`; })}</div>; }`,
+    },
+    {
+      label: 'switch callback return',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => { switch (item.kind) { case 'visible': return \`Visible row \${item.id}\`; default: return \`Hidden row \${item.id}\`; } })}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => { switch (item.kind) { case 'visible': return \`Updated row \${item.id}\`; default: return \`Hidden row \${item.id}\`; } })}</div>; }`,
+    },
+    {
+      label: 'try callback return',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => { try { return \`Visible row \${item.id}\`; } catch { return \`Hidden row \${item.id}\`; } })}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => { try { return \`Updated row \${item.id}\`; } catch { return \`Hidden row \${item.id}\`; } })}</div>; }`,
+    },
+    {
+      label: 'nested block callback return',
+      beforeCopy: 'Visible row {{…}}', afterCopy: 'Updated row {{…}}',
+      beforeSource: `export function C({ items }) { return <div>{items.map((item) => { { return \`Visible row \${item.id}\`; } })}</div>; }`,
+      afterSource: `export function C({ items }) { return <div>{items.map((item) => { { return \`Updated row \${item.id}\`; } })}</div>; }`,
+    },
+  ];
+  for (const entry of cases) await assertCombinedCopyGate(entry);
 });
 
 test('the copy partition holds the contract, uncertain holds the safety net', async () => {
@@ -314,12 +498,13 @@ test('the copy partition holds the contract, uncertain holds the safety net', as
   for (const hedged of ['keydown', 'dragover', 'gallery']) {
     assert.ok(!readsAsCopy(hedged), `expected uncertain partition: ${JSON.stringify(hedged)}`);
   }
+  for (const unit of ['B', 'KB', 'MB', 'GB', 'TB', 'KiB', 'MiB', 'GiB', 'TiB']) {
+    assert.ok(!definitelyNotCopy(unit), `storage unit must remain inventoried: ${unit}`);
+    assert.ok(!readsAsCopy(unit), `storage unit must stay in the uncertain partition: ${unit}`);
+  }
 });
 
 // --- fixes from the cubic review on PR #497 -------------------------------------------
-
-import fs from 'node:fs';
-import os from 'node:os';
 
 test('a duplicate swap changes the inventory (multiset, not Set)', async () => {
   // The real failure: a file holds the same string twice and one occurrence is changed to
@@ -366,16 +551,73 @@ test('a switch body is inventoried, only the case label is skipped', async () =>
       file,
       `export function C({ state }) {
          switch (state) {
-           case 'saved':
-             return <p>All changes saved</p>;
-           default:
-             return null;
+            case 'saved':
+              return <p>All changes saved</p>;
+            case \`pending-\${state}\`:
+              return <p>Changes pending</p>;
+            default:
+              return null;
          }
        }`
     );
     const { copy, uncertain } = collectFromSource(file);
     assert.ok(copy.includes('All changes saved'), 'copy inside a case body must be recorded');
+    assert.ok(copy.includes('Changes pending'), 'copy inside a template case body must be recorded');
     assert.ok(![...copy, ...uncertain].includes('saved'), 'the case label itself is structure');
+    assert.ok(![...copy, ...uncertain].includes('pending-{{…}}'), 'a template case label is structure');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('transparent wrappers keep template case labels structural', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'WrappedSwitch.tsx');
+    const source = `export function C({ state }) {
+       switch (state) {
+          case (\`parenthesized-\${state}\`):
+            return <p>Parenthesized case pending</p>;
+          case (\`asserted-\${state}\` as string):
+            return <p>Asserted case pending</p>;
+          case (\`satisfied-\${state}\` satisfies string):
+            return <p>Satisfied case pending</p>;
+          case (\`nonnull-\${state}\`!):
+            return <p>Non-null case pending</p>;
+          default:
+            return null;
+       }
+     }`;
+    fs.writeFileSync(file, source);
+    const { copy, uncertain } = collectFromSource(file);
+    for (const body of [
+      'Parenthesized case pending',
+      'Asserted case pending',
+      'Satisfied case pending',
+      'Non-null case pending',
+    ]) {
+      assert.ok(
+        copy.includes(body),
+        `copy inside a wrapped template case body must be recorded: ${body}`
+      );
+    }
+    for (const label of [
+      'parenthesized-{{…}}',
+      'asserted-{{…}}',
+      'satisfied-{{…}}',
+      'nonnull-{{…}}',
+    ]) {
+      assert.ok(
+        ![...copy, ...uncertain].includes(label),
+        `a wrapped case label is structure: ${label}`
+      );
+    }
+    assert.equal(
+      (await flaggedSource(source)).length,
+      4,
+      'rendered copy in every wrapped case body must remain linted'
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -407,6 +649,90 @@ test('the real extractor records interpolated copy with stable placeholders', as
        }`
     );
     assert.deepEqual(collectFromSource(file).copy, copy, 'expression renames are not copy changes');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the extractor follows visible callback branches of structural JSX props', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Callbacks.tsx');
+    const write = (visibleCopy) => {
+      fs.writeFileSync(
+        file,
+        `export function C({ name }) {
+           return <ConfirmDialog
+             variant="Internal structural token"
+             data-testid="confirm-dialog"
+             lookup={labels[\`technical-\${name}\`]}
+             onConfirm={() => Promise.resolve().then(() => <span>${visibleCopy}</span>)}
+           />;
+         }`
+      );
+      return collectFromSource(file);
+    };
+
+    const before = write('Save changes');
+    assert.ok(before.copy.includes('Save changes'), 'JSX rendered by an onConfirm callback must be recorded');
+    assert.ok(![...before.copy, ...before.uncertain].includes('Internal structural token'));
+    assert.ok(![...before.copy, ...before.uncertain].includes('confirm-dialog'));
+    assert.ok(![...before.copy, ...before.uncertain].includes('technical-{{…}}'));
+
+    const after = write('Discard changes');
+    assert.ok(after.copy.includes('Discard changes'));
+    assert.notDeepEqual(before, after, 'changing callback copy must change the inventory');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the extractor records direct strings and helper arguments for ReactNode props', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'ReactNode.tsx');
+    const write = (primaryAction) => {
+      fs.writeFileSync(
+        file,
+        `export function C({ ready }) {
+           return <>
+             <Card variant="Internal structural token" action={ready ? '${primaryAction}' : 'Discard changes'} />
+             <Card action={renderAction('Retry export')} />
+           </>;
+         }`
+      );
+      return collectFromSource(file);
+    };
+
+    const before = write('Save changes');
+    for (const text of ['Save changes', 'Discard changes', 'Retry export']) {
+      assert.ok(before.copy.includes(text), `missing rendered ReactNode copy: ${text}`);
+    }
+    assert.ok(![...before.copy, ...before.uncertain].includes('Internal structural token'));
+
+    const after = write('Save draft');
+    assert.ok(after.copy.includes('Save draft'));
+    assert.notDeepEqual(before, after, 'changing a direct ReactNode value must change the inventory');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('property access does not hide callback templates from the extractor', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'NotesPdf.tsx');
+    fs.writeFileSync(
+      file,
+      `export function C({ name }) {
+         return <div>{notesPdf.render().then(() => \`PDF export ready for \${name}\`)}</div>;
+       }`
+    );
+    const { copy } = collectFromSource(file);
+    assert.ok(copy.includes('PDF export ready for {{…}}'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

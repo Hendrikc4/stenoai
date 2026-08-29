@@ -192,20 +192,29 @@ elsewhere would land unseen.
   props (`label`, `description`, `hint`, `confirmLabel`, …), which carry ~170 sites of
   visible copy. It is a *separate* config from
   `eslint.config.mjs` on purpose: a codebase with no i18n yet trips it hundreds of times,
-  and folding those 761 into the main lint run would make it permanently red - which this repo
+  and folding those 751 into the main lint run would make it permanently red - which this repo
   has already seen end in four react-hooks rules downgraded to `warn`, where they are now
   write-only. Instead `app/scripts/i18n-lint-gate.mjs` compares per-file counts against
   `renderer/i18n-lint-baseline.json` and fails on any divergence, in both directions: a
   higher count is new hardcoded copy, a lower one is progress that should be committed
   (`npm run lint:i18n:update`) so the burn-down number stays honest.
+  The companion rule is intentionally syntax-only: it follows direct JSX expressions,
+  transparent conditional/type wrappers, and direct literal/template ReactNode values,
+  then stops at functions, callbacks, helpers, and other calls. That keeps the blocking
+  rule precise; broader rendered-copy paths belong to the inventory ratchet below.
 - **The English copy inventory.** `app/scripts/i18n-copy-inventory.mjs` extracts every
-  English string the renderer shows into `docs/i18n/copy-inventory.json` (1260 `copy` +
-  1140 `uncertain`, repeated copy recorded per occurrence). Interpolations use stable
+  English string the renderer shows into `docs/i18n/copy-inventory.json` (1288 `copy` +
+  1165 `uncertain`, repeated copy recorded per occurrence). Interpolations use stable
   `{{…}}` placeholders so expression renames do not create copy churn. It blocks nothing; it
   witnesses. The review rule for an i18n migration is then one sentence: *the inventory
   diff must show strings moving, never changing.* Afterwards it keeps working as a copy
   changelog — an intentional wording change shows up as a one-file diff in the PR that
   makes it.
+
+  In particular, the inventory covers callback returns, nested/filtered maps, helper
+  calls, indirect ReactNode props such as `action`, and property-access callbacks. Those
+  paths are deliberately outside the custom ESLint rule, but changing their wording still
+  makes the checked-in inventory stale and therefore fails `npm run i18n:inventory`.
 
   Its burden of proof is **inverted** relative to the linter, and that asymmetry is the
   design. The linter blocks, so a false positive costs a contributor time and a noisy rule
