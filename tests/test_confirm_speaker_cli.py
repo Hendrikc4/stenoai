@@ -888,6 +888,10 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             self.assertTrue(failed_once)
             self.assertIn("[Person Gamma] hello there", transcript_path.read_text())
             self.assertIn("[Speaker 2] hello there", summary_path.read_text())
+            self.assertIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
 
             retry, _ = self._run(
                 [
@@ -902,6 +906,263 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             self.assertEqual(retry_data["relabeled_lines"], 0)
             self.assertIn("[Person Gamma] hello there", summary_path.read_text())
             self.assertNotIn("[Speaker 2] hello there", summary_path.read_text())
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
+    def test_relabel_retry_preserves_a_json_copy_with_only_its_label_edited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = output_dir / "mtg001_summary.json"
+            summary_path.write_text(json.dumps({
+                "is_diarised": True,
+                "diarised_text": "[00:05] [Speaker 2] hello there",
+            }), encoding="utf-8")
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                            "segments": [{"start": 4.0, "end": 6.0}],
+                        },
+                    },
+                },
+            }, turn_manifest=[{
+                "start": 5.1,
+                "channel": "mic",
+                "diarization_speaker_id": "SPEAKER_00",
+            }])
+            transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n"
+                "[00:05] [Speaker 2] hello there",
+                encoding="utf-8",
+            )
+            real_atomic_write = simple_recorder._atomic_write_json
+
+            def fail_summary_write(path, payload, *args, **kwargs):
+                if path == summary_path and payload.get("diarised_text", "").find("Person Gamma") >= 0:
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, payload, *args, **kwargs)
+
+            with mock.patch("simple_recorder._atomic_write_json", side_effect=fail_summary_write):
+                first, cfg = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
+                    "--relabel-transcript",
+                ], tmp)
+
+            first_data = _last_json(first.output)
+            self.assertTrue(first_data["success"])
+            edited = json.loads(summary_path.read_text(encoding="utf-8"))
+            edited["diarised_text"] = "[00:05] [Person Delta] hello there"
+            summary_path.write_text(json.dumps(edited), encoding="utf-8")
+            pending = read_speakers_sidecar(output_dir, "mtg001")[
+                "pending_summary_transcript_sync"
+            ]
+            self.assertNotIn("hello there", json.dumps(pending))
+            self.assertNotIn("Person Gamma", json.dumps(pending))
+
+            retry, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--person-id", first_data["person_id"],
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(summary["diarised_text"], "[00:05] [Person Delta] hello there")
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
+    def test_relabel_prefers_json_when_both_summary_formats_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            before = "[00:05] [Speaker 2] hello there"
+            json_path = output_dir / "mtg001_summary.json"
+            json_path.write_text(json.dumps({"diarised_text": before}), encoding="utf-8")
+            md_path = output_dir / "mtg001_summary.md"
+            md_path.write_text(
+                "## Summary\n\nText.\n\n## Transcript\n\n" + before + "\n",
+                encoding="utf-8",
+            )
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                            "segments": [{"start": 4.0, "end": 6.0}],
+                        },
+                    },
+                },
+            }, turn_manifest=[{
+                "start": 5.1,
+                "channel": "mic",
+                "diarization_speaker_id": "SPEAKER_00",
+            }])
+            transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n" + before,
+                encoding="utf-8",
+            )
+
+            result, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
+                "--relabel-transcript",
+            ], tmp)
+
+            self.assertTrue(_last_json(result.output)["success"])
+            self.assertIn(
+                "[Person Gamma] hello there",
+                json.loads(json_path.read_text(encoding="utf-8"))["diarised_text"],
+            )
+            self.assertIn("[Speaker 2] hello there", md_path.read_text(encoding="utf-8"))
+
+    def test_marker_write_failure_leaves_both_transcript_artifacts_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            before = "[00:05] [Speaker 2] hello there"
+            summary_path = output_dir / "mtg001_summary.md"
+            summary_path.write_text(
+                "## Summary\n\nText.\n\n## Transcript\n\n" + before + "\n",
+                encoding="utf-8",
+            )
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                            "segments": [{"start": 4.0, "end": 6.0}],
+                        },
+                    },
+                },
+            }, turn_manifest=[{
+                "start": 5.1,
+                "channel": "mic",
+                "diarization_speaker_id": "SPEAKER_00",
+            }])
+            transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_file_before = "Session: mtg001\n\n" + "=" * 60 + "\n\n" + before
+            transcript_path.write_text(transcript_file_before, encoding="utf-8")
+            summary_before = summary_path.read_text(encoding="utf-8")
+            import src.speaker_suggestions as speaker_suggestions
+            real_write = speaker_suggestions.write_sidecar_document
+
+            def fail_only_marker_write(output, stem, document, **kwargs):
+                if "pending_summary_transcript_sync" in document:
+                    raise OSError("simulated marker write failure")
+                return real_write(output, stem, document, **kwargs)
+
+            with mock.patch.object(
+                speaker_suggestions,
+                "write_sidecar_document",
+                side_effect=fail_only_marker_write,
+            ):
+                first, cfg = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
+                    "--relabel-transcript",
+                ], tmp)
+
+            first_data = _last_json(first.output)
+            self.assertTrue(first_data["success"])
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), transcript_file_before)
+            self.assertEqual(summary_path.read_text(encoding="utf-8"), summary_before)
+
+            retry, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--person-id", first_data["person_id"],
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertIn("[Person Gamma] hello there", transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("[Person Gamma] hello there", summary_path.read_text(encoding="utf-8"))
+
+    def test_change_confirmation_retry_uses_the_exact_old_person_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = output_dir / "mtg001_summary.md"
+            summary_path.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            write_speakers_sidecar(output_dir, "mtg001", {
+                "mic": {
+                    "recording_type": "in_person",
+                    "clusters": {
+                        "SPEAKER_00": {
+                            "embedding": [1.0, 0.0],
+                            "speech_duration_seconds": 30.0,
+                            "segment_count": 5,
+                            "segments": [{"start": 4.0, "end": 6.0}],
+                        },
+                    },
+                },
+            }, turn_manifest=[{
+                "start": 5.1,
+                "channel": "mic",
+                "diarization_speaker_id": "SPEAKER_00",
+            }])
+            transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n"
+                "[00:05] [Speaker 2] hello there",
+                encoding="utf-8",
+            )
+            first, cfg = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                "--relabel-transcript",
+            ], tmp)
+            self.assertTrue(_last_json(first.output)["success"])
+            person_beta = cfg.create_person_profile("Person Beta")
+            real_atomic_write = simple_recorder._atomic_write_text
+            failed_once = False
+
+            def fail_first_beta_summary_write(path, text, *args, **kwargs):
+                nonlocal failed_once
+                if path == summary_path and not failed_once and "[Person Beta]" in text:
+                    failed_once = True
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text",
+                side_effect=fail_first_beta_summary_write,
+            ):
+                changed, _ = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--person-id", person_beta["person_id"],
+                    "--relabel-transcript",
+                ], tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(changed.output)["success"])
+            self.assertIn("[Person Beta] hello there", transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("[Person Alpha] hello there", summary_path.read_text(encoding="utf-8"))
+
+            retry, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--person-id", person_beta["person_id"],
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertIn("[Person Beta] hello there", summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn("[Person Alpha] hello there", summary_path.read_text(encoding="utf-8"))
 
     def test_relabel_retry_preserves_a_manually_edited_summary_copy(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1453,6 +1453,10 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             self.assertTrue(failed_once)
             self.assertNotIn("Person Alpha", transcript.read_text())
             self.assertIn("[00:05] [Person Alpha] hello there", summary.read_text())
+            self.assertIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(Path(tmp) / "output", "mtg001"),
+            )
 
             retry = self._run(
                 simple_recorder.mark_speaker_cluster,
@@ -1465,6 +1469,76 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             self.assertEqual(retry_data["transcript_lines_restored"], 0)
             self.assertIn("[00:05] [Speaker 2] hello there", summary.read_text())
             self.assertNotIn("Person Alpha", summary.read_text())
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(Path(tmp) / "output", "mtg001"),
+            )
+
+    def test_retry_preserves_a_summary_with_only_its_label_edited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+            summary = Path(tmp) / "output" / "mtg001_summary.md"
+            summary.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+
+            real_atomic_write = simple_recorder._atomic_write_text
+
+            def fail_summary_write(path, text, *args, **kwargs):
+                if path == summary and "[Speaker 2] hello there" in text:
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch("simple_recorder._atomic_write_text", side_effect=fail_summary_write):
+                first = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertTrue(_last_json(first.output)["success"])
+            self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            summary.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Transcript\n\n[00:05] [Person Delta] hello there\n",
+                encoding="utf-8",
+            )
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertIn("[00:05] [Person Delta] hello there", summary.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(Path(tmp) / "output", "mtg001"),
+            )
 
     def test_retry_refuses_reordered_summary_turns_sharing_a_timestamp(self):
         # The manifest retains 5.1 and 5.8, but both are rendered as 00:05.
@@ -1508,6 +1582,19 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     "original_label": "Speaker 3",
                 },
             ]
+            marker = {
+                "version": 1,
+                "summary_format": "md",
+                "canonical_before_sha256": simple_recorder._transcript_body_hash(
+                    stale_reordered_body,
+                ),
+                "embedded_before_sha256": simple_recorder._transcript_body_hash(
+                    stale_reordered_body,
+                ),
+                "operation_sha256": simple_recorder._summary_sync_operation_hash(
+                    {("mic", "SPEAKER_A")}, "Person Alpha",
+                ),
+            }
 
             with self.assertLogs("src.speaker_suggestions", level="WARNING") as logs:
                 simple_recorder._update_summary_transcript(
@@ -1518,6 +1605,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     restore_manifest=manifest,
                     restore_target_ids={("mic", "SPEAKER_A")},
                     retry_relabel_to="Person Alpha",
+                    sync_marker=marker,
                 )
 
             self.assertEqual(summary.read_text(encoding="utf-8"), original_summary)
@@ -1560,6 +1648,19 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     "original_label": "Speaker 3",
                 },
             ]
+            embedded_body = (
+                "[00:05] [Person Beta] beta words\n"
+                "[00:05] [Person Alpha] alpha words"
+            )
+            marker = {
+                "version": 1,
+                "summary_format": "md",
+                "canonical_before_sha256": simple_recorder._transcript_body_hash(embedded_body),
+                "embedded_before_sha256": simple_recorder._transcript_body_hash(embedded_body),
+                "operation_sha256": simple_recorder._summary_sync_operation_hash(
+                    {("mic", "SPEAKER_A")}, "Person Alpha",
+                ),
+            }
 
             with self.assertLogs("src.speaker_suggestions", level="WARNING") as logs:
                 simple_recorder._update_summary_transcript(
@@ -1570,6 +1671,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     restore_manifest=manifest,
                     restore_target_ids={("mic", "SPEAKER_A")},
                     retry_relabel_to="Person Alpha",
+                    sync_marker=marker,
                 )
 
             self.assertEqual(summary.read_text(encoding="utf-8"), original_summary)

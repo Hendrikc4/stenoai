@@ -18,6 +18,7 @@ transcribes/summarizes the resulting file. Usage (called by Electron):
 import click
 import asyncio
 import filelock
+import hashlib
 import logging
 import json
 import os
@@ -5650,11 +5651,14 @@ def confirm_speaker(
         sys.exit(1)
 
     relabeled_lines = 0
+    summary_artifacts_ready = True
     if relabel_transcript:
         transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
         previous_transcript_body = _saved_transcript_body(transcript_path)
         turn_manifest = sidecar.get("transcript_lines")
         retry_relabel_target_ids = None
+        summary_sync_ready = True
+        summary_sync_marker = None
         if turn_manifest:
             # Exact recorded provenance -- immune to the fuzzy-matching
             # cross-channel/same-channel mislabeling below (see
@@ -5675,36 +5679,50 @@ def confirm_speaker(
                 target_ids,
                 lock_held=True,
             )
-            relabeled_lines = relabel_transcript_exact(
-                transcript_path, turn_manifest, target_ids, person["display_name"],
-            )
+            # record_original_labels rewrites the sidecar. Refresh the manifest
+            # before persisting the pending transition so this write cannot
+            # accidentally put its pre-write copy back on disk.
+            refreshed_sidecar = store.read(meeting_stem)
+            if isinstance(refreshed_sidecar, dict):
+                sidecar = refreshed_sidecar
+                turn_manifest = sidecar.get("transcript_lines") or turn_manifest
+            if previous_transcript_body is not None:
+                summary_sync_ready, summary_sync_marker = _prepare_summary_transcript_sync(
+                    output_dir,
+                    meeting_stem,
+                    previous_transcript_body,
+                    target_ids,
+                    person["display_name"],
+                )
+                summary_artifacts_ready = summary_sync_ready
+            if summary_sync_ready:
+                relabeled_lines = relabel_transcript_exact(
+                    transcript_path, turn_manifest, target_ids, person["display_name"],
+                )
         else:
             raw_clusters_by_id = channel_data.get("clusters") or {}
             pooled_segments = []
             for fragment_id in [resolved_id, *context.merged_from]:
                 pooled_segments.extend(raw_clusters_by_id.get(fragment_id, {}).get("segments") or [])
             relabeled_lines = relabel_transcript_speaker(transcript_path, pooled_segments, person["display_name"])
-        if previous_transcript_body is not None:
-            if relabeled_lines > 0:
-                _update_summary_transcript(
-                    output_dir,
-                    meeting_stem,
-                    transcript_path,
-                    previous_transcript_body,
-                )
-            elif turn_manifest and retry_relabel_target_ids:
-                # The transcript can be durable while its best-effort summary
-                # write fails. A same-cluster confirmation retry has no newly
-                # relabelled lines, but may safely repair a matching embedded
-                # copy only through exact manifest provenance.
-                _update_summary_transcript(
-                    output_dir,
-                    meeting_stem,
-                    transcript_path,
-                    previous_transcript_body,
-                    restore_manifest=turn_manifest,
-                    restore_target_ids=retry_relabel_target_ids,
-                    retry_relabel_to=person["display_name"],
+        if (
+            previous_transcript_body is not None
+            and summary_sync_ready
+            and (relabeled_lines > 0 or summary_sync_marker is not None)
+        ):
+            sync_outcome = _update_summary_transcript(
+                output_dir,
+                meeting_stem,
+                transcript_path,
+                previous_transcript_body,
+                restore_manifest=turn_manifest,
+                restore_target_ids=retry_relabel_target_ids,
+                retry_relabel_to=person["display_name"],
+                sync_marker=summary_sync_marker,
+            )
+            if summary_sync_marker is not None and sync_outcome != "io_error":
+                _clear_summary_transcript_sync(
+                    output_dir, meeting_stem, summary_sync_marker,
                 )
 
     # Naming the cluster supersedes "a human kept this generic": the row is
@@ -5724,7 +5742,8 @@ def confirm_speaker(
     # gate this behind a flag) -- keeps the meeting's Participants chip in
     # sync with every confirm, including plain CLI/backfill-validation use.
     participant_names = confirmed_participant_names(meeting_stem, config.get_person_profiles())
-    _update_summary_participants(output_dir, meeting_stem, participant_names)
+    if summary_artifacts_ready:
+        _update_summary_participants(output_dir, meeting_stem, participant_names)
 
     print(json.dumps({
         "success": True,
@@ -5996,6 +6015,7 @@ def mark_speaker_cluster(
     config = get_config()
     cleared_from = []
     restored_lines = 0
+    summary_artifacts_ready = True
     if multiple and fragment_ids:
         if not config.begin_transaction():
             print(json.dumps({
@@ -6088,37 +6108,47 @@ def mark_speaker_cluster(
         # but it must still repair the transcript and Participants section.
         transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
         previous_transcript_body = _saved_transcript_body(transcript_path)
-        restored_lines = restore_transcript_labels(
-            transcript_path,
-            sidecar.get("transcript_lines") or [],
-            {(channel, fid) for fid in fragment_ids},
-        )
-        if previous_transcript_body is not None:
-            # A prior attempt can have restored the canonical transcript and
-            # then lost the best-effort summary write.  Its retry sees no
-            # newly restored lines, but the old person label can still be in
-            # the summary's embedded transcript.  Repair just labels whose
-            # provenance matches this cluster; never replace user text.
-            if restored_lines > 0:
-                _update_summary_transcript(
-                    output_dir,
-                    meeting_stem,
-                    transcript_path,
-                    previous_transcript_body,
+        restore_target_ids = {(channel, fid) for fid in fragment_ids}
+        summary_sync_ready = True
+        summary_sync_marker = None
+        if previous_transcript_body is not None and sidecar.get("transcript_lines"):
+            summary_sync_ready, summary_sync_marker = _prepare_summary_transcript_sync(
+                output_dir,
+                meeting_stem,
+                previous_transcript_body,
+                restore_target_ids,
+                None,
+            )
+            summary_artifacts_ready = summary_sync_ready
+        if summary_sync_ready:
+            restored_lines = restore_transcript_labels(
+                transcript_path,
+                sidecar.get("transcript_lines") or [],
+                restore_target_ids,
+            )
+        if (
+            previous_transcript_body is not None
+            and summary_sync_ready
+            and (restored_lines > 0 or summary_sync_marker is not None)
+        ):
+            sync_outcome = _update_summary_transcript(
+                output_dir,
+                meeting_stem,
+                transcript_path,
+                previous_transcript_body,
+                restore_manifest=sidecar.get("transcript_lines") or [],
+                restore_target_ids=restore_target_ids,
+                sync_marker=summary_sync_marker,
+            )
+            if summary_sync_marker is not None and sync_outcome != "io_error":
+                _clear_summary_transcript_sync(
+                    output_dir, meeting_stem, summary_sync_marker,
                 )
-            else:
-                _update_summary_transcript(
-                    output_dir,
-                    meeting_stem,
-                    transcript_path,
-                    previous_transcript_body,
-                    restore_manifest=sidecar.get("transcript_lines") or [],
-                    restore_target_ids={(channel, fid) for fid in fragment_ids},
-                )
-        _update_summary_participants(
-            output_dir, meeting_stem,
-            confirmed_participant_names(meeting_stem, config.get_person_profiles()),
-        )
+        if summary_artifacts_ready:
+            _update_summary_participants(
+                output_dir, meeting_stem,
+                confirmed_participant_names(meeting_stem, config.get_person_profiles()),
+            )
 
     print(json.dumps({
         "success": True,
@@ -6703,6 +6733,149 @@ def _enumerate_meeting_stems(output_dir):
 
 
 _MD_SECTION_HEADER_RE = re.compile(r"^## (.+?)\s*$")
+_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY = "pending_summary_transcript_sync"
+_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION = 1
+
+
+def _transcript_body_hash(body: str) -> str:
+    """Hash the exact extracted body without persisting its contents."""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _summary_transcript_copy(
+    output_dir: Path, meeting_stem: str,
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Return ``(format, body, io_failed)`` using the normal JSON priority."""
+    json_path = output_dir / f"{meeting_stem}_summary.json"
+    md_path = output_dir / f"{meeting_stem}_summary.md"
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            logger.warning("Could not read %s to prepare transcript sync: %s", json_path, error)
+            return "json", None, True
+        embedded = data.get("diarised_text")
+        return "json", embedded if isinstance(embedded, str) else None, False
+
+    if not md_path.exists():
+        return None, None, False
+    try:
+        original = md_path.read_text(encoding="utf-8")
+    except OSError as error:
+        logger.warning("Could not read %s to prepare transcript sync: %s", md_path, error)
+        return "md", None, True
+
+    lines = original.split("\n")
+    i = 0
+    while i < len(lines):
+        match = _MD_SECTION_HEADER_RE.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        body_end = i + 1
+        while body_end < len(lines) and not _MD_SECTION_HEADER_RE.match(lines[body_end]):
+            body_end += 1
+        if match.group(1).strip().lower() == "transcript":
+            return "md", "\n".join(lines[i + 1:body_end]).strip(), False
+        i = body_end
+    return "md", None, False
+
+
+def _summary_sync_operation_hash(target_ids: set, replacement_label: Optional[str]) -> str:
+    payload = {
+        "replacement_label_sha256": (
+            hashlib.sha256(replacement_label.encode("utf-8")).hexdigest()
+            if replacement_label is not None else None
+        ),
+        "target_ids": sorted([list(target_id) for target_id in target_ids]),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prepare_summary_transcript_sync(
+    output_dir: Path,
+    meeting_stem: str,
+    previous_transcript_body: str,
+    target_ids: set,
+    replacement_label: Optional[str],
+) -> tuple[bool, Optional[dict]]:
+    """Persist exact pre-write proof for a possible summary retry.
+
+    The marker contains hashes and operation identity only. It is written to
+    the already crash-safe speaker sidecar while the caller holds its meeting
+    lock, before either transcript artifact changes.
+    """
+    from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
+
+    store = SpeakerSidecarStore(output_dir)
+    sidecar = store.read(meeting_stem)
+    if not isinstance(sidecar, dict):
+        return False, None
+    operation_hash = _summary_sync_operation_hash(target_ids, replacement_label)
+    existing = sidecar.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY)
+    if existing is not None:
+        if (
+            isinstance(existing, dict)
+            and existing.get("version") == _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION
+            and existing.get("operation_sha256") == operation_hash
+        ):
+            return True, existing
+        # Never replace proof for a transition that has not been reconciled.
+        return False, None
+
+    summary_format, embedded_body, io_failed = _summary_transcript_copy(output_dir, meeting_stem)
+    if io_failed:
+        return False, None
+    if summary_format is None or embedded_body is None:
+        return True, None
+    if embedded_body != previous_transcript_body:
+        # The embedded copy already diverged before this operation. Preserve it
+        # and do not mint provenance that could make a later retry overwrite it.
+        return True, None
+
+    marker = {
+        "version": _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+        "summary_format": summary_format,
+        "canonical_before_sha256": _transcript_body_hash(previous_transcript_body),
+        "embedded_before_sha256": _transcript_body_hash(embedded_body),
+        "operation_sha256": operation_hash,
+    }
+
+    def persist(document):
+        document[_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY] = marker
+
+    try:
+        store.mutate_locked(meeting_stem, store.run_token(sidecar), persist)
+    except (FileNotFoundError, OSError, StaleDiarizationRun, ValueError) as error:
+        logger.warning("Could not persist pending transcript sync for %s: %s", meeting_stem, error)
+        return False, None
+    return True, marker
+
+
+def _clear_summary_transcript_sync(
+    output_dir: Path, meeting_stem: str, marker: dict,
+) -> bool:
+    """Remove only the exact marker this operation consumed."""
+    from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
+
+    store = SpeakerSidecarStore(output_dir)
+    sidecar = store.read(meeting_stem)
+    if not isinstance(sidecar, dict):
+        return False
+    if sidecar.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY) != marker:
+        return True
+
+    def clear(document):
+        if document.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY) == marker:
+            document.pop(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY, None)
+
+    try:
+        store.mutate_locked(meeting_stem, store.run_token(sidecar), clear)
+    except (FileNotFoundError, OSError, StaleDiarizationRun, ValueError) as error:
+        logger.warning("Could not clear pending transcript sync for %s: %s", meeting_stem, error)
+        return False
+    return True
 
 
 def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
@@ -6735,22 +6908,39 @@ def _update_summary_transcript(
     restore_manifest: Optional[list] = None,
     restore_target_ids: Optional[set] = None,
     retry_relabel_to: Optional[str] = None,
-) -> None:
+    sync_marker: Optional[dict] = None,
+) -> str:
     """Keep a summary's embedded diarised transcript aligned after naming.
 
     The separate transcript is the relabel operation's canonical artifact. An
     embedded copy is replaced only when it still exactly matches the canonical
-    body from before relabeling. A user-edited or independently redacted copy is
-    preserved. When a prior attempt restored the canonical transcript but its
-    summary write failed, a provenance-checked label-only repair can bring the
-    embedded copy forward without replacing its text. JSON remains preferred
-    when both summary formats exist, matching the rest of the meeting-store
-    code. Missing or unreadable artifacts are best-effort no-ops because
-    speaker-profile confirmation already succeeded.
+    body from before relabeling. A retry additionally needs the crash-safe hash
+    marker written before that first canonical change. Manifest/timestamps alone
+    are never authority to overwrite a divergent copy. The return value lets the
+    caller retain the marker only for I/O failures and clear it after a completed
+    update or a deliberate user-edit no-op.
     """
     transcript_body = _saved_transcript_body(transcript_path)
     if not transcript_body:
-        return
+        return "io_error"
+
+    expected_operation_hash = None
+    if restore_target_ids is not None:
+        expected_operation_hash = _summary_sync_operation_hash(
+            restore_target_ids, retry_relabel_to,
+        )
+
+    def _marker_allows_retry(summary_format: str, embedded_body: str) -> bool:
+        return bool(
+            isinstance(sync_marker, dict)
+            and sync_marker.get("version") == _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION
+            and sync_marker.get("summary_format") == summary_format
+            and sync_marker.get("operation_sha256") == expected_operation_hash
+            and sync_marker.get("canonical_before_sha256")
+            == sync_marker.get("embedded_before_sha256")
+            and sync_marker.get("embedded_before_sha256")
+            == _transcript_body_hash(embedded_body)
+        )
 
     def _repair_embedded_labels(embedded_body: str) -> tuple[str, int]:
         if restore_manifest is None or restore_target_ids is None:
@@ -6773,38 +6963,45 @@ def _update_summary_transcript(
             data = json.loads(json_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             logger.warning(f"Could not read {json_path} to update transcript: {e}")
-            return
+            return "io_error"
         embedded_body = data.get("diarised_text")
         if not isinstance(embedded_body, str):
-            return
-        if embedded_body.strip() == previous_transcript_body.strip():
+            return "diverged"
+        if embedded_body == transcript_body:
+            return "complete"
+        if embedded_body == previous_transcript_body:
             replacement_body = transcript_body
             repaired_labels = False
-        elif restore_manifest is not None and restore_target_ids is not None:
+        elif (
+            restore_manifest is not None
+            and restore_target_ids is not None
+            and _marker_allows_retry("json", embedded_body)
+        ):
             replacement_body, restored_lines = _repair_embedded_labels(embedded_body)
             if restored_lines == 0:
-                return
+                return "unsafe"
             repaired_labels = True
         else:
-            return
-        if repaired_labels and replacement_body.strip() != transcript_body:
-            return
-        if replacement_body.strip() == embedded_body.strip():
-            return
+            return "diverged"
+        if repaired_labels and replacement_body != transcript_body:
+            return "unsafe"
+        if replacement_body == embedded_body:
+            return "complete"
         data["diarised_text"] = replacement_body
         try:
             _atomic_write_json(json_path, data)
         except OSError as e:
             logger.warning(f"Could not update transcript in {json_path}: {e}")
-        return
+            return "io_error"
+        return "updated"
 
     if not md_path.exists():
-        return
+        return "missing"
     try:
         original = md_path.read_text(encoding="utf-8")
     except OSError as e:
         logger.warning(f"Could not read {md_path} to update transcript: {e}")
-        return
+        return "io_error"
 
     lines = original.split("\n")
     section_start = None
@@ -6824,30 +7021,38 @@ def _update_summary_transcript(
         i = body_end
 
     if section_start is None:
-        return
+        return "diverged"
     embedded_body = "\n".join(lines[section_start + 1:section_end]).strip()
-    if embedded_body == previous_transcript_body.strip():
+    if embedded_body == transcript_body:
+        return "complete"
+    if embedded_body == previous_transcript_body:
         replacement_body = transcript_body
         repaired_labels = False
-    elif restore_manifest is not None and restore_target_ids is not None:
+    elif (
+        restore_manifest is not None
+        and restore_target_ids is not None
+        and _marker_allows_retry("md", embedded_body)
+    ):
         replacement_body, restored_lines = _repair_embedded_labels(embedded_body)
         if restored_lines == 0:
-            return
+            return "unsafe"
         repaired_labels = True
     else:
-        return
-    if repaired_labels and replacement_body.strip() != transcript_body:
-        return
-    if replacement_body.strip() == embedded_body:
-        return
+        return "diverged"
+    if repaired_labels and replacement_body != transcript_body:
+        return "unsafe"
+    if replacement_body == embedded_body:
+        return "complete"
     new_section = ["## Transcript", "", *replacement_body.split("\n"), ""]
     spliced = lines[:section_start] + new_section + lines[section_end:]
     if spliced == lines:
-        return
+        return "complete"
     try:
         _atomic_write_text(md_path, "\n".join(spliced))
     except OSError as e:
         logger.warning(f"Could not update transcript in {md_path}: {e}")
+        return "io_error"
+    return "updated"
 
 
 def _update_summary_participants(output_dir: Path, meeting_stem: str, participant_names: list) -> None:

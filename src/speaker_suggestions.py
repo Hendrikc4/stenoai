@@ -47,7 +47,6 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1698,20 +1697,11 @@ def relabel_transcript_exact(transcript_path: Path, turn_manifest: list, target_
         )
         return 0
 
-    # Diagnostic trail for a real, unexplained incident: two confirm-speaker
-    # calls on the same meeting (different clusters) left one raw cluster's
-    # lines scattered across three different labels instead of the uniform
-    # result this function's own logic (and a controlled replay of it)
-    # produces. Never reproduced from a clean replay, so this call's exact
-    # inputs/outcome are logged to give a real trail if it recurs, rather
-    # than reconstructing after the fact from the file alone.
-    before_labels = Counter(
-        _TRANSCRIPT_LINE_RE.match(lines[i]).group(2) for i in diarised_line_indices
-    )
+    # Keep the diagnostic trail metadata-only. Speaker display names and raw
+    # transcript labels are meeting content and must never enter logs.
     logger.info(
-        "relabel_transcript_exact: %s target_ids=%s display_name=%r lines=%d before_labels=%s",
-        transcript_path, sorted(target_ids), display_name, len(diarised_line_indices),
-        dict(before_labels),
+        "relabel_transcript_exact: %s targets=%d lines=%d",
+        transcript_path, len(target_ids), len(diarised_line_indices),
     )
 
     changed = 0
