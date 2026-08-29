@@ -39,6 +39,38 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             },
         })
 
+    def _seed_two_cluster_relabel_artifacts(self, tmp):
+        output_dir = Path(tmp) / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        body = "[00:05] [Speaker 2] first\n[00:10] [Speaker 3] second"
+        summary_path = output_dir / "mtg001_summary.md"
+        summary_path.write_text("## Transcript\n\n" + body + "\n", encoding="utf-8")
+        write_speakers_sidecar(output_dir, "mtg001", {
+            "mic": {
+                "recording_type": "in_person",
+                "clusters": {
+                    "SPEAKER_00": {
+                        "embedding": [1.0, 0.0], "speech_duration_seconds": 30.0,
+                        "segment_count": 5, "segments": [{"start": 4.0, "end": 6.0}],
+                    },
+                    "SPEAKER_01": {
+                        "embedding": [0.0, 1.0], "speech_duration_seconds": 30.0,
+                        "segment_count": 5, "segments": [{"start": 9.0, "end": 11.0}],
+                    },
+                },
+            },
+        }, turn_manifest=[
+            {"start": 5.1, "channel": "mic", "diarization_speaker_id": "SPEAKER_00"},
+            {"start": 10.1, "channel": "mic", "diarization_speaker_id": "SPEAKER_01"},
+        ])
+        transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_text(
+            "Session: mtg001\n\n" + "=" * 60 + "\n\n" + body,
+            encoding="utf-8",
+        )
+        return output_dir, summary_path, transcript_path
+
     def test_requires_exactly_one_of_person_id_or_new_person(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._seed_sidecar(tmp)
@@ -980,6 +1012,90 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 "pending_summary_transcript_sync",
                 read_speakers_sidecar(output_dir, "mtg001"),
             )
+
+    def test_completed_marker_after_clear_failure_is_reconciled_before_another_confirm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = self._seed_two_cluster_relabel_artifacts(tmp)
+            with mock.patch("simple_recorder._clear_summary_transcript_sync", return_value=False):
+                first, cfg = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ], tmp)
+
+            self.assertFalse(_last_json(first.output)["success"])
+            self.assertIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
+            second, _ = self._run([
+                "mtg001", "mic", "SPEAKER_01", "--new-person", "Person Beta",
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(second.output)["success"])
+            self.assertIn("[00:10] [Person Beta] second", transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("[00:10] [Person Beta] second", summary_path.read_text(encoding="utf-8"))
+            self.assertIn("Person Beta", summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
+    def test_change_confirmation_reconciles_a_completed_marker_from_the_old_person(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = self._seed_two_cluster_relabel_artifacts(tmp)
+            with mock.patch("simple_recorder._clear_summary_transcript_sync", return_value=False):
+                first, cfg = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ], tmp)
+            self.assertFalse(_last_json(first.output)["success"])
+            person_beta = cfg.create_person_profile("Person Beta")
+
+            changed, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--person-id", person_beta["person_id"],
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(changed.output)["success"])
+            self.assertIn("[00:05] [Person Beta] first", transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("[00:05] [Person Beta] first", summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
+    def test_ambiguous_pending_marker_fails_before_a_second_confirm_mutates_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = self._seed_two_cluster_relabel_artifacts(tmp)
+            real_atomic_write = simple_recorder._atomic_write_text
+
+            def fail_alpha_summary_write(path, text, *args, **kwargs):
+                if path == summary_path and "[Person Alpha]" in text:
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text",
+                side_effect=fail_alpha_summary_write,
+            ):
+                first, cfg = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ], tmp)
+            self.assertTrue(_last_json(first.output)["success"])
+
+            second, _ = self._run([
+                "mtg001", "mic", "SPEAKER_01", "--new-person", "Person Beta",
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertNotEqual(second.exit_code, 0)
+            self.assertFalse(_last_json(second.output)["success"])
+            self.assertEqual([p["display_name"] for p in cfg.get_person_profiles()], ["Person Alpha"])
+            self.assertIn("[00:10] [Speaker 3] second", transcript_path.read_text(encoding="utf-8"))
+            self.assertIn("[00:10] [Speaker 3] second", summary_path.read_text(encoding="utf-8"))
 
     def test_relabel_prefers_json_when_both_summary_formats_exist(self):
         with tempfile.TemporaryDirectory() as tmp:

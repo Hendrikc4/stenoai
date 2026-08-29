@@ -5351,6 +5351,7 @@ def confirm_speaker(
         record_original_labels,
         relabel_transcript_exact,
         relabel_transcript_speaker,
+        restore_transcript_text_labels,
     )
 
     if bool(person_id) == bool(new_person):
@@ -5435,6 +5436,10 @@ def confirm_speaker(
         }))
         sys.exit(1)
 
+    embedding, context = clusters[resolved_id]
+    fragment_ids = {resolved_id, *context.merged_from}
+    channel_recording_type = channel_data.get("recording_type")
+
     if not config.begin_transaction():
         print(json.dumps({
             "success": False,
@@ -5455,9 +5460,22 @@ def confirm_speaker(
             print(json.dumps({"success": False, "error": f"No person profile with id {person_id!r}"}))
             sys.exit(1)
 
-    embedding, context = clusters[resolved_id]
-    fragment_ids = {resolved_id, *context.merged_from}
-    channel_recording_type = channel_data.get("recording_type")
+    if relabel_transcript and sidecar.get("transcript_lines"):
+        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        target_ids = {(channel, sid) for sid in fragment_ids}
+        if not _reconcile_pending_summary_transcript_sync(
+            output_dir,
+            meeting_stem,
+            transcript_path,
+            target_ids,
+            person["display_name"],
+        ):
+            config.rollback_transaction()
+            print(json.dumps({
+                "success": False,
+                "error": "Could not safely reconcile a pending transcript update.",
+            }))
+            sys.exit(1)
 
     # Reassignment: if this exact cluster (or one of its merged fragments)
     # was already confirmed as someone, this confirm supersedes that -- the
@@ -5687,10 +5705,17 @@ def confirm_speaker(
                 sidecar = refreshed_sidecar
                 turn_manifest = sidecar.get("transcript_lines") or turn_manifest
             if previous_transcript_body is not None:
+                expected_transcript_body, _ = restore_transcript_text_labels(
+                    previous_transcript_body,
+                    turn_manifest,
+                    target_ids,
+                    replacement_label=person["display_name"],
+                )
                 summary_sync_ready, summary_sync_marker = _prepare_summary_transcript_sync(
                     output_dir,
                     meeting_stem,
                     previous_transcript_body,
+                    expected_transcript_body,
                     target_ids,
                     person["display_name"],
                 )
@@ -5721,9 +5746,14 @@ def confirm_speaker(
                 sync_marker=summary_sync_marker,
             )
             if summary_sync_marker is not None and sync_outcome != "io_error":
-                _clear_summary_transcript_sync(
+                if not _clear_summary_transcript_sync(
                     output_dir, meeting_stem, summary_sync_marker,
-                )
+                ):
+                    print(json.dumps({
+                        "success": False,
+                        "error": "Could not finalize the pending transcript update. Retry the confirmation.",
+                    }))
+                    sys.exit(1)
 
     # Naming the cluster supersedes "a human kept this generic": the row is
     # now decided, and leaving the marking would have the panel report a
@@ -5934,6 +5964,7 @@ def mark_speaker_cluster(
         clusters_from_sidecar_channel,
         minimum_speaker_count,
         restore_transcript_labels,
+        restore_transcript_text_labels,
         set_cluster_multi_speaker,
     )
 
@@ -5996,6 +6027,22 @@ def mark_speaker_cluster(
     fragment_ids = {diarization_speaker_id}
     if resolved_id in clusters:
         fragment_ids = {resolved_id, *clusters[resolved_id][1].merged_from}
+
+    if multiple and fragment_ids and sidecar.get("transcript_lines"):
+        transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+        restore_target_ids = {(channel, fid) for fid in fragment_ids}
+        if not _reconcile_pending_summary_transcript_sync(
+            output_dir,
+            meeting_stem,
+            transcript_path,
+            restore_target_ids,
+            None,
+        ):
+            print(json.dumps({
+                "success": False,
+                "error": "Could not safely reconcile a pending transcript update.",
+            }))
+            sys.exit(1)
 
     # Marking a cluster mixed must UNDO any name already on it, not just
     # stop future ones. Order matters: someone typically confirms a cluster
@@ -6112,10 +6159,16 @@ def mark_speaker_cluster(
         summary_sync_ready = True
         summary_sync_marker = None
         if previous_transcript_body is not None and sidecar.get("transcript_lines"):
+            expected_transcript_body, _ = restore_transcript_text_labels(
+                previous_transcript_body,
+                sidecar.get("transcript_lines") or [],
+                restore_target_ids,
+            )
             summary_sync_ready, summary_sync_marker = _prepare_summary_transcript_sync(
                 output_dir,
                 meeting_stem,
                 previous_transcript_body,
+                expected_transcript_body,
                 restore_target_ids,
                 None,
             )
@@ -6141,9 +6194,15 @@ def mark_speaker_cluster(
                 sync_marker=summary_sync_marker,
             )
             if summary_sync_marker is not None and sync_outcome != "io_error":
-                _clear_summary_transcript_sync(
+                if not _clear_summary_transcript_sync(
                     output_dir, meeting_stem, summary_sync_marker,
-                )
+                ):
+                    print(json.dumps({
+                        "success": False,
+                        "error": "Could not finalize the pending transcript update. Retry the speaker marking.",
+                        "cleared_confirmation_from": cleared_from,
+                    }))
+                    sys.exit(1)
         if summary_artifacts_ready:
             _update_summary_participants(
                 output_dir, meeting_stem,
@@ -6734,7 +6793,8 @@ def _enumerate_meeting_stems(output_dir):
 
 _MD_SECTION_HEADER_RE = re.compile(r"^## (.+?)\s*$")
 _PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY = "pending_summary_transcript_sync"
-_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION = 1
+_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION = 2
+_LEGACY_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION = 1
 
 
 def _transcript_body_hash(body: str) -> str:
@@ -6797,6 +6857,7 @@ def _prepare_summary_transcript_sync(
     output_dir: Path,
     meeting_stem: str,
     previous_transcript_body: str,
+    expected_transcript_body: str,
     target_ids: set,
     replacement_label: Optional[str],
 ) -> tuple[bool, Optional[dict]]:
@@ -6817,7 +6878,10 @@ def _prepare_summary_transcript_sync(
     if existing is not None:
         if (
             isinstance(existing, dict)
-            and existing.get("version") == _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION
+            and existing.get("version") in {
+                _LEGACY_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+                _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+            }
             and existing.get("operation_sha256") == operation_hash
         ):
             return True, existing
@@ -6839,6 +6903,7 @@ def _prepare_summary_transcript_sync(
         "summary_format": summary_format,
         "canonical_before_sha256": _transcript_body_hash(previous_transcript_body),
         "embedded_before_sha256": _transcript_body_hash(embedded_body),
+        "canonical_after_sha256": _transcript_body_hash(expected_transcript_body),
         "operation_sha256": operation_hash,
     }
 
@@ -6851,6 +6916,75 @@ def _prepare_summary_transcript_sync(
         logger.warning("Could not persist pending transcript sync for %s: %s", meeting_stem, error)
         return False, None
     return True, marker
+
+
+def _reconcile_pending_summary_transcript_sync(
+    output_dir: Path,
+    meeting_stem: str,
+    transcript_path: Path,
+    target_ids: set,
+    replacement_label: Optional[str],
+) -> bool:
+    """Clear only a proved-complete marker before a different operation.
+
+    A marker is deliberately retained after a summary I/O failure so the
+    same operation can safely retry.  It must not, however, turn a later
+    confirmation or mixed-speaker marking into a silent partial success.  A
+    completed v2 marker records the expected canonical result, so it can be
+    removed only when both artifacts exactly have that result.  Anything
+    else is either the retry itself or ambiguous and must fail closed before
+    callers mutate profiles, sidecar state, or Participants.
+    """
+    from src.speaker_sidecar_store import SpeakerSidecarStore
+
+    store = SpeakerSidecarStore(output_dir)
+    sidecar = store.read(meeting_stem)
+    if not isinstance(sidecar, dict):
+        return False
+    marker = sidecar.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY)
+    if marker is None:
+        return True
+
+    operation_hash = _summary_sync_operation_hash(target_ids, replacement_label)
+    transcript_body = _saved_transcript_body(transcript_path)
+    summary_format, embedded_body, io_failed = _summary_transcript_copy(
+        output_dir, meeting_stem,
+    )
+    if transcript_body is None or io_failed or summary_format is None or embedded_body is None:
+        logger.warning("Could not safely reconcile pending transcript sync for %s", meeting_stem)
+        return False
+
+    expected_after_hash = (
+        marker.get("canonical_after_sha256") if isinstance(marker, dict) else None
+    )
+    marker_is_complete = (
+        isinstance(marker, dict)
+        and marker.get("version") == _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION
+        and marker.get("summary_format") == summary_format
+        and isinstance(expected_after_hash, str)
+        and _transcript_body_hash(transcript_body) == expected_after_hash
+        and _transcript_body_hash(embedded_body) == expected_after_hash
+    )
+    if marker_is_complete:
+        if _clear_summary_transcript_sync(output_dir, meeting_stem, marker):
+            return True
+        logger.warning("Could not clear completed pending transcript sync for %s", meeting_stem)
+        return False
+
+    if (
+        isinstance(marker, dict)
+        and marker.get("version") in {
+            _LEGACY_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+            _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+        }
+        and marker.get("operation_sha256") == operation_hash
+    ):
+        # This is the exact interrupted operation.  Its later update path
+        # still verifies the original embedded hash before changing anything.
+        return True
+
+    logger.warning("Pending transcript sync for %s cannot be safely reconciled", meeting_stem)
+    return False
 
 
 def _clear_summary_transcript_sync(
@@ -6933,7 +7067,10 @@ def _update_summary_transcript(
     def _marker_allows_retry(summary_format: str, embedded_body: str) -> bool:
         return bool(
             isinstance(sync_marker, dict)
-            and sync_marker.get("version") == _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION
+            and sync_marker.get("version") in {
+                _LEGACY_PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+                _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+            }
             and sync_marker.get("summary_format") == summary_format
             and sync_marker.get("operation_sha256") == expected_operation_hash
             and sync_marker.get("canonical_before_sha256")

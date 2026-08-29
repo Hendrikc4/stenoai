@@ -42,6 +42,7 @@ from src.speaker_suggestions import (
     set_cluster_review_state,
     suggest_speaker,
     suggest_speakers_for_meeting,
+    write_sidecar_document,
     write_speakers_sidecar,
 )
 
@@ -1335,6 +1336,140 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             )
             self.assertIn("[00:05] [Speaker 2] hello there", summary_text)
 
+    def test_mark_reconciles_a_completed_marker_before_profile_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{"start": 5.2, "channel": "mic", "diarization_speaker_id": "SPEAKER_00"}],
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                ["mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha", "--relabel-transcript"],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            canonical_body = "[00:05] [Person Alpha] hello there"
+            sidecar = read_speakers_sidecar(output_dir, "mtg001")
+            sidecar["pending_summary_transcript_sync"] = {
+                "version": simple_recorder._PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+                "summary_format": "md",
+                "canonical_before_sha256": simple_recorder._transcript_body_hash(canonical_body),
+                "embedded_before_sha256": simple_recorder._transcript_body_hash(canonical_body),
+                "canonical_after_sha256": simple_recorder._transcript_body_hash(canonical_body),
+                "operation_sha256": simple_recorder._summary_sync_operation_hash(
+                    {("mic", "SPEAKER_01")}, "Person Other",
+                ),
+            }
+            write_sidecar_document(output_dir, "mtg001", sidecar)
+
+            marked = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(marked.output)["success"])
+            self.assertNotIn("pending_summary_transcript_sync", read_speakers_sidecar(output_dir, "mtg001"))
+            self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
+
+    def test_mark_reports_a_marker_clear_failure_without_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{"start": 5.2, "channel": "mic", "diarization_speaker_id": "SPEAKER_00"}],
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                ["mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha", "--relabel-transcript"],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+
+            with mock.patch("simple_recorder._clear_summary_transcript_sync", return_value=False):
+                marked = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(marked.exit_code, 0)
+            self.assertFalse(_last_json(marked.output)["success"])
+            self.assertIn("pending_summary_transcript_sync", read_speakers_sidecar(output_dir, "mtg001"))
+            self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            self.assertNotIn("[Person Alpha]", summary.read_text(encoding="utf-8"))
+
+    def test_mark_fails_closed_for_an_ambiguous_pending_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{"start": 5.2, "channel": "mic", "diarization_speaker_id": "SPEAKER_00"}],
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                ["mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha", "--relabel-transcript"],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            canonical_body = "[00:05] [Person Alpha] hello there"
+            sidecar = read_speakers_sidecar(output_dir, "mtg001")
+            sidecar["pending_summary_transcript_sync"] = {
+                "version": simple_recorder._PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
+                "summary_format": "md",
+                "canonical_before_sha256": simple_recorder._transcript_body_hash(canonical_body),
+                "embedded_before_sha256": simple_recorder._transcript_body_hash(canonical_body),
+                "canonical_after_sha256": simple_recorder._transcript_body_hash("different"),
+                "operation_sha256": simple_recorder._summary_sync_operation_hash(
+                    {("mic", "SPEAKER_01")}, "Person Other",
+                ),
+            }
+            write_sidecar_document(output_dir, "mtg001", sidecar)
+
+            marked = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertNotEqual(marked.exit_code, 0)
+            self.assertFalse(_last_json(marked.output)["success"])
+            self.assertIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            self.assertIn("Person Alpha", summary.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                MULTI_SPEAKER_KEY,
+                read_speakers_sidecar(output_dir, "mtg001")["channels"]["mic"]["clusters"]["SPEAKER_00"],
+            )
+
     def test_retry_after_sidecar_failure_repairs_transcript_and_participants(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = self._seed_with_transcript(
@@ -1583,13 +1718,16 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 },
             ]
             marker = {
-                "version": 1,
+                "version": simple_recorder._PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
                 "summary_format": "md",
                 "canonical_before_sha256": simple_recorder._transcript_body_hash(
                     stale_reordered_body,
                 ),
                 "embedded_before_sha256": simple_recorder._transcript_body_hash(
                     stale_reordered_body,
+                ),
+                "canonical_after_sha256": simple_recorder._transcript_body_hash(
+                    canonical_body,
                 ),
                 "operation_sha256": simple_recorder._summary_sync_operation_hash(
                     {("mic", "SPEAKER_A")}, "Person Alpha",
@@ -1653,10 +1791,13 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 "[00:05] [Person Alpha] alpha words"
             )
             marker = {
-                "version": 1,
+                "version": simple_recorder._PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION,
                 "summary_format": "md",
                 "canonical_before_sha256": simple_recorder._transcript_body_hash(embedded_body),
                 "embedded_before_sha256": simple_recorder._transcript_body_hash(embedded_body),
+                "canonical_after_sha256": simple_recorder._transcript_body_hash(
+                    canonical_body,
+                ),
                 "operation_sha256": simple_recorder._summary_sync_operation_hash(
                     {("mic", "SPEAKER_A")}, "Person Alpha",
                 ),
