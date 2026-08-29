@@ -170,6 +170,28 @@ export function collectFromSource(file) {
     if (accept(text)) record(text, certain);
   };
 
+  // Walk an expression whose value is rendered. Structural subtrees still stay out, and
+  // nested JSX goes through the normal walk so its own attribute semantics remain intact.
+  // Function boundaries are optionally delegated for ReactNode props, matching the broad
+  // callback recall used elsewhere without making their internals certain by position.
+  const walkRenderedExpression = (node, certain, delegateFunctions = false) => {
+    if (isStructural(node)) return;
+    if (
+      (delegateFunctions && (ts.isArrowFunction(node) || ts.isFunctionExpression(node))) ||
+      ts.isJsxElement(node) ||
+      ts.isJsxSelfClosingElement(node) ||
+      ts.isJsxFragment(node) ||
+      ts.isJsxAttribute(node)
+    ) {
+      walk(node);
+      return;
+    }
+    const accept = certain ? isCopy : (text) => !definitelyNotCopy(text);
+    addLiteral(node, accept, certain);
+    addTemplate(node, accept, certain);
+    ts.forEachChild(node, (child) => walkRenderedExpression(child, certain, delegateFunctions));
+  };
+
   const walk = (node) => {
     if (isStructural(node)) return;
 
@@ -184,26 +206,10 @@ export function collectFromSource(file) {
       const name = node.name.getText(source);
       if (RENDERED_NODE_ATTRIBUTES.includes(name)) {
         // ReactNode props are rendered even when their value is a direct string or a
-        // conditional/call expression. Give those values the same certain-copy treatment
-        // as JSX children, while delegating nested JSX and callbacks to their normal
-        // structural handling so attributes such as className stay out of the inventory.
-        const walkRenderedNode = (n) => {
-          if (
-            ts.isArrowFunction(n) ||
-            ts.isFunctionExpression(n) ||
-            ts.isJsxElement(n) ||
-            ts.isJsxSelfClosingElement(n) ||
-            ts.isJsxFragment(n) ||
-            ts.isJsxAttribute(n)
-          ) {
-            walk(n);
-            return;
-          }
-          addLiteral(n, isCopy, true);
-          addTemplate(n, isCopy, true);
-          ts.forEachChild(n, walkRenderedNode);
-        };
-        if (node.initializer) walkRenderedNode(node.initializer);
+        // conditional/call expression. Keep ambiguous lowercase tokens in the safety net,
+        // while delegating nested JSX and callbacks to their normal structural handling so
+        // attributes such as className stay out of the inventory.
+        if (node.initializer) walkRenderedExpression(node.initializer, false, true);
         return;
       }
       if (!COPY_ATTRIBUTES.includes(name)) {
@@ -232,40 +238,25 @@ export function collectFromSource(file) {
       }
       if (node.initializer) {
         // Covers `title="Copy"` and `title={cond ? 'Hide' : 'Show'}` alike.
-        const walkAttr = (n) => {
-          addLiteral(n, isCopy, true);
-          addTemplate(n, isCopy, true);
-          ts.forEachChild(n, walkAttr);
-        };
-        walkAttr(node.initializer);
+        walkRenderedExpression(node.initializer, true, true);
       }
       // Do not fall through: descending again would count every copy attribute twice and
       // make the per-occurrence counts meaningless.
       return;
     }
 
-    if (ts.isJsxExpression(node) && node.parent && ts.isJsxElement(node.parent)) {
+    if (
+      ts.isJsxExpression(node) &&
+      node.parent &&
+      (ts.isJsxElement(node.parent) || ts.isJsxFragment(node.parent))
+    ) {
       // A literal in children position — `{count === 1 ? 'note' : 'notes'}` — is rendered
       // exactly like JSX text. Structural knowledge, so no heuristic and no uncertainty.
       //
       // But stop at any nested JSX: `{items.map(x => <div className="p-1">…</div>)}` is
       // also a children expression, and descending into it would hand every className to
       // the certain-copy branch. Hand those back to the normal walk.
-      const walkChild = (n) => {
-        if (
-          ts.isJsxElement(n) ||
-          ts.isJsxSelfClosingElement(n) ||
-          ts.isJsxFragment(n) ||
-          ts.isJsxAttribute(n)
-        ) {
-          walk(n);
-          return;
-        }
-        addLiteral(n, isCopy, true);
-        addTemplate(n, isCopy, true);
-        ts.forEachChild(n, walkChild);
-      };
-      ts.forEachChild(node, walkChild);
+      ts.forEachChild(node, (child) => walkRenderedExpression(child, true, true));
       return;
     }
 

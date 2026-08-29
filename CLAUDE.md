@@ -203,8 +203,8 @@ elsewhere would land unseen.
   then stops at functions, callbacks, helpers, and other calls. That keeps the blocking
   rule precise; broader rendered-copy paths belong to the inventory ratchet below.
 - **The English copy inventory.** `app/scripts/i18n-copy-inventory.mjs` extracts every
-  English string the renderer shows into `docs/i18n/copy-inventory.json` (1288 `copy` +
-  1165 `uncertain`, repeated copy recorded per occurrence). Interpolations use stable
+  English string the renderer shows into `docs/i18n/copy-inventory.json` (1220 `copy` +
+  1175 `uncertain`, repeated copy recorded per occurrence). Interpolations use stable
   `{{…}}` placeholders so expression renames do not create copy churn. It blocks nothing; it
   witnesses. The review rule for an i18n migration is then one sentence: *the inventory
   diff must show strings moving, never changing.* Afterwards it keeps working as a copy

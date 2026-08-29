@@ -194,6 +194,24 @@ const BARE_UTILITIES = new Set([
 
 const utilityShaped = (token) => UTILITY_PREFIX.test(token) || BARE_UTILITIES.has(token);
 
+// Tailwind variants decorate, but do not change, the underlying utility. Peel only
+// conventional lowercase or bracketed variants so prose containing a colon cannot be
+// mistaken for markup merely because one word happens to resemble a utility.
+const utilityBase = (token) => {
+  let base = token;
+  let match;
+  while ((match = base.match(/^(?:[a-z-]+|\[[^\]]+\]):/))) {
+    base = base.slice(match[0].length);
+  }
+  return base;
+};
+
+const readsAsUtilityClassList = (tokens) =>
+  tokens.length > 1 &&
+  tokens.every((token) => !/\p{Lu}/u.test(token)) &&
+  tokens.every((token) => utilityShaped(utilityBase(token))) &&
+  tokens.some((token) => /[-:[\]/]/.test(token) || /\d/.test(token));
+
 const CSS_LIKE = [
   /^[a-z-]+\([^)]*\)$/i, // var(--fg-1), rotate(90deg), translateY(-2px)
   /^#[0-9a-f]{3,8}$/i, // hex colours
@@ -277,6 +295,10 @@ export function readsAsCopy(text) {
   if (definitelyNotCopy(trimmed)) return false;
   if (STORAGE_UNIT.test(trimmed)) return false;
   const tokens = trimmed.split(/\s+/);
+  // Some complete Tailwind lists survive the conservative reject list because variants
+  // and arbitrary values obscure their utility prefixes. Keep them in the inventory's
+  // safety net, but do not promote them to the contractual copy partition.
+  if (readsAsUtilityClassList(tokens)) return false;
   if (tokens.length > 1) return true; // a phrase that survived the reject list is prose
   return /^\p{Lu}/u.test(trimmed); // one word: capitalised reads as a label
 }

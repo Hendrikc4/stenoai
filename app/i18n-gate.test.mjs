@@ -720,6 +720,132 @@ test('the extractor records direct strings and helper arguments for ReactNode pr
   }
 });
 
+test('copy attributes delegate nested JSX structure to the normal traversal', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'CopyAttribute.tsx');
+    fs.writeFileSync(
+      file,
+      `export function C() {
+         return <Card description={<span className="mt-2 flex">Hello there</span>} />;
+       }`
+    );
+    const { copy, uncertain } = collectFromSource(file);
+    assert.ok(copy.includes('Hello there'), 'nested JSX text is rendered copy');
+    assert.ok(![...copy, ...uncertain].includes('mt-2 flex'), 'nested className stays structural');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('direct conditional literals under a JSX fragment are certain copy', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Fragment.tsx');
+    fs.writeFileSync(
+      file,
+      `export function C({ count }) { return <>{count === 1 ? 'note' : 'notes'}</>; }`
+    );
+    const { copy, uncertain } = collectFromSource(file);
+    assert.ok(copy.includes('note'));
+    assert.ok(copy.includes('notes'));
+    assert.ok(!uncertain.includes('note'));
+    assert.ok(!uncertain.includes('notes'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('rendered traversal excludes equality operands but keeps conditional branches', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Equality.tsx');
+    fs.writeFileSync(
+      file,
+      `export function C({ tab }) { return <>{tab === 'saved' ? 'All saved' : 'Pending'}</>; }`
+    );
+    const { copy, uncertain } = collectFromSource(file);
+    assert.ok(copy.includes('All saved'));
+    assert.ok(copy.includes('Pending'));
+    assert.ok(![...copy, ...uncertain].includes('saved'), 'equality operand is structural');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ReactNode action precision distinguishes data tokens from visible copy', async () => {
+  const source = `export function C({ name }) {
+    return <>
+      <Card action="confirm" />
+      <Card action="Retry export" />
+      <Card action={\`Retry export for \${name}\`} />
+      <Card action={\`confirm \${name}\`} />
+    </>;
+  }`;
+  const messages = await flaggedSource(source);
+  assert.equal(messages.length, 3, 'only the three visibly worded actions are blocking copy');
+  assert.ok(messages.every((message) => message.ruleId === 'steno-i18n/no-interpolated-literal'));
+
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Action.tsx');
+    fs.writeFileSync(file, source);
+    const { copy, uncertain } = collectFromSource(file);
+    assert.ok(uncertain.includes('confirm'), 'ambiguous lowercase action remains inventoried');
+    assert.ok(!copy.includes('confirm'), 'data-shaped action is not part of the copy contract');
+    assert.ok(copy.includes('Retry export'));
+    assert.ok(copy.includes('Retry export for {{…}}'));
+    assert.ok(copy.includes('confirm {{…}}'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('real utility lists never become contractual copy while ordinary phrases do', async () => {
+  const utilities = [
+    'bg-secondary text-secondary-foreground hover:bg-paper-2 dark:hover:bg-[hsl(54,7%,18%)]',
+    'inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg text-sm font-medium transition-colors duration-fast ease-steno focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:shrink-0 [&_svg]:size-4',
+    'border-transparent bg-muted text-muted-foreground hover:bg-paper-2 dark:hover:bg-[hsl(54,7%,18%)]',
+    'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors duration-fast ease-steno focus:outline-none [&_svg]:size-3 [&_svg]:shrink-0',
+    'border-transparent bg-paper-1 dark:bg-[hsl(54,7%,14%)]',
+    'mt-1 block',
+    'mt-1 block',
+    'mt-2 block',
+    'h-[30px] bg-[color:var(--surface-raised)] text-[13px]',
+    'h-[30px] min-w-[150px] rounded-[6px] bg-[color:var(--surface-raised)] px-2.5 py-0 text-[13px]',
+  ];
+  const { definitelyNotCopy, readsAsCopy } = await import('./scripts/i18n-copy-rules.mjs');
+  for (const utility of utilities) {
+    assert.equal(readsAsCopy(utility), false, `utility must not read as copy: ${utility}`);
+  }
+  assert.equal(readsAsCopy('sign-in required'), true, 'ordinary hyphenated copy keeps its contract');
+
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Utilities.tsx');
+    fs.writeFileSync(
+      file,
+      `export const values = ${JSON.stringify([...utilities, 'sign-in required'])};`
+    );
+    const { copy, uncertain } = collectFromSource(file);
+    for (const utility of new Set(utilities)) {
+      assert.ok(!copy.includes(utility), `utility must not be contractual copy: ${utility}`);
+      const expectedOccurrences = definitelyNotCopy(utility)
+        ? 0
+        : utilities.filter((entry) => entry === utility).length;
+      assert.equal(uncertain.filter((entry) => entry === utility).length, expectedOccurrences);
+    }
+    assert.ok(copy.includes('sign-in required'), 'ordinary hyphenated copy keeps its contract');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('property access does not hide callback templates from the extractor', async () => {
   const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));

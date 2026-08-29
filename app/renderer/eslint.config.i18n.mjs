@@ -7,8 +7,8 @@ import {
   COPY_ATTRIBUTES,
   RENDERED_NODE_ATTRIBUTES,
   NON_COPY_PATTERNS,
-  definitelyNotCopy,
   isCopy,
+  readsAsCopy,
 } from '../scripts/i18n-copy-rules.mjs';
 
 // eslint-plugin-i18next's `jsx-only` mode covers JSX text and selected literal
@@ -73,7 +73,7 @@ const noInterpolatedLiteral = {
       Literal(node) {
         if (
           typeof node.value === 'string'
-          && !definitelyNotCopy(node.value)
+          && readsAsCopy(node.value)
           && copyBearingJsxOwner(node) === 'rendered-node'
         ) {
           context.report({ node, messageId: 'hardcoded' });
@@ -86,7 +86,8 @@ const noInterpolatedLiteral = {
         const owner = copyBearingJsxOwner(node);
         const authoredParts = node.quasis.map((quasi) => quasi.value.cooked ?? quasi.value.raw);
         const hasLiteralCopy = authoredParts.some((part) => isCopy(part));
-        const hasRenderedNodeCopy = authoredParts.some((part) => !definitelyNotCopy(part));
+        const renderedNodeText = authoredParts.join('{{…}}');
+        const hasRenderedNodeCopy = readsAsCopy(renderedNodeText);
         if (
           (node.expressions.length > 0 && owner === 'copy' && hasLiteralCopy)
           || (owner === 'rendered-node' && hasRenderedNodeCopy)
