@@ -1416,6 +1416,174 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
             self.assertNotIn("## Participants", summary.read_text(encoding="utf-8"))
 
+    def test_transcript_read_error_fails_before_marking_or_profile_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Participants\n\nPerson Alpha\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            transcript_before = transcript.read_text(encoding="utf-8")
+            summary_before = summary.read_text(encoding="utf-8")
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
+            profiles_before = cfg.get_person_profiles()
+            real_read_text = Path.read_text
+
+            def fail_canonical_read(path, *args, **kwargs):
+                if path == transcript:
+                    raise PermissionError("simulated transcript read denial")
+                return real_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", new=fail_canonical_read):
+                failed = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles(), profiles_before)
+            self.assertEqual(read_speakers_sidecar(output_dir, "mtg001"), sidecar_before)
+            self.assertEqual(transcript.read_text(encoding="utf-8"), transcript_before)
+            self.assertEqual(summary.read_text(encoding="utf-8"), summary_before)
+            self.assertNotIn("pending_summary_transcript_sync", sidecar_before)
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertEqual(cfg.get_person_profiles()[0]["prototypes"], [])
+            sidecar_after_retry = read_speakers_sidecar(output_dir, "mtg001")
+            self.assertTrue(
+                sidecar_after_retry["channels"]["mic"]["clusters"]["SPEAKER_00"][
+                    MULTI_SPEAKER_KEY
+                ]
+            )
+            self.assertNotIn("pending_summary_transcript_sync", sidecar_after_retry)
+            self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
+            self.assertNotIn("## Participants", summary.read_text(encoding="utf-8"))
+
+    def test_canonical_transcript_write_failure_keeps_marker_and_retries_mark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Participants\n\nPerson Alpha\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            transcript_before = transcript.read_text(encoding="utf-8")
+            summary_before = summary.read_text(encoding="utf-8")
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
+            transcript_tmp = transcript.with_name(transcript.name + ".tmp")
+            real_write_text = Path.write_text
+
+            def fail_canonical_tmp_write(path, text, *args, **kwargs):
+                if path == transcript_tmp:
+                    raise OSError("simulated canonical transcript write failure")
+                return real_write_text(path, text, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", new=fail_canonical_tmp_write):
+                failed = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles()[0]["prototypes"], [])
+            sidecar_after_failure = read_speakers_sidecar(output_dir, "mtg001")
+            self.assertTrue(
+                sidecar_after_failure["channels"]["mic"]["clusters"]["SPEAKER_00"][
+                    MULTI_SPEAKER_KEY
+                ]
+            )
+            marker = sidecar_after_failure["pending_summary_transcript_sync"]
+            expected_sidecar = json.loads(json.dumps(sidecar_before))
+            expected_sidecar["pending_summary_transcript_sync"] = marker
+            expected_sidecar["channels"]["mic"]["clusters"]["SPEAKER_00"][
+                MULTI_SPEAKER_KEY
+            ] = True
+            self.assertEqual(sidecar_after_failure, expected_sidecar)
+            self.assertEqual(transcript.read_text(encoding="utf-8"), transcript_before)
+            self.assertEqual(summary.read_text(encoding="utf-8"), summary_before)
+            self.assertIn("Person Alpha", summary_before)
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertNotEqual(
+                read_speakers_sidecar(output_dir, "mtg001").get(
+                    "pending_summary_transcript_sync"
+                ),
+                marker,
+            )
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+            self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+            self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
+            self.assertNotIn("## Participants", summary.read_text(encoding="utf-8"))
+
     def test_mark_reconciles_a_completed_marker_before_profile_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = self._seed_with_transcript(

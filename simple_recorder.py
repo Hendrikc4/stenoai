@@ -5340,6 +5340,7 @@ def confirm_speaker(
     confirm itself if the transcript is missing or nothing matches.
     """
     from src.config import get_config, get_data_dirs
+    from src.speaker_schema import validate_display_name
     from src.speaker_sidecar_store import SpeakerSidecarStore, StaleDiarizationRun
     from src.speaker_suggestions import (
         clear_cluster_review_state,
@@ -5453,7 +5454,23 @@ def confirm_speaker(
         sys.exit(1)
     if new_person:
         try:
-            person = config.create_person_profile(new_person)
+            normalized_new_person = validate_display_name(new_person)
+            person = (
+                _pending_new_person_confirmation_retry(
+                    config.get_person_profiles(),
+                    sidecar,
+                    meeting_stem,
+                    channel,
+                    resolved_id,
+                    fragment_ids,
+                    run_id,
+                    normalized_new_person,
+                )
+                if relabel_transcript
+                else None
+            )
+            if person is None:
+                person = config.create_person_profile(normalized_new_person)
         except ValueError as e:
             config.rollback_transaction()
             print(json.dumps({"success": False, "error": str(e)}))
@@ -5469,7 +5486,16 @@ def confirm_speaker(
         prepared_transcript_path = (
             get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
         )
-        prepared_transcript_body = _saved_transcript_body(prepared_transcript_path)
+        prepared_transcript_body, transcript_read_failed = _read_saved_transcript_body(
+            prepared_transcript_path
+        )
+        if transcript_read_failed:
+            config.rollback_transaction()
+            print(json.dumps({
+                "success": False,
+                "error": "Could not read the transcript. Retry the confirmation.",
+            }))
+            sys.exit(1)
         prepared_turn_manifest = sidecar.get("transcript_lines")
         target_ids = {(channel, sid) for sid in fragment_ids}
         if not _reconcile_pending_summary_transcript_sync(
@@ -5739,25 +5765,37 @@ def confirm_speaker(
         turn_manifest = prepared_turn_manifest or sidecar.get("transcript_lines")
         retry_relabel_target_ids = prepared_relabel_target_ids
         summary_sync_marker = prepared_summary_sync_marker
-        if turn_manifest:
-            # Exact recorded provenance -- immune to the fuzzy-matching
-            # cross-channel/same-channel mislabeling below (see
-            # relabel_transcript_exact's docstring and the plan doc's
-            # Phase 8). Only meetings processed after this manifest
-            # existed have one; everything else falls back.
-            target_ids = prepared_relabel_target_ids or {
-                (channel, sid) for sid in [resolved_id, *context.merged_from]
-            }
-            retry_relabel_target_ids = target_ids
-            relabeled_lines = relabel_transcript_exact(
-                transcript_path, turn_manifest, target_ids, person["display_name"],
-            )
-        else:
-            raw_clusters_by_id = channel_data.get("clusters") or {}
-            pooled_segments = []
-            for fragment_id in [resolved_id, *context.merged_from]:
-                pooled_segments.extend(raw_clusters_by_id.get(fragment_id, {}).get("segments") or [])
-            relabeled_lines = relabel_transcript_speaker(transcript_path, pooled_segments, person["display_name"])
+        try:
+            if turn_manifest:
+                # Exact recorded provenance -- immune to the fuzzy-matching
+                # cross-channel/same-channel mislabeling below (see
+                # relabel_transcript_exact's docstring and the plan doc's
+                # Phase 8). Only meetings processed after this manifest
+                # existed have one; everything else falls back.
+                target_ids = prepared_relabel_target_ids or {
+                    (channel, sid) for sid in [resolved_id, *context.merged_from]
+                }
+                retry_relabel_target_ids = target_ids
+                relabeled_lines = relabel_transcript_exact(
+                    transcript_path, turn_manifest, target_ids, person["display_name"],
+                )
+            else:
+                raw_clusters_by_id = channel_data.get("clusters") or {}
+                pooled_segments = []
+                for fragment_id in [resolved_id, *context.merged_from]:
+                    pooled_segments.extend(
+                        raw_clusters_by_id.get(fragment_id, {}).get("segments") or []
+                    )
+                relabeled_lines = relabel_transcript_speaker(
+                    transcript_path, pooled_segments, person["display_name"]
+                )
+        except OSError:
+            logger.warning("Could not update canonical transcript during speaker confirmation")
+            print(json.dumps({
+                "success": False,
+                "error": "Could not update the transcript. Retry the confirmation.",
+            }))
+            sys.exit(1)
         if (
             previous_transcript_body is not None
             and (relabeled_lines > 0 or summary_sync_marker is not None)
@@ -6068,7 +6106,15 @@ def mark_speaker_cluster(
         prepared_transcript_path = (
             get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
         )
-        prepared_transcript_body = _saved_transcript_body(prepared_transcript_path)
+        prepared_transcript_body, transcript_read_failed = _read_saved_transcript_body(
+            prepared_transcript_path
+        )
+        if transcript_read_failed:
+            print(json.dumps({
+                "success": False,
+                "error": "Could not read the transcript. Retry the speaker marking.",
+            }))
+            sys.exit(1)
         prepared_restore_target_ids = {(channel, fid) for fid in fragment_ids}
         if not _reconcile_pending_summary_transcript_sync(
             output_dir,
@@ -6225,11 +6271,20 @@ def mark_speaker_cluster(
             (channel, fid) for fid in fragment_ids
         }
         summary_sync_marker = prepared_summary_sync_marker
-        restored_lines = restore_transcript_labels(
-            transcript_path,
-            sidecar.get("transcript_lines") or [],
-            restore_target_ids,
-        )
+        try:
+            restored_lines = restore_transcript_labels(
+                transcript_path,
+                sidecar.get("transcript_lines") or [],
+                restore_target_ids,
+            )
+        except OSError:
+            logger.warning("Could not update canonical transcript during speaker marking")
+            print(json.dumps({
+                "success": False,
+                "error": "Could not update the transcript. Retry the speaker marking.",
+                "cleared_confirmation_from": cleared_from,
+            }))
+            sys.exit(1)
         if (
             previous_transcript_body is not None
             and (restored_lines > 0 or summary_sync_marker is not None)
@@ -6908,6 +6963,49 @@ def _summary_sync_operation_hash(target_ids: set, replacement_label: Optional[st
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _pending_new_person_confirmation_retry(
+    profiles: list,
+    sidecar: dict,
+    meeting_stem: str,
+    channel: str,
+    resolved_id: str,
+    fragment_ids: set,
+    run_id,
+    display_name: str,
+) -> Optional[dict]:
+    """Resolve only the profile created by this exact interrupted request.
+
+    ``--new-person`` normally rejects every duplicate name. The sole exception
+    is a retry whose still-pending marker proves the same name and cluster
+    operation, and whose profile has the matching committed prototype. This
+    keeps the real CLI request idempotent without turning name collisions into
+    a general existing-person lookup.
+    """
+    marker = sidecar.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY)
+    target_ids = {(channel, fragment_id) for fragment_id in fragment_ids}
+    if not (
+        isinstance(marker, dict)
+        and marker.get("version") == _PENDING_SUMMARY_TRANSCRIPT_SYNC_VERSION
+        and marker.get("operation_sha256")
+        == _summary_sync_operation_hash(target_ids, display_name)
+    ):
+        return None
+    candidates = [
+        profile
+        for profile in profiles
+        if profile.get("display_name") == display_name
+        and any(
+            prototype.get("meeting_id") == meeting_stem
+            and prototype.get("channel") == channel
+            and prototype.get("diarization_speaker_id") == resolved_id
+            and prototype.get("diarization_run_id") == run_id
+            and prototype.get("created_from") in {"user_confirmed", "user_corrected"}
+            for prototype in profile.get("prototypes") or []
+        )
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _prepare_summary_transcript_sync(
     output_dir: Path,
     meeting_stem: str,
@@ -7092,7 +7190,7 @@ def _finalize_summary_transcript_sync(
     return None
 
 
-def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
+def _read_saved_transcript_body(transcript_path: Path) -> tuple[Optional[str], bool]:
     """Read the user-facing body from a recorder-written transcript file.
 
     `_write_transcript_file` prefixes metadata and a line of `=` characters.
@@ -7101,9 +7199,11 @@ def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
     """
     try:
         content = transcript_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, False
     except OSError as e:
         logger.warning(f"Could not read {transcript_path} to update summary transcript: {e}")
-        return None
+        return None, True
     lines = content.split("\n")
     separator = (
         next((i for i, line in enumerate(lines[:12]) if re.fullmatch(r"={20,}\s*", line)), None)
@@ -7111,7 +7211,12 @@ def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
         else None
     )
     body = "\n".join(lines[separator + 1:]) if separator is not None else content
-    return body.strip()
+    return body.strip(), False
+
+
+def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
+    body, _io_failed = _read_saved_transcript_body(transcript_path)
+    return body
 
 
 def _update_summary_transcript(

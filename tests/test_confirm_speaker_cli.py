@@ -9,7 +9,11 @@ from click.testing import CliRunner
 
 import simple_recorder
 from src.config import Config
-from src.speaker_suggestions import read_speakers_sidecar, write_speakers_sidecar
+from src.speaker_suggestions import (
+    read_speakers_sidecar,
+    write_sidecar_document,
+    write_speakers_sidecar,
+)
 
 
 def _last_json(output):
@@ -905,17 +909,15 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                     raise OSError("simulated summary write failure")
                 return real_atomic_write(path, text, *args, **kwargs)
 
+            request = [
+                "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
+                "--relabel-transcript",
+            ]
             with mock.patch(
                 "simple_recorder._atomic_write_text",
                 side_effect=fail_first_summary_transcript_write,
             ):
-                first, cfg = self._run(
-                    [
-                        "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Gamma",
-                        "--relabel-transcript",
-                    ],
-                    tmp,
-                )
+                first, cfg = self._run(request, tmp)
 
             first_data = _last_json(first.output)
             self.assertNotEqual(first.exit_code, 0)
@@ -928,17 +930,10 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 read_speakers_sidecar(output_dir, "mtg001"),
             )
 
-            person_id = cfg.get_person_profiles()[0]["person_id"]
-            retry, _ = self._run(
-                [
-                    "mtg001", "mic", "SPEAKER_00", "--person-id", person_id,
-                    "--relabel-transcript",
-                ],
-                tmp,
-                cfg=cfg,
-            )
+            retry, _ = self._run(request, tmp, cfg=cfg)
             retry_data = _last_json(retry.output)
             self.assertTrue(retry_data["success"])
+            self.assertEqual(len(cfg.get_person_profiles()), 1)
             self.assertEqual(retry_data["relabeled_lines"], 0)
             self.assertIn("[Person Gamma] hello there", summary_path.read_text())
             self.assertNotIn("[Speaker 2] hello there", summary_path.read_text())
@@ -946,6 +941,110 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 "pending_summary_transcript_sync",
                 read_speakers_sidecar(output_dir, "mtg001"),
             )
+
+    def test_canonical_transcript_write_failure_reports_json_and_retries_same_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = self._seed_two_cluster_relabel_artifacts(tmp)
+            summary_path.write_text(
+                "## Summary\n\nText.\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] first\n[00:10] [Speaker 3] second\n",
+                encoding="utf-8",
+            )
+            request = [
+                "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                "--relabel-transcript",
+            ]
+            transcript_before = transcript_path.read_text(encoding="utf-8")
+            summary_before = summary_path.read_text(encoding="utf-8")
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
+            real_write_text = Path.write_text
+            transcript_tmp = transcript_path.with_name(transcript_path.name + ".tmp")
+
+            def fail_canonical_tmp_write(path, text, *args, **kwargs):
+                if path == transcript_tmp:
+                    raise OSError("simulated canonical transcript write failure")
+                return real_write_text(path, text, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", new=fail_canonical_tmp_write):
+                failed, cfg = self._run(request, tmp)
+
+            failed_data = _last_json(failed.output)
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(failed_data["success"])
+            profiles = cfg.get_person_profiles()
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(profiles[0]["display_name"], "Person Alpha")
+            self.assertEqual(len(profiles[0]["prototypes"]), 1)
+            committed_person_id = profiles[0]["person_id"]
+            sidecar_after_failure = read_speakers_sidecar(output_dir, "mtg001")
+            marker = sidecar_after_failure["pending_summary_transcript_sync"]
+            expected_sidecar = json.loads(json.dumps(sidecar_before))
+            expected_sidecar["pending_summary_transcript_sync"] = marker
+            expected_sidecar["transcript_lines"][0]["original_label"] = "Speaker 2"
+            self.assertEqual(sidecar_after_failure, expected_sidecar)
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), transcript_before)
+            self.assertEqual(summary_path.read_text(encoding="utf-8"), summary_before)
+            self.assertNotIn("## Participants", summary_before)
+
+            retry, _ = self._run(request, tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertEqual(len(cfg.get_person_profiles()), 1)
+            self.assertEqual(cfg.get_person_profiles()[0]["person_id"], committed_person_id)
+            self.assertNotEqual(
+                read_speakers_sidecar(output_dir, "mtg001").get(
+                    "pending_summary_transcript_sync"
+                ),
+                marker,
+            )
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+            self.assertIn("[00:05] [Person Alpha] first", transcript_path.read_text())
+            self.assertIn("[00:05] [Person Alpha] first", summary_path.read_text())
+            self.assertIn("Person Alpha", summary_path.read_text())
+
+    def test_new_person_retry_does_not_reuse_name_without_matching_cluster_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, _summary_path, _transcript_path = (
+                self._seed_two_cluster_relabel_artifacts(tmp)
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            person = cfg.create_person_profile("Person Alpha")
+            cfg.add_speaker_prototype(
+                person["person_id"],
+                [1.0, 0.0],
+                recording_type="in_person",
+                meeting_id="other-meeting",
+                diarization_speaker_id="SPEAKER_00",
+                speech_duration_seconds=30.0,
+                segment_count=5,
+                created_from="user_confirmed",
+                channel="mic",
+            )
+            sidecar = read_speakers_sidecar(output_dir, "mtg001")
+            sidecar["pending_summary_transcript_sync"] = {
+                "version": 2,
+                "operation_sha256": simple_recorder._summary_sync_operation_hash(
+                    {("mic", "SPEAKER_00")}, "Person Alpha"
+                ),
+            }
+            write_sidecar_document(output_dir, "mtg001", sidecar)
+            profiles_before = cfg.get_person_profiles()
+
+            failed, _ = self._run(
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles(), profiles_before)
 
     def test_relabel_retry_keeps_marker_when_same_second_turns_make_repair_unsafe(self):
         with tempfile.TemporaryDirectory() as tmp:
