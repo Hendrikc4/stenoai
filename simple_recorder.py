@@ -5654,6 +5654,7 @@ def confirm_speaker(
         transcript_path = get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
         previous_transcript_body = _saved_transcript_body(transcript_path)
         turn_manifest = sidecar.get("transcript_lines")
+        retry_relabel_target_ids = None
         if turn_manifest:
             # Exact recorded provenance -- immune to the fuzzy-matching
             # cross-channel/same-channel mislabeling below (see
@@ -5661,6 +5662,7 @@ def confirm_speaker(
             # Phase 8). Only meetings processed after this manifest
             # existed have one; everything else falls back.
             target_ids = {(channel, sid) for sid in [resolved_id, *context.merged_from]}
+            retry_relabel_target_ids = target_ids
             # BEFORE the rename, so the label each line carries today is
             # still readable. Without it, naming a cluster is irreversible
             # in the transcript and marking it as mixed later would leave
@@ -5682,13 +5684,28 @@ def confirm_speaker(
             for fragment_id in [resolved_id, *context.merged_from]:
                 pooled_segments.extend(raw_clusters_by_id.get(fragment_id, {}).get("segments") or [])
             relabeled_lines = relabel_transcript_speaker(transcript_path, pooled_segments, person["display_name"])
-        if relabeled_lines > 0 and previous_transcript_body is not None:
-            _update_summary_transcript(
-                output_dir,
-                meeting_stem,
-                transcript_path,
-                previous_transcript_body,
-            )
+        if previous_transcript_body is not None:
+            if relabeled_lines > 0:
+                _update_summary_transcript(
+                    output_dir,
+                    meeting_stem,
+                    transcript_path,
+                    previous_transcript_body,
+                )
+            elif turn_manifest and retry_relabel_target_ids:
+                # The transcript can be durable while its best-effort summary
+                # write fails. A same-cluster confirmation retry has no newly
+                # relabelled lines, but may safely repair a matching embedded
+                # copy only through exact manifest provenance.
+                _update_summary_transcript(
+                    output_dir,
+                    meeting_stem,
+                    transcript_path,
+                    previous_transcript_body,
+                    restore_manifest=turn_manifest,
+                    restore_target_ids=retry_relabel_target_ids,
+                    retry_relabel_to=person["display_name"],
+                )
 
     # Naming the cluster supersedes "a human kept this generic": the row is
     # now decided, and leaving the marking would have the panel report a
@@ -6076,13 +6093,28 @@ def mark_speaker_cluster(
             sidecar.get("transcript_lines") or [],
             {(channel, fid) for fid in fragment_ids},
         )
-        if restored_lines > 0 and previous_transcript_body is not None:
-            _update_summary_transcript(
-                output_dir,
-                meeting_stem,
-                transcript_path,
-                previous_transcript_body,
-            )
+        if previous_transcript_body is not None:
+            # A prior attempt can have restored the canonical transcript and
+            # then lost the best-effort summary write.  Its retry sees no
+            # newly restored lines, but the old person label can still be in
+            # the summary's embedded transcript.  Repair just labels whose
+            # provenance matches this cluster; never replace user text.
+            if restored_lines > 0:
+                _update_summary_transcript(
+                    output_dir,
+                    meeting_stem,
+                    transcript_path,
+                    previous_transcript_body,
+                )
+            else:
+                _update_summary_transcript(
+                    output_dir,
+                    meeting_stem,
+                    transcript_path,
+                    previous_transcript_body,
+                    restore_manifest=sidecar.get("transcript_lines") or [],
+                    restore_target_ids={(channel, fid) for fid in fragment_ids},
+                )
         _update_summary_participants(
             output_dir, meeting_stem,
             confirmed_participant_names(meeting_stem, config.get_person_profiles()),
@@ -6700,19 +6732,38 @@ def _update_summary_transcript(
     meeting_stem: str,
     transcript_path: Path,
     previous_transcript_body: str,
+    restore_manifest: Optional[list] = None,
+    restore_target_ids: Optional[set] = None,
+    retry_relabel_to: Optional[str] = None,
 ) -> None:
     """Keep a summary's embedded diarised transcript aligned after naming.
 
     The separate transcript is the relabel operation's canonical artifact. An
     embedded copy is replaced only when it still exactly matches the canonical
     body from before relabeling. A user-edited or independently redacted copy is
-    preserved. JSON remains preferred when both summary formats exist, matching
-    the rest of the meeting-store code. Missing or unreadable artifacts are
-    best-effort no-ops because speaker-profile confirmation already succeeded.
+    preserved. When a prior attempt restored the canonical transcript but its
+    summary write failed, a provenance-checked label-only repair can bring the
+    embedded copy forward without replacing its text. JSON remains preferred
+    when both summary formats exist, matching the rest of the meeting-store
+    code. Missing or unreadable artifacts are best-effort no-ops because
+    speaker-profile confirmation already succeeded.
     """
     transcript_body = _saved_transcript_body(transcript_path)
     if not transcript_body:
         return
+
+    def _repair_embedded_labels(embedded_body: str) -> tuple[str, int]:
+        if restore_manifest is None or restore_target_ids is None:
+            return embedded_body, 0
+        from src.speaker_suggestions import restore_transcript_text_labels
+
+        return restore_transcript_text_labels(
+            embedded_body,
+            restore_manifest,
+            restore_target_ids,
+            require_unique_target_timestamps=True,
+            replacement_label=retry_relabel_to,
+        )
 
     json_path = output_dir / f"{meeting_stem}_summary.json"
     md_path = output_dir / f"{meeting_stem}_summary.md"
@@ -6724,11 +6775,23 @@ def _update_summary_transcript(
             logger.warning(f"Could not read {json_path} to update transcript: {e}")
             return
         embedded_body = data.get("diarised_text")
-        if not isinstance(embedded_body, str) or embedded_body.strip() != previous_transcript_body.strip():
+        if not isinstance(embedded_body, str):
             return
-        if embedded_body.strip() == transcript_body:
+        if embedded_body.strip() == previous_transcript_body.strip():
+            replacement_body = transcript_body
+            repaired_labels = False
+        elif restore_manifest is not None and restore_target_ids is not None:
+            replacement_body, restored_lines = _repair_embedded_labels(embedded_body)
+            if restored_lines == 0:
+                return
+            repaired_labels = True
+        else:
             return
-        data["diarised_text"] = transcript_body
+        if repaired_labels and replacement_body.strip() != transcript_body:
+            return
+        if replacement_body.strip() == embedded_body.strip():
+            return
+        data["diarised_text"] = replacement_body
         try:
             _atomic_write_json(json_path, data)
         except OSError as e:
@@ -6763,9 +6826,21 @@ def _update_summary_transcript(
     if section_start is None:
         return
     embedded_body = "\n".join(lines[section_start + 1:section_end]).strip()
-    if embedded_body != previous_transcript_body.strip():
+    if embedded_body == previous_transcript_body.strip():
+        replacement_body = transcript_body
+        repaired_labels = False
+    elif restore_manifest is not None and restore_target_ids is not None:
+        replacement_body, restored_lines = _repair_embedded_labels(embedded_body)
+        if restored_lines == 0:
+            return
+        repaired_labels = True
+    else:
         return
-    new_section = ["## Transcript", "", *transcript_body.split("\n"), ""]
+    if repaired_labels and replacement_body.strip() != transcript_body:
+        return
+    if replacement_body.strip() == embedded_body:
+        return
+    new_section = ["## Transcript", "", *replacement_body.split("\n"), ""]
     spliced = lines[:section_start] + new_section + lines[section_end:]
     if spliced == lines:
         return

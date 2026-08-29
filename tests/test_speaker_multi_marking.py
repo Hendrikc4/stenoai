@@ -1393,6 +1393,188 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
             self.assertNotIn("Person Alpha", transcript.read_text())
             self.assertNotIn("Person Alpha", summary.read_text())
 
+    def test_retry_repairs_summary_after_its_first_write_fails(self):
+        # The first attempt can restore the canonical transcript successfully
+        # but lose the best-effort summary write.  A retry must not use its
+        # zero restored-line count as a reason to leave the stale person name
+        # in the summary's embedded transcript.
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = self._seed_with_transcript(
+                tmp,
+                "[00:05] [Speaker 2] hello there",
+                [{
+                    "start": 5.2,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                }],
+            )
+            summary = Path(tmp) / "output" / "mtg001_summary.md"
+            summary.write_text(
+                "---\ntitle: \"Meeting\"\n---\n\n"
+                "## Summary\n\nText.\n\n"
+                "## Participants\n\nPerson Alpha\n\n"
+                "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+
+            real_atomic_write = simple_recorder._atomic_write_text
+            failed_once = False
+
+            def fail_first_summary_transcript_write(path, text, *args, **kwargs):
+                nonlocal failed_once
+                if path == summary and not failed_once and "[Speaker 2] hello there" in text:
+                    failed_once = True
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text",
+                side_effect=fail_first_summary_transcript_write,
+            ):
+                first = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertTrue(_last_json(first.output)["success"])
+            self.assertTrue(failed_once)
+            self.assertNotIn("Person Alpha", transcript.read_text())
+            self.assertIn("[00:05] [Person Alpha] hello there", summary.read_text())
+
+            retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+            retry_data = _last_json(retry.output)
+            self.assertTrue(retry_data["success"])
+            self.assertEqual(retry_data["transcript_lines_restored"], 0)
+            self.assertIn("[00:05] [Speaker 2] hello there", summary.read_text())
+            self.assertNotIn("Person Alpha", summary.read_text())
+
+    def test_retry_refuses_reordered_summary_turns_sharing_a_timestamp(self):
+        # The manifest retains 5.1 and 5.8, but both are rendered as 00:05.
+        # If a user reorders those summary lines, their marker and position no
+        # longer prove which one belongs to the target cluster.  Repairing the
+        # apparent stale name would otherwise rewrite the other person's line.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            canonical_body = (
+                "[00:05] [Speaker 2] alpha words\n"
+                "[00:05] [Speaker 3] beta words"
+            )
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n" + canonical_body,
+                encoding="utf-8",
+            )
+            summary = output_dir / "mtg001_summary.md"
+            stale_reordered_body = (
+                "[00:05] [Person Beta] beta words\n"
+                "[00:05] [Person Alpha] alpha words"
+            )
+            original_summary = (
+                "## Summary\n\nText.\n\n## Transcript\n\n"
+                f"{stale_reordered_body}\n"
+            )
+            summary.write_text(original_summary, encoding="utf-8")
+            manifest = [
+                {
+                    "start": 5.1,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_A",
+                    "original_label": "Speaker 2",
+                },
+                {
+                    "start": 5.8,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_B",
+                    "original_label": "Speaker 3",
+                },
+            ]
+
+            with self.assertLogs("src.speaker_suggestions", level="WARNING") as logs:
+                simple_recorder._update_summary_transcript(
+                    output_dir,
+                    "mtg001",
+                    transcript_path,
+                    canonical_body,
+                    restore_manifest=manifest,
+                    restore_target_ids={("mic", "SPEAKER_A")},
+                    retry_relabel_to="Person Alpha",
+                )
+
+            self.assertEqual(summary.read_text(encoding="utf-8"), original_summary)
+            self.assertTrue(any("no unique summary marker" in line for line in logs.output))
+
+    def test_retry_refuses_duplicate_summary_marker_when_other_start_is_missing(self):
+        # A missing start is not evidence that the other turn belongs to a
+        # different second.  The stored summary only has [00:05] for both
+        # rows, so the retry cannot prove which reordered row is the target.
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            canonical_body = (
+                "[00:05] [Speaker 2] alpha words\n"
+                "[00:05] [Speaker 3] beta words"
+            )
+            transcript_path.write_text(
+                "Session: mtg001\n\n" + "=" * 60 + "\n\n" + canonical_body,
+                encoding="utf-8",
+            )
+            summary = output_dir / "mtg001_summary.md"
+            original_summary = (
+                "## Summary\n\nText.\n\n## Transcript\n\n"
+                "[00:05] [Person Beta] beta words\n"
+                "[00:05] [Person Alpha] alpha words\n"
+            )
+            summary.write_text(original_summary, encoding="utf-8")
+            manifest = [
+                {
+                    "start": 5.1,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_A",
+                    "original_label": "Speaker 2",
+                },
+                {
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_B",
+                    "original_label": "Speaker 3",
+                },
+            ]
+
+            with self.assertLogs("src.speaker_suggestions", level="WARNING") as logs:
+                simple_recorder._update_summary_transcript(
+                    output_dir,
+                    "mtg001",
+                    transcript_path,
+                    canonical_body,
+                    restore_manifest=manifest,
+                    restore_target_ids={("mic", "SPEAKER_A")},
+                    retry_relabel_to="Person Alpha",
+                )
+
+            self.assertEqual(summary.read_text(encoding="utf-8"), original_summary)
+            self.assertTrue(any("no unique summary marker" in line for line in logs.output))
+
     def test_without_a_recorded_original_the_line_says_multiple_speakers(self):
         # Every meeting confirmed before the original label was recorded has
         # nothing to restore. Putting back "You" or "Speaker 3" would invent
