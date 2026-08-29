@@ -39,10 +39,12 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             },
         })
 
-    def _seed_two_cluster_relabel_artifacts(self, tmp):
+    def _seed_two_cluster_relabel_artifacts(self, tmp, *, same_rendered_timestamp=False):
         output_dir = Path(tmp) / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
-        body = "[00:05] [Speaker 2] first\n[00:10] [Speaker 3] second"
+        second_timestamp = "00:05" if same_rendered_timestamp else "00:10"
+        second_start = 5.8 if same_rendered_timestamp else 10.1
+        body = f"[00:05] [Speaker 2] first\n[{second_timestamp}] [Speaker 3] second"
         summary_path = output_dir / "mtg001_summary.md"
         summary_path.write_text("## Transcript\n\n" + body + "\n", encoding="utf-8")
         write_speakers_sidecar(output_dir, "mtg001", {
@@ -61,7 +63,7 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             },
         }, turn_manifest=[
             {"start": 5.1, "channel": "mic", "diarization_speaker_id": "SPEAKER_00"},
-            {"start": 10.1, "channel": "mic", "diarization_speaker_id": "SPEAKER_01"},
+            {"start": second_start, "channel": "mic", "diarization_speaker_id": "SPEAKER_01"},
         ])
         transcript_path = Path(tmp) / "transcripts" / "mtg001_transcript.txt"
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
@@ -916,7 +918,8 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 )
 
             first_data = _last_json(first.output)
-            self.assertTrue(first_data["success"])
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(first_data["success"])
             self.assertTrue(failed_once)
             self.assertIn("[Person Gamma] hello there", transcript_path.read_text())
             self.assertIn("[Speaker 2] hello there", summary_path.read_text())
@@ -925,9 +928,10 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 read_speakers_sidecar(output_dir, "mtg001"),
             )
 
+            person_id = cfg.get_person_profiles()[0]["person_id"]
             retry, _ = self._run(
                 [
-                    "mtg001", "mic", "SPEAKER_00", "--person-id", first_data["person_id"],
+                    "mtg001", "mic", "SPEAKER_00", "--person-id", person_id,
                     "--relabel-transcript",
                 ],
                 tmp,
@@ -942,6 +946,80 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 "pending_summary_transcript_sync",
                 read_speakers_sidecar(output_dir, "mtg001"),
             )
+
+    def test_relabel_retry_keeps_marker_when_same_second_turns_make_repair_unsafe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = self._seed_two_cluster_relabel_artifacts(
+                tmp, same_rendered_timestamp=True,
+            )
+            stale_body = (
+                "[00:05] [Speaker 2] first\n"
+                "[00:05] [Speaker 3] second"
+            )
+            canonical_body = (
+                "[00:05] [Person Alpha] first\n"
+                "[00:05] [Speaker 3] second"
+            )
+            real_atomic_write = simple_recorder._atomic_write_text
+            failed_once = False
+
+            def fail_first_summary_transcript_write(path, text, *args, **kwargs):
+                nonlocal failed_once
+                if path == summary_path and not failed_once and "[Person Alpha]" in text:
+                    failed_once = True
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text",
+                side_effect=fail_first_summary_transcript_write,
+            ):
+                first, cfg = self._run([
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ], tmp)
+
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(_last_json(first.output)["success"])
+            self.assertTrue(failed_once)
+            self.assertEqual(simple_recorder._saved_transcript_body(transcript_path), canonical_body)
+            self.assertIn(stale_body, summary_path.read_text(encoding="utf-8"))
+            marker = read_speakers_sidecar(output_dir, "mtg001")[
+                "pending_summary_transcript_sync"
+            ]
+            person_id = cfg.get_person_profiles()[0]["person_id"]
+
+            unsafe_retry, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--person-id", person_id,
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertNotEqual(unsafe_retry.exit_code, 0)
+            self.assertFalse(_last_json(unsafe_retry.output)["success"])
+            self.assertEqual(simple_recorder._saved_transcript_body(transcript_path), canonical_body)
+            self.assertIn(stale_body, summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                read_speakers_sidecar(output_dir, "mtg001")[
+                    "pending_summary_transcript_sync"
+                ],
+                marker,
+            )
+
+            summary_path.write_text(
+                "## Transcript\n\n" + canonical_body + "\n",
+                encoding="utf-8",
+            )
+            recovered, _ = self._run([
+                "mtg001", "mic", "SPEAKER_00", "--person-id", person_id,
+                "--relabel-transcript",
+            ], tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(recovered.output)["success"])
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+            self.assertIn(canonical_body, summary_path.read_text(encoding="utf-8"))
 
     def test_relabel_retry_preserves_a_json_copy_with_only_its_label_edited(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -990,7 +1068,8 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 ], tmp)
 
             first_data = _last_json(first.output)
-            self.assertTrue(first_data["success"])
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(first_data["success"])
             edited = json.loads(summary_path.read_text(encoding="utf-8"))
             edited["diarised_text"] = "[00:05] [Person Delta] hello there"
             summary_path.write_text(json.dumps(edited), encoding="utf-8")
@@ -1000,8 +1079,9 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
             self.assertNotIn("hello there", json.dumps(pending))
             self.assertNotIn("Person Gamma", json.dumps(pending))
 
+            person_id = cfg.get_person_profiles()[0]["person_id"]
             retry, _ = self._run([
-                "mtg001", "mic", "SPEAKER_00", "--person-id", first_data["person_id"],
+                "mtg001", "mic", "SPEAKER_00", "--person-id", person_id,
                 "--relabel-transcript",
             ], tmp, cfg=cfg)
 
@@ -1084,7 +1164,7 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                     "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
                     "--relabel-transcript",
                 ], tmp)
-            self.assertTrue(_last_json(first.output)["success"])
+            self.assertFalse(_last_json(first.output)["success"])
 
             second, _ = self._run([
                 "mtg001", "mic", "SPEAKER_01", "--new-person", "Person Beta",
@@ -1267,7 +1347,8 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                     "--relabel-transcript",
                 ], tmp, cfg=cfg)
 
-            self.assertTrue(_last_json(changed.output)["success"])
+            self.assertNotEqual(changed.exit_code, 0)
+            self.assertFalse(_last_json(changed.output)["success"])
             self.assertIn("[Person Beta] hello there", transcript_path.read_text(encoding="utf-8"))
             self.assertIn("[Person Alpha] hello there", summary_path.read_text(encoding="utf-8"))
 

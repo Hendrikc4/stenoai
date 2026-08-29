@@ -5745,13 +5745,19 @@ def confirm_speaker(
                 retry_relabel_to=person["display_name"],
                 sync_marker=summary_sync_marker,
             )
-            if summary_sync_marker is not None and sync_outcome != "io_error":
-                if not _clear_summary_transcript_sync(
-                    output_dir, meeting_stem, summary_sync_marker,
-                ):
+            if summary_sync_marker is not None:
+                finalization_failure = _finalize_summary_transcript_sync(
+                    output_dir, meeting_stem, summary_sync_marker, sync_outcome,
+                )
+                if finalization_failure is not None:
+                    errors = {
+                        "io_error": "Could not update the summary transcript. Retry the confirmation.",
+                        "unsafe": "Could not safely update the summary transcript. Retry the confirmation.",
+                        "clear_error": "Could not finalize the pending transcript update. Retry the confirmation.",
+                    }
                     print(json.dumps({
                         "success": False,
-                        "error": "Could not finalize the pending transcript update. Retry the confirmation.",
+                        "error": errors[finalization_failure],
                     }))
                     sys.exit(1)
 
@@ -6193,13 +6199,19 @@ def mark_speaker_cluster(
                 restore_target_ids=restore_target_ids,
                 sync_marker=summary_sync_marker,
             )
-            if summary_sync_marker is not None and sync_outcome != "io_error":
-                if not _clear_summary_transcript_sync(
-                    output_dir, meeting_stem, summary_sync_marker,
-                ):
+            if summary_sync_marker is not None:
+                finalization_failure = _finalize_summary_transcript_sync(
+                    output_dir, meeting_stem, summary_sync_marker, sync_outcome,
+                )
+                if finalization_failure is not None:
+                    errors = {
+                        "io_error": "Could not update the summary transcript. Retry the speaker marking.",
+                        "unsafe": "Could not safely update the summary transcript. Retry the speaker marking.",
+                        "clear_error": "Could not finalize the pending transcript update. Retry the speaker marking.",
+                    }
                     print(json.dumps({
                         "success": False,
-                        "error": "Could not finalize the pending transcript update. Retry the speaker marking.",
+                        "error": errors[finalization_failure],
                         "cleared_confirmation_from": cleared_from,
                     }))
                     sys.exit(1)
@@ -7012,6 +7024,31 @@ def _clear_summary_transcript_sync(
     return True
 
 
+def _finalize_summary_transcript_sync(
+    output_dir: Path,
+    meeting_stem: str,
+    marker: dict,
+    sync_outcome: str,
+) -> Optional[str]:
+    """Consume a pending marker only after an unambiguously safe outcome.
+
+    I/O failures and ambiguous provenance remain retryable and visible to the
+    caller. Unexpected outcomes fail closed rather than silently discarding
+    the only durable evidence that can authorize a later repair.
+    """
+    safe_outcomes = {"updated", "complete", "diverged", "missing"}
+    if sync_outcome not in safe_outcomes:
+        if sync_outcome not in {"io_error", "unsafe"}:
+            logger.warning(
+                "Unexpected summary transcript sync outcome for %s",
+                meeting_stem,
+            )
+        return "io_error" if sync_outcome == "io_error" else "unsafe"
+    if not _clear_summary_transcript_sync(output_dir, meeting_stem, marker):
+        return "clear_error"
+    return None
+
+
 def _saved_transcript_body(transcript_path: Path) -> Optional[str]:
     """Read the user-facing body from a recorder-written transcript file.
 
@@ -7051,8 +7088,8 @@ def _update_summary_transcript(
     body from before relabeling. A retry additionally needs the crash-safe hash
     marker written before that first canonical change. Manifest/timestamps alone
     are never authority to overwrite a divergent copy. The return value lets the
-    caller retain the marker only for I/O failures and clear it after a completed
-    update or a deliberate user-edit no-op.
+    caller retain the marker for I/O failures or ambiguous provenance and clear
+    it only after a completed update or a deliberate user-edit no-op.
     """
     transcript_body = _saved_transcript_body(transcript_path)
     if not transcript_body:

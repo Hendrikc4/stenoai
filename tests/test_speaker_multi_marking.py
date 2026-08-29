@@ -1224,13 +1224,13 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 "a negative earned by a DIFFERENT cluster is not this marking's to delete",
             )
 
-    def _seed_with_transcript(self, tmp, body, manifest):
+    def _seed_with_transcript(self, tmp, body, manifest, *, clusters=None):
         output_dir = Path(tmp) / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
         write_speakers_sidecar(output_dir, "mtg001", {
             "mic": {
                 "recording_type": "in_person",
-                "clusters": {
+                "clusters": clusters or {
                     "SPEAKER_00": {
                         "embedding": [1.0, 0.0], "speech_duration_seconds": 30.0,
                         "segment_count": 5, "segments": [{"start": 4.0, "end": 6.0}],
@@ -1530,7 +1530,7 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
 
     def test_retry_repairs_summary_after_its_first_write_fails(self):
         # The first attempt can restore the canonical transcript successfully
-        # but lose the best-effort summary write.  A retry must not use its
+        # but lose the summary write. A retry must not use its
         # zero restored-line count as a reason to leave the stale person name
         # in the summary's embedded transcript.
         with tempfile.TemporaryDirectory() as tmp:
@@ -1584,7 +1584,8 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     cfg=cfg,
                 )
 
-            self.assertTrue(_last_json(first.output)["success"])
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(_last_json(first.output)["success"])
             self.assertTrue(failed_once)
             self.assertNotIn("Person Alpha", transcript.read_text())
             self.assertIn("[00:05] [Person Alpha] hello there", summary.read_text())
@@ -1608,6 +1609,130 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 "pending_summary_transcript_sync",
                 read_speakers_sidecar(Path(tmp) / "output", "mtg001"),
             )
+
+    def test_mark_retry_keeps_marker_when_same_second_turns_make_repair_unsafe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            generic_body = (
+                "[00:05] [Speaker 2] alpha words\n"
+                "[00:05] [Speaker 3] beta words"
+            )
+            named_body = (
+                "[00:05] [Person Alpha] alpha words\n"
+                "[00:05] [Speaker 3] beta words"
+            )
+            manifest = [
+                {
+                    "start": 5.1,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_00",
+                },
+                {
+                    "start": 5.8,
+                    "channel": "mic",
+                    "diarization_speaker_id": "SPEAKER_01",
+                },
+            ]
+            clusters = {
+                "SPEAKER_00": {
+                    "embedding": [1.0, 0.0],
+                    "speech_duration_seconds": 30.0,
+                    "segment_count": 5,
+                    "segments": [{"start": 4.0, "end": 6.0}],
+                },
+                "SPEAKER_01": {
+                    "embedding": [0.0, 1.0],
+                    "speech_duration_seconds": 25.0,
+                    "segment_count": 4,
+                    "segments": [{"start": 5.5, "end": 7.0}],
+                },
+            }
+            transcript = self._seed_with_transcript(
+                tmp, generic_body, manifest, clusters=clusters,
+            )
+            output_dir = Path(tmp) / "output"
+            summary = output_dir / "mtg001_summary.md"
+            summary.write_text(
+                "## Transcript\n\n" + generic_body + "\n",
+                encoding="utf-8",
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            confirmed = self._run(
+                simple_recorder.confirm_speaker,
+                [
+                    "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                    "--relabel-transcript",
+                ],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(confirmed.output)["success"])
+            self.assertEqual(simple_recorder._saved_transcript_body(transcript), named_body)
+
+            real_atomic_write = simple_recorder._atomic_write_text
+            failed_once = False
+
+            def fail_first_summary_transcript_write(path, text, *args, **kwargs):
+                nonlocal failed_once
+                if path == summary and not failed_once and "[Speaker 2] alpha words" in text:
+                    failed_once = True
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text",
+                side_effect=fail_first_summary_transcript_write,
+            ):
+                first = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(_last_json(first.output)["success"])
+            self.assertTrue(failed_once)
+            self.assertEqual(simple_recorder._saved_transcript_body(transcript), generic_body)
+            self.assertIn(named_body, summary.read_text(encoding="utf-8"))
+            marker = read_speakers_sidecar(output_dir, "mtg001")[
+                "pending_summary_transcript_sync"
+            ]
+
+            unsafe_retry = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertNotEqual(unsafe_retry.exit_code, 0)
+            self.assertFalse(_last_json(unsafe_retry.output)["success"])
+            self.assertEqual(simple_recorder._saved_transcript_body(transcript), generic_body)
+            self.assertIn(named_body, summary.read_text(encoding="utf-8"))
+            self.assertEqual(
+                read_speakers_sidecar(output_dir, "mtg001")[
+                    "pending_summary_transcript_sync"
+                ],
+                marker,
+            )
+
+            summary.write_text(
+                "## Transcript\n\n" + generic_body + "\n",
+                encoding="utf-8",
+            )
+            recovered = self._run(
+                simple_recorder.mark_speaker_cluster,
+                ["mtg001", "mic", "SPEAKER_00"],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertTrue(_last_json(recovered.output)["success"])
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+            self.assertIn(generic_body, summary.read_text(encoding="utf-8"))
 
     def test_retry_preserves_a_summary_with_only_its_label_edited(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1653,7 +1778,8 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                     cfg=cfg,
                 )
 
-            self.assertTrue(_last_json(first.output)["success"])
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertFalse(_last_json(first.output)["success"])
             self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
             summary.write_text(
                 "## Summary\n\nText.\n\n"
