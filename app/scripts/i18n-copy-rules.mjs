@@ -48,6 +48,12 @@ export const COPY_ATTRIBUTES = [
   'submitLabel',
 ];
 
+/** Every ESLint rule whose findings make up the blocking per-file ratchet. */
+export const I18N_GATE_RULE_IDS = [
+  'i18next/no-literal-string',
+  'steno-i18n/no-interpolated-literal',
+];
+
 /**
  * JSX props whose NAME sounds like copy but whose value is data, an id, or a handler.
  *
@@ -144,7 +150,9 @@ const SVG_PATH = /^[MmLlHhVvCcSsQqTtAaZz][\d\s,.eE+-]{8,}/;
 /** Strings that are structurally technical: ids, keys, paths, CSS, URLs, class names. */
 const TECHNICAL_PATTERNS = [
   /^https?:\/\//i,
-  /^[./~]/, // paths and relative imports
+  // Real path prefixes only. A bare leading `~` is also ordinary approximation copy
+  // (`~572 MB`), so treating the character alone as a path silently dropped visible text.
+  /^(?:\.{1,2}[\\/]|~[\\/]|[\\/]{1,2}|[A-Za-z]:[\\/])/, // relative, home, root/UNC, drive
   /^--/, // CSS custom properties
   /^[a-z]+([A-Z][a-z0-9]*)+$/, // camelCase identifiers
   /^[A-Z0-9]+(_[A-Z0-9]+)+$/, // SCREAMING_SNAKE_CASE

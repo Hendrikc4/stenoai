@@ -186,20 +186,22 @@ elsewhere would land unseen.
 **Two checks, run per PR (`npm run lint:i18n`, `npm run i18n:inventory`):**
 
 - **No new hardcoded copy.** `renderer/eslint.config.i18n.mjs` runs
-  `i18next/no-literal-string` at `error` over JSX text and the copy-bearing attributes —
+  `i18next/no-literal-string` plus the local interpolated-template rule at `error` over
+  JSX text and the copy-bearing attributes -
   the DOM ones (`placeholder`, `title`, `alt`, `aria-label`) and this app's own component
   props (`label`, `description`, `hint`, `confirmLabel`, …), which carry ~170 sites of
   visible copy. It is a *separate* config from
   `eslint.config.mjs` on purpose: a codebase with no i18n yet trips it hundreds of times,
-  and folding those 713 into the main lint run would make it permanently red — which this repo
+  and folding those 761 into the main lint run would make it permanently red - which this repo
   has already seen end in four react-hooks rules downgraded to `warn`, where they are now
   write-only. Instead `app/scripts/i18n-lint-gate.mjs` compares per-file counts against
   `renderer/i18n-lint-baseline.json` and fails on any divergence, in both directions: a
   higher count is new hardcoded copy, a lower one is progress that should be committed
   (`npm run lint:i18n:update`) so the burn-down number stays honest.
 - **The English copy inventory.** `app/scripts/i18n-copy-inventory.mjs` extracts every
-  English string the renderer shows into `docs/i18n/copy-inventory.json` (1122 `copy` +
-  1108 `uncertain`, repeated copy recorded per occurrence). It blocks nothing; it
+  English string the renderer shows into `docs/i18n/copy-inventory.json` (1260 `copy` +
+  1140 `uncertain`, repeated copy recorded per occurrence). Interpolations use stable
+  `{{…}}` placeholders so expression renames do not create copy churn. It blocks nothing; it
   witnesses. The review rule for an i18n migration is then one sentence: *the inventory
   diff must show strings moving, never changing.* Afterwards it keeps working as a copy
   changelog — an intentional wording change shows up as a one-file diff in the PR that

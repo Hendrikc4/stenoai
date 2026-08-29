@@ -135,6 +135,18 @@ export function collectFromSource(file) {
     if (accept(text)) record(text, certain);
   };
 
+  // Preserve the wording around interpolations while making the result independent of the
+  // expression spelling. Renaming `minimumSpeakers` must not look like a copy change, but
+  // changing "people spoke" must. One stable placeholder per expression gives the review
+  // diff exactly that contract: `At least {{…}} people spoke`.
+  const addTemplate = (node, accept, certain = false) => {
+    if (!ts.isTemplateExpression(node)) return;
+    const text = normalize(
+      node.templateSpans.reduce((out, span) => `${out}{{…}}${span.literal.text}`, node.head.text)
+    );
+    if (accept(text)) record(text, certain);
+  };
+
   const walk = (node) => {
     if (isStructural(node)) return;
 
@@ -152,6 +164,7 @@ export function collectFromSource(file) {
         // Covers `title="Copy"` and `title={cond ? 'Hide' : 'Show'}` alike.
         const walkAttr = (n) => {
           addLiteral(n, isCopy, true);
+          addTemplate(n, isCopy, true);
           ts.forEachChild(n, walkAttr);
         };
         walkAttr(node.initializer);
@@ -179,6 +192,7 @@ export function collectFromSource(file) {
           return;
         }
         addLiteral(n, isCopy, true);
+        addTemplate(n, isCopy, true);
         ts.forEachChild(n, walkChild);
       };
       ts.forEachChild(node, walkChild);
@@ -187,6 +201,7 @@ export function collectFromSource(file) {
 
     // Everything else: a literal anywhere in the file, kept unless provably not copy.
     addLiteral(node, (text) => !definitelyNotCopy(text));
+    addTemplate(node, (text) => !definitelyNotCopy(text));
     ts.forEachChild(node, walk);
   };
   walk(source);

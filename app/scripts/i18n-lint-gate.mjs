@@ -26,7 +26,7 @@ import { ESLint } from 'eslint';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { toPosixPath } from './i18n-copy-rules.mjs';
+import { I18N_GATE_RULE_IDS, toPosixPath } from './i18n-copy-rules.mjs';
 
 const APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG = path.join(APP_DIR, 'renderer/eslint.config.i18n.mjs');
@@ -46,7 +46,7 @@ for (const r of results) {
   for (const m of r.messages) {
     if (m.fatal) fatal.push(`${toPosixPath(path.relative(APP_DIR, r.filePath))}:${m.line ?? '?'} ${m.message}`);
   }
-  const n = r.messages.filter((m) => m.ruleId === 'i18next/no-literal-string').length;
+  const n = r.messages.filter((m) => I18N_GATE_RULE_IDS.includes(m.ruleId)).length;
   // POSIX keys so the checked-in baseline matches on Windows too.
   if (n > 0) counts[toPosixPath(path.relative(APP_DIR, r.filePath))] = n;
 }
@@ -67,7 +67,7 @@ if (update) {
     BASELINE,
     JSON.stringify({ total, files: sorted }, null, 2) + '\n'
   );
-  console.log(`i18n gate: baseline updated — ${total} literal(s) in ${Object.keys(sorted).length} file(s).`);
+  console.log(`i18n gate: baseline updated — ${total} hardcoded string(s) in ${Object.keys(sorted).length} file(s).`);
   process.exit(0);
 }
 
@@ -88,7 +88,7 @@ for (const file of new Set([...Object.keys(base), ...Object.keys(counts)])) {
 }
 
 if (raised.length === 0 && lowered.length === 0) {
-  console.log(`i18n gate: ok — ${total} known literal(s) in ${Object.keys(counts).length} file(s), none added.`);
+  console.log(`i18n gate: ok — ${total} known hardcoded string(s) in ${Object.keys(counts).length} file(s), none added.`);
   process.exit(0);
 }
 

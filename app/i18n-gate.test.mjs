@@ -25,7 +25,8 @@ async function flagged(jsx) {
   const [result] = await eslint.lintText(source, {
     filePath: path.join(APP_DIR, 'renderer/src/__fixture__.tsx'),
   });
-  return (result?.messages ?? []).filter((m) => m.ruleId === 'i18next/no-literal-string');
+  const { I18N_GATE_RULE_IDS } = await import('./scripts/i18n-copy-rules.mjs');
+  return (result?.messages ?? []).filter((m) => I18N_GATE_RULE_IDS.includes(m.ruleId));
 }
 
 test('flags ordinary user-facing JSX text', async () => {
@@ -289,6 +290,21 @@ test('copy-bearing component props are gated, not just DOM attributes', async ()
   assert.equal(structural.length, 0);
 });
 
+test('interpolated copy is blocked by the real JSX linter', async () => {
+  for (const jsx of [
+    '    <span>{`At least ${count} people spoke`}</span>',
+    '    <button aria-label={`Delete ${name}`} />',
+    '    <SettingRow description={`Connected to ${provider}`} />',
+  ]) {
+    const messages = await flagged(jsx);
+    assert.equal(messages.length, 1, `expected interpolated copy to be flagged: ${jsx}`);
+    assert.equal(messages[0].ruleId, 'steno-i18n/no-interpolated-literal');
+  }
+
+  const structural = await flagged('    <span className={`size-${size} flex`} />');
+  assert.equal(structural.length, 0, 'an interpolated structural attribute must stay out');
+});
+
 test('the copy partition holds the contract, uncertain holds the safety net', async () => {
   // `copy` is what a migration diff must hold string-for-string; `uncertain` is recall
   // insurance, so a styling PR that only moves uncertain lines is a five-second read.
@@ -362,6 +378,53 @@ test('a switch body is inventoried, only the case label is skipped', async () =>
     assert.ok(![...copy, ...uncertain].includes('saved'), 'the case label itself is structure');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the real extractor records interpolated copy with stable placeholders', async () => {
+  const { collectFromSource } = await import('./scripts/i18n-copy-inventory.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'i18n-gate-'));
+  try {
+    const file = path.join(dir, 'Template.tsx');
+    fs.writeFileSync(
+      file,
+      `export function C({ count, capacity, name }) {
+         return <div title={\`Delete \${name}\`}>
+           {\`At least \${count} people spoke, but only \${capacity} were distinct.\`}
+         </div>;
+       }`
+    );
+    const { copy } = collectFromSource(file);
+    assert.ok(copy.includes('Delete {{…}}'));
+    assert.ok(copy.includes('At least {{…}} people spoke, but only {{…}} were distinct.'));
+
+    fs.writeFileSync(
+      file,
+      `export function C({ renamedCount, renamedCapacity, renamedName }) {
+         return <div title={\`Delete \${renamedName}\`}>
+           {\`At least \${renamedCount} people spoke, but only \${renamedCapacity} were distinct.\`}
+         </div>;
+       }`
+    );
+    assert.deepEqual(collectFromSource(file).copy, copy, 'expression renames are not copy changes');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('approximate sizes are copy while real path prefixes remain technical', () => {
+  for (const copy of ['~572 MB', '~670 MB']) {
+    assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
+  }
+  for (const pathLike of [
+    '~/Library/Application Support',
+    './relative/path',
+    '../parent/path',
+    '/absolute/path',
+    'C:\\Users\\alice',
+    '\\\\server\\share',
+  ]) {
+    assert.ok(definitelyNotCopy(pathLike), `expected path: ${JSON.stringify(pathLike)}`);
   }
 });
 
