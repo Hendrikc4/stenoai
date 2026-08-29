@@ -185,6 +185,7 @@ test('lowercase copy containing a number is kept', async () => {
     // marker test alone was satisfied and the string fell out. None of them is a
     // utility class, which is what now tells the two apart.
     'v2 beta3',
+    'v2 active',
     '1080p 60fps',
   ]) {
     assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
@@ -197,9 +198,34 @@ test('lowercase copy containing a number is kept', async () => {
     'absolute inset-0 bg-ink-900/40 backdrop-blur-sm',
     'px-2 py-1.5 text-sm',
     'gap-1.5 rounded-full',
+    '2xl:grid grid-cols-2',
   ]) {
     assert.ok(definitelyNotCopy(markup), `expected NOT copy: ${JSON.stringify(markup)}`);
   }
+});
+
+test('bare numeric status copy stays in the combined gate', async () => {
+  for (const copy of ['2 active', '3 active']) {
+    assert.ok(!definitelyNotCopy(copy), `expected copy: ${JSON.stringify(copy)}`);
+    assert.ok(readsAsCopy(copy), `expected copy contract: ${JSON.stringify(copy)}`);
+  }
+
+  await assertCombinedCopyGate({
+    label: 'rendered numeric status identifier',
+    beforeCopy: '2 active',
+    afterCopy: '3 active',
+    beforeSource: `export function C() { const status = '2 active'; return <span>{status}</span>; }`,
+    afterSource: `export function C() { const status = '3 active'; return <span>{status}</span>; }`,
+  });
+
+  await assertCombinedCopyGate({
+    label: 'direct numeric ReactNode action',
+    expectedLint: 1,
+    beforeCopy: '2 active',
+    afterCopy: '3 active',
+    beforeSource: `export function C() { return <SectionHead action="2 active" />; }`,
+    afterSource: `export function C() { return <SectionHead action="3 active" />; }`,
+  });
 });
 
 test('lowercase copy with a hyphenated word is kept; class lists are still rejected', async () => {

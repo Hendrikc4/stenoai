@@ -194,6 +194,12 @@ const BARE_UTILITIES = new Set([
 
 const utilityShaped = (token) => UTILITY_PREFIX.test(token) || BARE_UTILITIES.has(token);
 
+// A bare number is ordinary copy context ("2 active"), not utility syntax. Digits only
+// strengthen the markup signal when they are attached to a class-shaped token such as
+// `mt-2`; brackets, variants and fractions are independently conclusive markers.
+const hasMarkupMarker = (token) =>
+  /[:[\]/]/.test(token) || (/\d/.test(token) && (token.includes('-') || utilityShaped(token)));
+
 // Tailwind variants decorate, but do not change, the underlying utility. Peel only
 // conventional lowercase or bracketed variants so prose containing a colon cannot be
 // mistaken for markup merely because one word happens to resemble a utility.
@@ -210,7 +216,7 @@ const readsAsUtilityClassList = (tokens) =>
   tokens.length > 1 &&
   tokens.every((token) => !/\p{Lu}/u.test(token)) &&
   tokens.every((token) => utilityShaped(utilityBase(token))) &&
-  tokens.some((token) => /[-:[\]/]/.test(token) || /\d/.test(token));
+  tokens.some(hasMarkupMarker);
 
 const CSS_LIKE = [
   /^[a-z-]+\([^)]*\)$/i, // var(--fg-1), rotate(90deg), translateY(-2px)
@@ -245,8 +251,8 @@ export function definitelyNotCopy(text) {
   // single hyphenated word but rejected the whole string as soon as a second token
   // followed, which threw away the same words in a sentence: "sign-in required" was
   // dropped just like "flex items-center". Markup now has to prove itself twice over —
-  // either a token carries a digit, bracket, slash or colon, or EVERY token comes from
-  // the utility vocabulary below.
+  // either a token carries a bracket, slash, colon or an attached utility-style digit,
+  // or EVERY token comes from the utility vocabulary below.
   //
   // That vocabulary is a reject list, so its gaps fail safe: an unrecognised class prefix
   // means the string is recorded as `uncertain`, which is noise. An unrecognised English
@@ -268,13 +274,12 @@ export function definitelyNotCopy(text) {
   // longer look like markup and are recorded. That is noise in a generated file, which is
   // what this file's inverted burden of proof asks us to prefer over a dropped string.
   const tokens = trimmed.split(/\s+/);
-  const markupShaped = (token) => /[:[\]/]/.test(token) || /\d/.test(token);
   const classListShaped = (token) => /^[a-z0-9[\]:/._%-]+$/.test(token);
   if (
     !/\p{Lu}/u.test(trimmed) &&
     tokens.every(classListShaped) &&
-    tokens.every((t) => utilityShaped(t) || markupShaped(t)) &&
-    tokens.some((t) => markupShaped(t) || t.includes('-')) &&
+    tokens.every((t) => utilityShaped(t) || hasMarkupMarker(t)) &&
+    tokens.some((t) => hasMarkupMarker(t) || t.includes('-')) &&
     tokens.some(utilityShaped)
   ) {
     return true;
