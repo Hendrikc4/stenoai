@@ -201,12 +201,12 @@ const hasMarkupMarker = (token) =>
   /[:[\]/]/.test(token) || (/\d/.test(token) && (token.includes('-') || utilityShaped(token)));
 
 // Tailwind variants decorate, but do not change, the underlying utility. Peel only
-// conventional lowercase or bracketed variants so prose containing a colon cannot be
-// mistaken for markup merely because one word happens to resemble a utility.
+// conventional lowercase/alphanumeric or bracketed variants so prose containing a colon
+// cannot be mistaken for markup merely because one word resembles a utility.
 const utilityBase = (token) => {
   let base = token;
   let match;
-  while ((match = base.match(/^(?:[a-z-]+|\[[^\]]+\]):/))) {
+  while ((match = base.match(/^(?:[a-z][a-z0-9-]*|[0-9]+xl|\[[^\]]+\]):/))) {
     base = base.slice(match[0].length);
   }
   return base;

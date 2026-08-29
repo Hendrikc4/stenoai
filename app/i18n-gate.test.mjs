@@ -843,6 +843,7 @@ test('real utility lists never become contractual copy while ordinary phrases do
     'mt-2 block',
     'h-[30px] bg-[color:var(--surface-raised)] text-[13px]',
     'h-[30px] min-w-[150px] rounded-[6px] bg-[color:var(--surface-raised)] px-2.5 py-0 text-[13px]',
+    '2xl:grid 2xl:gap-4',
   ];
   const { definitelyNotCopy, readsAsCopy } = await import('./scripts/i18n-copy-rules.mjs');
   for (const utility of utilities) {
