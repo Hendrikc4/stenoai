@@ -370,6 +370,8 @@ test('interpolated copy is blocked by the real JSX linter', async () => {
 test('purely dynamic JSX templates are not treated as hardcoded copy', async () => {
   for (const jsx of [
     '    <span>{`${done} / ${total}`}</span>',
+    '    <SectionHead action={`${user.first} ${user.last}`} />',
+    '    <SectionHead action={`${first}, ${last}`} />',
     '    <span>{`${dynamicTitle}`}</span>',
     '    <SettingRow description={`${completed} / ${available}`} />',
   ]) {
