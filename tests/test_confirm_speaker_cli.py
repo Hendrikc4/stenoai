@@ -945,6 +945,56 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                 read_speakers_sidecar(output_dir, "mtg001"),
             )
 
+    def test_noncanonical_existing_name_uses_one_canonical_retry_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = (
+                self._seed_two_cluster_relabel_artifacts(tmp)
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            person = cfg.create_person_profile("Alice")
+            cfg._config["person_profiles"][0]["display_name"] = "\uff21\uff4c\uff49\uff43\uff45"
+            self.assertTrue(cfg._save())
+            request = [
+                "mtg001", "mic", "SPEAKER_00", "--person-id", person["person_id"],
+                "--relabel-transcript",
+            ]
+            real_atomic_write = simple_recorder._atomic_write_text
+            failed_once = False
+
+            def fail_first_summary_write(path, text, *args, **kwargs):
+                nonlocal failed_once
+                if path == summary_path and not failed_once:
+                    failed_once = True
+                    raise OSError("simulated summary write failure")
+                return real_atomic_write(path, text, *args, **kwargs)
+
+            with mock.patch(
+                "simple_recorder._atomic_write_text", side_effect=fail_first_summary_write,
+            ):
+                first, _ = self._run(request, tmp, cfg=cfg)
+
+            self.assertNotEqual(first.exit_code, 0)
+            self.assertTrue(failed_once)
+            self.assertIn("[Alice] first", transcript_path.read_text(encoding="utf-8"))
+            self.assertNotIn("\uff21\uff4c\uff49\uff43\uff45", transcript_path.read_text(encoding="utf-8"))
+            marker = read_speakers_sidecar(output_dir, "mtg001")[
+                "pending_summary_transcript_sync"
+            ]
+            self.assertEqual(
+                marker["operation_sha256"],
+                simple_recorder._summary_sync_operation_hash({("mic", "SPEAKER_00")}, "Alice"),
+            )
+            self.assertEqual(cfg.get_person_profile(person["person_id"])["display_name"], "Alice")
+
+            retry, _ = self._run(request, tmp, cfg=cfg)
+
+            self.assertTrue(_last_json(retry.output)["success"])
+            self.assertIn("[Alice] first", summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "pending_summary_transcript_sync",
+                read_speakers_sidecar(output_dir, "mtg001"),
+            )
+
     def test_legacy_relabel_summary_io_failure_retries_same_new_person_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "output"
@@ -1196,6 +1246,40 @@ class ConfirmSpeakerCliTests(unittest.TestCase):
                     "mtg001", "mic", "SPEAKER_00", "--person-id", person["person_id"],
                     "--relabel-transcript",
                 ],
+                tmp,
+                cfg=cfg,
+            )
+
+            self.assertNotEqual(failed.exit_code, 0)
+            self.assertFalse(_last_json(failed.output)["success"])
+            self.assertEqual(cfg.get_person_profiles(), profiles_before)
+            self.assertEqual(read_speakers_sidecar(output_dir, "mtg001"), sidecar_before)
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), transcript_before)
+            self.assertEqual(summary_path.read_text(encoding="utf-8"), summary_before)
+
+    def test_corrupt_neighbouring_reserved_you_profile_fails_before_confirmation_mutation(self):
+        """A persisted lookalike of the reserved self label cannot become
+        hard-negative or participant evidence during a different confirm."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir, summary_path, transcript_path = (
+                self._seed_two_cluster_relabel_artifacts(tmp)
+            )
+            cfg = Config(config_path=Path(tmp) / "config.json")
+            first, cfg = self._run(
+                ["mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha"],
+                tmp,
+                cfg=cfg,
+            )
+            self.assertTrue(_last_json(first.output)["success"])
+            cfg._config["person_profiles"][0]["display_name"] = "\uff39\uff4f\uff55"
+            self.assertTrue(cfg._save())
+            profiles_before = cfg.get_person_profiles()
+            sidecar_before = read_speakers_sidecar(output_dir, "mtg001")
+            transcript_before = transcript_path.read_text(encoding="utf-8")
+            summary_before = summary_path.read_text(encoding="utf-8")
+
+            failed, _ = self._run(
+                ["mtg001", "mic", "SPEAKER_01", "--new-person", "Person Beta"],
                 tmp,
                 cfg=cfg,
             )

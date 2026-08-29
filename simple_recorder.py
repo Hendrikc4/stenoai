@@ -5456,11 +5456,22 @@ def confirm_speaker(
         sys.exit(1)
     target_ids = {(channel, sid) for sid in fragment_ids}
     try:
+        profiles = config.get_person_profiles()
+        # Every confirmed profile from this meeting can participate in the
+        # evidence and Participants updates below. Do not let a persisted
+        # reserved/self lookalike become biometric or display evidence just
+        # because it is adjacent to, rather than selected by, this confirm.
+        for existing_profile in profiles:
+            if any(
+                prototype.get("meeting_id") == meeting_stem
+                for prototype in (existing_profile.get("prototypes") or [])
+            ):
+                validate_display_name(existing_profile.get("display_name"))
         if new_person:
             normalized_new_person = validate_display_name(new_person)
             retry_person = (
                 _pending_new_person_confirmation_retry(
-                    config.get_person_profiles(),
+                    profiles,
                     sidecar,
                     meeting_stem,
                     channel,
@@ -5487,6 +5498,27 @@ def confirm_speaker(
             intended_display_name = validate_display_name(
                 selected_person.get("display_name"),
             )
+            if selected_person.get("display_name") != intended_display_name:
+                # Keep the durable profile and every operation artefact on
+                # the same canonical spelling. Without this, the pending
+                # marker hashes the validated value while transcript writes
+                # use the raw persisted spelling, making an otherwise exact
+                # retry look like a foreign operation.
+                if not config.rename_person_profile(person_id, intended_display_name):
+                    config.rollback_transaction()
+                    print(json.dumps({
+                        "success": False,
+                        "error": "Could not normalize the person profile.",
+                    }))
+                    sys.exit(1)
+                selected_person = config.get_person_profile(person_id)
+                if selected_person is None:
+                    config.rollback_transaction()
+                    print(json.dumps({
+                        "success": False,
+                        "error": f"No person profile with id {person_id!r}",
+                    }))
+                    sys.exit(1)
     except ValueError as error:
         config.rollback_transaction()
         print(json.dumps({"success": False, "error": str(error)}))
@@ -6183,6 +6215,16 @@ def mark_speaker_cluster(
     legacy_display_names = set()
     try:
         profiles = config.get_person_profiles()
+        # A confirmation can update hard-negative evidence and Participants
+        # for another confirmed profile in this meeting. Validate all of
+        # those profiles before either a mixed mark or a --single clear
+        # changes durable state.
+        for person in profiles:
+            if any(
+                prototype.get("meeting_id") == meeting_stem
+                for prototype in (person.get("prototypes") or [])
+            ):
+                validate_display_name(person.get("display_name"))
         for person in profiles:
             if not any(
                 prototype.get("meeting_id") == meeting_stem
@@ -6198,8 +6240,34 @@ def mark_speaker_cluster(
     except ValueError as error:
         print(json.dumps({"success": False, "error": str(error)}))
         sys.exit(1)
-    pending_marker = sidecar.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY)
     legacy_target_ids = {(channel, fid) for fid in fragment_ids}
+    pending_transcript_path = (
+        get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
+    )
+    if not _reconcile_pending_summary_transcript_sync(
+        output_dir,
+        meeting_stem,
+        pending_transcript_path,
+        legacy_target_ids,
+        None,
+        # A --single clear is never the recovery operation that wrote a
+        # pending marker. It must finalize a proved-complete marker or fail
+        # closed, rather than clearing the mixed state underneath it.
+        allow_operation_retry=multiple,
+    ):
+        print(json.dumps({
+            "success": False,
+            "error": "Could not safely reconcile a pending transcript update.",
+        }))
+        sys.exit(1)
+    sidecar = store.read(meeting_stem)
+    if not isinstance(sidecar, dict):
+        print(json.dumps({
+            "success": False,
+            "error": "The speaker analysis is missing or invalid.",
+        }))
+        sys.exit(1)
+    pending_marker = sidecar.get(_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY)
     if (
         not sidecar.get("transcript_lines")
         and isinstance(pending_marker, dict)
@@ -6217,17 +6285,21 @@ def mark_speaker_cluster(
             }))
             sys.exit(1)
         unresolved_hashes = set(label_hashes)
-        for person in profiles:
-            try:
+        try:
+            for person in profiles:
+                # Legacy markers contain the validated canonical name. Validate before
+                # comparing hashes so valid non-canonical Unicode names can reconcile.
+                # Do not skip malformed or reserved neighbouring profiles.
                 display_name = validate_display_name(person.get("display_name"))
-            except ValueError:
-                continue
-            display_name_hash = hashlib.sha256(
-                display_name.encode("utf-8"),
-            ).hexdigest()
-            if display_name_hash in unresolved_hashes:
-                legacy_display_names.add(display_name)
-                unresolved_hashes.remove(display_name_hash)
+                display_name_hash = hashlib.sha256(
+                    display_name.encode("utf-8"),
+                ).hexdigest()
+                if display_name_hash in unresolved_hashes:
+                    legacy_display_names.add(display_name)
+                    unresolved_hashes.remove(display_name_hash)
+        except ValueError as error:
+            print(json.dumps({"success": False, "error": str(error)}))
+            sys.exit(1)
         if unresolved_hashes:
             print(json.dumps({
                 "success": False,
@@ -6271,18 +6343,6 @@ def mark_speaker_cluster(
                 }))
                 sys.exit(1)
         else:
-            if not _reconcile_pending_summary_transcript_sync(
-                output_dir,
-                meeting_stem,
-                prepared_transcript_path,
-                prepared_restore_target_ids,
-                None,
-            ):
-                print(json.dumps({
-                    "success": False,
-                    "error": "Could not safely reconcile a pending transcript update.",
-                }))
-                sys.exit(1)
             if sidecar.get("transcript_lines"):
                 expected_transcript_body, _ = restore_transcript_text_labels(
                     prepared_transcript_body,
