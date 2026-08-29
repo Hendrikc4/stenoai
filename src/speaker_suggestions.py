@@ -1217,38 +1217,13 @@ def relabel_transcript_speaker(
         logger.warning("Could not read transcript %s for relabeling: %s", transcript_path, e)
         return 0
 
-    lines = original.split("\n")
-    new_lines = []
-    changed = 0
-    for line in lines:
-        match = _TRANSCRIPT_LINE_RE.match(line)
-        if not match:
-            new_lines.append(line)
-            continue
-        timestamp_str, label, text = match.groups()
-        if label == "You":
-            new_lines.append(line)
-            continue
-        try:
-            timestamp_seconds = _parse_transcript_timestamp(timestamp_str)
-        except ValueError:
-            new_lines.append(line)
-            continue
-        in_range = any(
-            seg.get("start", 0) - RELABEL_TIMESTAMP_TOLERANCE_SECONDS
-            <= timestamp_seconds
-            <= seg.get("end", 0) + RELABEL_TIMESTAMP_TOLERANCE_SECONDS
-            for seg in segments
-        )
-        if in_range and label != display_name:
-            new_lines.append(f"[{timestamp_str}] [{display_name}] {text}")
-            changed += 1
-        else:
-            new_lines.append(line)
+    relabeled_text, changed = relabel_transcript_text_speaker(
+        original, segments, display_name,
+    )
 
     if changed:
         tmp_path = transcript_path.with_name(transcript_path.name + ".tmp")
-        tmp_path.write_text("\n".join(new_lines), encoding="utf-8")
+        tmp_path.write_text(relabeled_text, encoding="utf-8")
         tmp_path.replace(transcript_path)
     return changed
 
@@ -1534,6 +1509,9 @@ def restore_transcript_text_labels(
                 continue
             if (entry.get("channel"), entry.get("diarization_speaker_id")) not in target_ids:
                 continue
+            current_label = _TRANSCRIPT_LINE_RE.match(lines[indices[index]]).group(2)
+            if replacement_label is not None and current_label == "You":
+                continue
             start = entry.get("start")
             if not isinstance(start, (int, float)) or not math.isfinite(start):
                 logger.warning(
@@ -1560,6 +1538,8 @@ def restore_transcript_text_labels(
         if (entry.get("channel"), entry.get("diarization_speaker_id")) not in target_ids:
             continue
         timestamp_str, label, text = _TRANSCRIPT_LINE_RE.match(lines[line_idx]).groups()
+        if replacement_label is not None and label == "You":
+            continue
         if replacement_label is not None:
             restored = replacement_label
         else:
@@ -1573,6 +1553,40 @@ def restore_transcript_text_labels(
         lines[line_idx] = f"[{timestamp_str}] [{restored}] {text}"
         changed += 1
 
+    return "\n".join(lines), changed
+
+
+def relabel_transcript_text_speaker(
+    transcript_text: str,
+    segments: list,
+    display_name: str,
+) -> tuple[str, int]:
+    """Apply the legacy segment-based relabeling rules to in-memory text."""
+    if not segments:
+        return transcript_text, 0
+
+    lines = transcript_text.split("\n")
+    changed = 0
+    for index, line in enumerate(lines):
+        match = _TRANSCRIPT_LINE_RE.match(line)
+        if not match:
+            continue
+        timestamp_str, label, text = match.groups()
+        if label == "You":
+            continue
+        try:
+            timestamp_seconds = _parse_transcript_timestamp(timestamp_str)
+        except ValueError:
+            continue
+        in_range = any(
+            seg.get("start", 0) - RELABEL_TIMESTAMP_TOLERANCE_SECONDS
+            <= timestamp_seconds
+            <= seg.get("end", 0) + RELABEL_TIMESTAMP_TOLERANCE_SECONDS
+            for seg in segments
+        )
+        if in_range and label != display_name:
+            lines[index] = f"[{timestamp_str}] [{display_name}] {text}"
+            changed += 1
     return "\n".join(lines), changed
 
 

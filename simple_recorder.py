@@ -5352,6 +5352,7 @@ def confirm_speaker(
         record_original_labels,
         relabel_transcript_exact,
         relabel_transcript_speaker,
+        relabel_transcript_text_speaker,
         restore_transcript_text_labels,
     )
 
@@ -5445,6 +5446,7 @@ def confirm_speaker(
     prepared_turn_manifest = None
     prepared_relabel_target_ids = None
     prepared_summary_sync_marker = None
+    summary_sync_outcome = None
 
     if not config.begin_transaction():
         print(json.dumps({
@@ -5482,7 +5484,7 @@ def confirm_speaker(
             print(json.dumps({"success": False, "error": f"No person profile with id {person_id!r}"}))
             sys.exit(1)
 
-    if relabel_transcript and sidecar.get("transcript_lines"):
+    if relabel_transcript:
         prepared_transcript_path = (
             get_data_dirs()["transcripts"] / f"{meeting_stem}_transcript.txt"
         )
@@ -5512,12 +5514,27 @@ def confirm_speaker(
             }))
             sys.exit(1)
         if prepared_transcript_body is not None:
-            expected_transcript_body, _ = restore_transcript_text_labels(
-                prepared_transcript_body,
-                prepared_turn_manifest,
-                target_ids,
-                replacement_label=person["display_name"],
-            )
+            if prepared_turn_manifest:
+                expected_transcript_body, _ = restore_transcript_text_labels(
+                    prepared_transcript_body,
+                    prepared_turn_manifest,
+                    target_ids,
+                    replacement_label=person["display_name"],
+                )
+            else:
+                raw_clusters_by_id = channel_data.get("clusters") or {}
+                pooled_segments = [
+                    segment
+                    for fragment_id in [resolved_id, *context.merged_from]
+                    for segment in (
+                        raw_clusters_by_id.get(fragment_id, {}).get("segments") or []
+                    )
+                ]
+                expected_transcript_body, _ = relabel_transcript_text_speaker(
+                    prepared_transcript_body,
+                    pooled_segments,
+                    person["display_name"],
+                )
             summary_sync_ready, prepared_summary_sync_marker = (
                 _prepare_summary_transcript_sync(
                     output_dir,
@@ -5526,6 +5543,7 @@ def confirm_speaker(
                     expected_transcript_body,
                     target_ids,
                     person["display_name"],
+                    whole_copy_retry=not bool(prepared_turn_manifest),
                 )
             )
             if not summary_sync_ready:
@@ -5536,29 +5554,36 @@ def confirm_speaker(
                 }))
                 sys.exit(1)
 
-        # Only persist reversible transcript provenance after the pending
-        # marker is durable. A marker failure must leave the sidecar, profile,
-        # transcript, summary and Participants state exactly as they were.
-        try:
-            record_original_labels(
-                output_dir,
-                meeting_stem,
-                prepared_transcript_path,
-                target_ids,
-                lock_held=True,
-            )
-        except OSError as error:
-            config.rollback_transaction()
-            logger.warning("Could not record transcript provenance for %s: %s", meeting_stem, error)
-            print(json.dumps({
-                "success": False,
-                "error": "Could not prepare the transcript update. Retry the confirmation.",
-            }))
-            sys.exit(1)
-        refreshed_sidecar = store.read(meeting_stem)
-        if isinstance(refreshed_sidecar, dict):
-            sidecar = refreshed_sidecar
-            prepared_turn_manifest = sidecar.get("transcript_lines") or prepared_turn_manifest
+        if prepared_turn_manifest:
+            # Only persist reversible transcript provenance after the pending
+            # marker is durable. A marker failure must leave the sidecar,
+            # profile, transcript, summary and Participants state unchanged.
+            try:
+                record_original_labels(
+                    output_dir,
+                    meeting_stem,
+                    prepared_transcript_path,
+                    target_ids,
+                    lock_held=True,
+                )
+            except OSError as error:
+                config.rollback_transaction()
+                logger.warning(
+                    "Could not record transcript provenance for %s: %s",
+                    meeting_stem,
+                    error,
+                )
+                print(json.dumps({
+                    "success": False,
+                    "error": "Could not prepare the transcript update. Retry the confirmation.",
+                }))
+                sys.exit(1)
+            refreshed_sidecar = store.read(meeting_stem)
+            if isinstance(refreshed_sidecar, dict):
+                sidecar = refreshed_sidecar
+                prepared_turn_manifest = (
+                    sidecar.get("transcript_lines") or prepared_turn_manifest
+                )
         prepared_relabel_target_ids = target_ids
 
     # Reassignment: if this exact cluster (or one of its merged fragments)
@@ -5810,21 +5835,7 @@ def confirm_speaker(
                 retry_relabel_to=person["display_name"],
                 sync_marker=summary_sync_marker,
             )
-            if summary_sync_marker is not None:
-                finalization_failure = _finalize_summary_transcript_sync(
-                    output_dir, meeting_stem, summary_sync_marker, sync_outcome,
-                )
-                if finalization_failure is not None:
-                    errors = {
-                        "io_error": "Could not update the summary transcript. Retry the confirmation.",
-                        "unsafe": "Could not safely update the summary transcript. Retry the confirmation.",
-                        "clear_error": "Could not finalize the pending transcript update. Retry the confirmation.",
-                    }
-                    print(json.dumps({
-                        "success": False,
-                        "error": errors[finalization_failure],
-                    }))
-                    sys.exit(1)
+            summary_sync_outcome = sync_outcome
 
     # Naming the cluster supersedes "a human kept this generic": the row is
     # now decided, and leaving the marking would have the panel report a
@@ -5838,12 +5849,48 @@ def confirm_speaker(
         current_run_token,
         lock_held=True,
     )
+    review_state_cleared = _cluster_review_state_is_clear(
+        store.read(meeting_stem), channel, fragment_ids,
+    )
 
     # Cheap and always-safe (unlike transcript relabeling, no reason to
     # gate this behind a flag) -- keeps the meeting's Participants chip in
     # sync with every confirm, including plain CLI/backfill-validation use.
     participant_names = confirmed_participant_names(meeting_stem, config.get_person_profiles())
-    _update_summary_participants(output_dir, meeting_stem, participant_names)
+    participants_updated = _update_summary_participants(
+        output_dir, meeting_stem, participant_names,
+    )
+
+    if prepared_summary_sync_marker is not None:
+        if not review_state_cleared:
+            print(json.dumps({
+                "success": False,
+                "error": "Could not clear the speaker review state. Retry the confirmation.",
+            }))
+            sys.exit(1)
+        if not participants_updated:
+            print(json.dumps({
+                "success": False,
+                "error": "Could not update summary participants. Retry the confirmation.",
+            }))
+            sys.exit(1)
+        finalization_failure = _finalize_summary_transcript_sync(
+            output_dir,
+            meeting_stem,
+            prepared_summary_sync_marker,
+            summary_sync_outcome or "unsafe",
+        )
+        if finalization_failure is not None:
+            errors = {
+                "io_error": "Could not update the summary transcript. Retry the confirmation.",
+                "unsafe": "Could not safely update the summary transcript. Retry the confirmation.",
+                "clear_error": "Could not finalize the pending transcript update. Retry the confirmation.",
+            }
+            print(json.dumps({
+                "success": False,
+                "error": errors[finalization_failure],
+            }))
+            sys.exit(1)
 
     print(json.dumps({
         "success": True,
@@ -6101,6 +6148,8 @@ def mark_speaker_cluster(
     prepared_transcript_body = None
     prepared_restore_target_ids = None
     prepared_summary_sync_marker = None
+    summary_sync_outcome = None
+    review_state_cleared = True
 
     if multiple and fragment_ids and sidecar.get("transcript_lines"):
         prepared_transcript_path = (
@@ -6261,6 +6310,9 @@ def mark_speaker_cluster(
             current_run_token,
             lock_held=True,
         )
+        review_state_cleared = _cluster_review_state_is_clear(
+            store.read(meeting_stem), channel, fragment_ids,
+        )
         # Derive the readable artefacts from durable state on every attempt.
         # A previous attempt can commit profile cleanup and then fail its
         # sidecar write. Retrying then has no newly-cleared person to report,
@@ -6304,26 +6356,44 @@ def mark_speaker_cluster(
                 restore_target_ids=restore_target_ids,
                 sync_marker=summary_sync_marker,
             )
-            if summary_sync_marker is not None:
-                finalization_failure = _finalize_summary_transcript_sync(
-                    output_dir, meeting_stem, summary_sync_marker, sync_outcome,
-                )
-                if finalization_failure is not None:
-                    errors = {
-                        "io_error": "Could not update the summary transcript. Retry the speaker marking.",
-                        "unsafe": "Could not safely update the summary transcript. Retry the speaker marking.",
-                        "clear_error": "Could not finalize the pending transcript update. Retry the speaker marking.",
-                    }
-                    print(json.dumps({
-                        "success": False,
-                        "error": errors[finalization_failure],
-                        "cleared_confirmation_from": cleared_from,
-                    }))
-                    sys.exit(1)
-        _update_summary_participants(
+            summary_sync_outcome = sync_outcome
+        participants_updated = _update_summary_participants(
             output_dir, meeting_stem,
             confirmed_participant_names(meeting_stem, config.get_person_profiles()),
         )
+        if prepared_summary_sync_marker is not None:
+            if not review_state_cleared:
+                print(json.dumps({
+                    "success": False,
+                    "error": "Could not clear the speaker review state. Retry the speaker marking.",
+                    "cleared_confirmation_from": cleared_from,
+                }))
+                sys.exit(1)
+            if not participants_updated:
+                print(json.dumps({
+                    "success": False,
+                    "error": "Could not update summary participants. Retry the speaker marking.",
+                    "cleared_confirmation_from": cleared_from,
+                }))
+                sys.exit(1)
+            finalization_failure = _finalize_summary_transcript_sync(
+                output_dir,
+                meeting_stem,
+                prepared_summary_sync_marker,
+                summary_sync_outcome or "unsafe",
+            )
+            if finalization_failure is not None:
+                errors = {
+                    "io_error": "Could not update the summary transcript. Retry the speaker marking.",
+                    "unsafe": "Could not safely update the summary transcript. Retry the speaker marking.",
+                    "clear_error": "Could not finalize the pending transcript update. Retry the speaker marking.",
+                }
+                print(json.dumps({
+                    "success": False,
+                    "error": errors[finalization_failure],
+                    "cleared_confirmation_from": cleared_from,
+                }))
+                sys.exit(1)
 
     print(json.dumps({
         "success": True,
@@ -7019,6 +7089,8 @@ def _prepare_summary_transcript_sync(
     expected_transcript_body: str,
     target_ids: set,
     replacement_label: Optional[str],
+    *,
+    whole_copy_retry: bool = False,
 ) -> tuple[bool, Optional[dict]]:
     """Persist exact pre-write provenance for an interrupted operation.
 
@@ -7064,6 +7136,8 @@ def _prepare_summary_transcript_sync(
         "canonical_after_sha256": _transcript_body_hash(expected_transcript_body),
         "operation_sha256": operation_hash,
     }
+    if whole_copy_retry:
+        marker["recovery_mode"] = "whole_copy"
 
     def persist(document):
         document[_PENDING_SUMMARY_TRANSCRIPT_SYNC_KEY] = marker
@@ -7175,6 +7249,26 @@ def _clear_summary_transcript_sync(
     return True
 
 
+def _cluster_review_state_is_clear(
+    sidecar: Optional[dict],
+    channel: str,
+    diarization_speaker_ids: set,
+) -> bool:
+    """Verify that every raw cluster in a completed merged-row action is clear."""
+    if not isinstance(sidecar, dict):
+        return False
+    channels = sidecar.get("channels")
+    channel_data = channels.get(channel) if isinstance(channels, dict) else None
+    clusters = channel_data.get("clusters") if isinstance(channel_data, dict) else None
+    if not isinstance(clusters, dict):
+        return False
+    for speaker_id in diarization_speaker_ids:
+        cluster = clusters.get(speaker_id)
+        if not isinstance(cluster, dict) or cluster.get("review_state") is not None:
+            return False
+    return True
+
+
 def _finalize_summary_transcript_sync(
     output_dir: Path,
     meeting_stem: str,
@@ -7274,6 +7368,17 @@ def _update_summary_transcript(
             == _transcript_body_hash(embedded_body)
         )
 
+    def _marker_allows_whole_copy_retry(
+        summary_format: str,
+        embedded_body: str,
+    ) -> bool:
+        return bool(
+            _marker_allows_retry(summary_format, embedded_body)
+            and sync_marker.get("recovery_mode") == "whole_copy"
+            and sync_marker.get("canonical_after_sha256")
+            == _transcript_body_hash(transcript_body)
+        )
+
     def _repair_embedded_labels(embedded_body: str) -> tuple[str, int]:
         if restore_manifest is None or restore_target_ids is None:
             return embedded_body, 0
@@ -7302,6 +7407,9 @@ def _update_summary_transcript(
         if embedded_body == transcript_body:
             return "complete"
         if embedded_body == previous_transcript_body:
+            replacement_body = transcript_body
+            repaired_labels = False
+        elif _marker_allows_whole_copy_retry("json", embedded_body):
             replacement_body = transcript_body
             repaired_labels = False
         elif (
@@ -7360,6 +7468,9 @@ def _update_summary_transcript(
     if embedded_body == previous_transcript_body:
         replacement_body = transcript_body
         repaired_labels = False
+    elif _marker_allows_whole_copy_retry("md", embedded_body):
+        replacement_body = transcript_body
+        repaired_labels = False
     elif (
         restore_manifest is not None
         and restore_target_ids is not None
@@ -7387,7 +7498,11 @@ def _update_summary_transcript(
     return "updated"
 
 
-def _update_summary_participants(output_dir: Path, meeting_stem: str, participant_names: list) -> None:
+def _update_summary_participants(
+    output_dir: Path,
+    meeting_stem: str,
+    participant_names: list,
+) -> bool:
     """Overwrite {meeting_stem}_summary.{json,md}'s participants with
     `participant_names` (a full replace, not an append -- so a later
     Change/rename/delete on the person-profile side stays in sync the next
@@ -7395,7 +7510,8 @@ def _update_summary_participants(output_dir: Path, meeting_stem: str, participan
     both exist, matching list_meetings' convention. Silently no-ops if
     neither summary file exists (a meeting can be deleted out from under a
     stale sidecar) -- this is a best-effort enhancement on a successful
-    confirm/rename/delete, never something that should fail the caller.
+    confirm/rename/delete. Returns whether the existing Summary was safely
+    updated or already current; a missing Summary is also a successful no-op.
     """
     json_path = output_dir / f"{meeting_stem}_summary.json"
     md_path = output_dir / f"{meeting_stem}_summary.md"
@@ -7406,20 +7522,24 @@ def _update_summary_participants(output_dir: Path, meeting_stem: str, participan
                 data = json.load(f)
         except (OSError, ValueError) as e:
             logger.warning(f"Could not read {json_path} to update participants: {e}")
-            return
+            return False
         if data.get("participants") == participant_names:
-            return
+            return True
         data["participants"] = participant_names
-        _atomic_write_json(json_path, data)
-        return
+        try:
+            _atomic_write_json(json_path, data)
+        except OSError as e:
+            logger.warning(f"Could not write {json_path} to update participants: {e}")
+            return False
+        return True
 
     if not md_path.exists():
-        return
+        return True
     try:
         original = md_path.read_text(encoding="utf-8")
     except OSError as e:
         logger.warning(f"Could not read {md_path} to update participants: {e}")
-        return
+        return False
 
     lines = original.split("\n")
     # Locate an existing "## Participants" section's span (header line plus
@@ -7475,14 +7595,19 @@ def _update_summary_participants(output_dir: Path, meeting_stem: str, participan
             # needed here, or every insertion would leave a double blank.
             spliced = lines[:summary_end] + new_section + lines[summary_end:]
     else:
-        return  # nothing to add, nothing to remove
+        return True  # nothing to add, nothing to remove
 
     if spliced == lines:
-        return
+        return True
 
     tmp_path = md_path.with_name(md_path.name + ".tmp")
-    tmp_path.write_text("\n".join(spliced), encoding="utf-8")
-    tmp_path.replace(md_path)
+    try:
+        tmp_path.write_text("\n".join(spliced), encoding="utf-8")
+        tmp_path.replace(md_path)
+    except OSError as e:
+        logger.warning(f"Could not write {md_path} to update participants: {e}")
+        return False
+    return True
 
 
 @cli.command(name='backfill-speaker-embeddings')

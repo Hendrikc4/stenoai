@@ -1942,6 +1942,113 @@ class MarkSpeakerClusterCliTests(unittest.TestCase):
                 read_speakers_sidecar(Path(tmp) / "output", "mtg001"),
             )
 
+    def test_mark_retry_marker_survives_review_or_participants_followup_failure(self):
+        for failure_stage in ("review_state", "participants"):
+            with self.subTest(failure_stage=failure_stage), tempfile.TemporaryDirectory() as tmp:
+                transcript = self._seed_with_transcript(
+                    tmp,
+                    "[00:05] [Speaker 2] hello there",
+                    [{
+                        "start": 5.2,
+                        "channel": "mic",
+                        "diarization_speaker_id": "SPEAKER_00",
+                    }],
+                )
+                output_dir = Path(tmp) / "output"
+                summary = output_dir / "mtg001_summary.md"
+                summary.write_text(
+                    "## Summary\n\nText.\n\n"
+                    "## Transcript\n\n[00:05] [Speaker 2] hello there\n",
+                    encoding="utf-8",
+                )
+                cfg = Config(config_path=Path(tmp) / "config.json")
+                confirmed = self._run(
+                    simple_recorder.confirm_speaker,
+                    [
+                        "mtg001", "mic", "SPEAKER_00", "--new-person", "Person Alpha",
+                        "--relabel-transcript",
+                    ],
+                    tmp,
+                    cfg=cfg,
+                )
+                self.assertTrue(_last_json(confirmed.output)["success"])
+                set_cluster_review_state(
+                    output_dir,
+                    "mtg001",
+                    "mic",
+                    "SPEAKER_00",
+                    REVIEW_STATE_GENERIC,
+                )
+
+                if failure_stage == "review_state":
+                    failure_patch = mock.patch(
+                        "src.speaker_suggestions.clear_cluster_review_state",
+                        return_value=0,
+                    )
+                else:
+                    real_write_text = Path.write_text
+                    summary_tmp = summary.with_name(summary.name + ".tmp")
+
+                    def fail_participants_write(path, text, *args, **kwargs):
+                        if path == summary_tmp and "## Participants" not in text:
+                            raise OSError("simulated participants write failure")
+                        return real_write_text(path, text, *args, **kwargs)
+
+                    failure_patch = mock.patch.object(
+                        Path,
+                        "write_text",
+                        new=fail_participants_write,
+                    )
+
+                with failure_patch:
+                    failed = self._run(
+                        simple_recorder.mark_speaker_cluster,
+                        ["mtg001", "mic", "SPEAKER_00"],
+                        tmp,
+                        cfg=cfg,
+                    )
+
+                self.assertNotEqual(failed.exit_code, 0)
+                self.assertFalse(_last_json(failed.output)["success"])
+                self.assertEqual(cfg.get_person_profiles()[0]["prototypes"], [])
+                sidecar_after_failure = read_speakers_sidecar(output_dir, "mtg001")
+                self.assertTrue(
+                    sidecar_after_failure["channels"]["mic"]["clusters"]["SPEAKER_00"][
+                        MULTI_SPEAKER_KEY
+                    ]
+                )
+                self.assertIn("pending_summary_transcript_sync", sidecar_after_failure)
+                self.assertNotIn("Person Alpha", transcript.read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    "[00:05] [Person Alpha] hello there",
+                    summary.read_text(encoding="utf-8"),
+                )
+                if failure_stage == "review_state":
+                    self.assertEqual(
+                        sidecar_after_failure["channels"]["mic"]["clusters"][
+                            "SPEAKER_00"
+                        ][REVIEW_STATE_KEY],
+                        REVIEW_STATE_GENERIC,
+                    )
+                else:
+                    self.assertIn("Person Alpha", summary.read_text(encoding="utf-8"))
+
+                retry = self._run(
+                    simple_recorder.mark_speaker_cluster,
+                    ["mtg001", "mic", "SPEAKER_00"],
+                    tmp,
+                    cfg=cfg,
+                )
+
+                self.assertTrue(_last_json(retry.output)["success"])
+                sidecar_after_retry = read_speakers_sidecar(output_dir, "mtg001")
+                self.assertNotIn("pending_summary_transcript_sync", sidecar_after_retry)
+                self.assertNotIn(
+                    REVIEW_STATE_KEY,
+                    sidecar_after_retry["channels"]["mic"]["clusters"]["SPEAKER_00"],
+                )
+                self.assertNotIn("Person Alpha", summary.read_text(encoding="utf-8"))
+
     def test_mark_retry_keeps_marker_when_same_second_turns_make_repair_unsafe(self):
         with tempfile.TemporaryDirectory() as tmp:
             generic_body = (
