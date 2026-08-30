@@ -6810,8 +6810,10 @@ const MIC_MONITOR_HEALTHY_RESET_MS = 30_000;
 // Browsers route media capture through helper sub-processes (Safari →
 // com.apple.WebKit.GPU, Chrome → com.google.Chrome.helper, etc.), so the raw
 // app_name reads as "Safari Graphics and Media" / "Google Chrome Helper".
-// Translate those back to the user-recognisable parent app name.
+// FaceTime, Phone.app and Continuity calls use the daemon "avconferenced".
+// Translate both back to the user-recognisable parent app name.
 const APP_NAME_OVERRIDES = [
+  { match: /^com\.apple\.avconferenced/, name: 'Call' },
   { match: /^com\.apple\.WebKit/, name: 'Safari' },
   { match: /^com\.google\.Chrome/, name: 'Google Chrome' },
   { match: /^org\.chromium\./, name: 'Chromium' },
