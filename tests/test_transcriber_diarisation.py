@@ -43,6 +43,7 @@ from src.transcriber import (
     _merge_close_diar_segments,
     _parse_channels_from_ffmpeg_stderr,
     _parse_duration_from_ffmpeg_stderr,
+    _reconcile_cross_channel_speakers,
     _resolve_speaker_placeholders,
     _run_steno_diarize,
     _terminate_process_tree,
@@ -1358,6 +1359,84 @@ class ResolveSpeakerPlaceholdersTests(unittest.TestCase):
         # Same placeholder key reuses the same number on a later turn.
         self.assertEqual(resolved[3], (3.0, "Speaker 2", "d", "mic", "SPEAKER_1"))
         # channel/raw_sid pass through untouched -- only label is rewritten.
+
+
+class ReconcileCrossChannelSpeakersTests(unittest.TestCase):
+    @staticmethod
+    def _cluster(embedding):
+        return {
+            "embedding": embedding,
+            "speech_duration_seconds": 10.0,
+            "segment_count": 2,
+        }
+
+    def test_merges_unambiguous_pairs_and_keeps_post_bleed_dominant_channel(self):
+        mic_clusters = {
+            "SPEAKER_0": self._cluster([1.0, 0.0, 0.0]),
+            "SPEAKER_1": self._cluster([0.0, 1.0, 0.0]),
+            "SPEAKER_2": self._cluster([0.0, 0.0, 1.0]),
+        }
+        system_clusters = {
+            "SPEAKER_0": self._cluster([1.0, 0.0, 0.0]),
+            "SPEAKER_1": self._cluster([0.0, 0.0, 1.0]),
+            "SPEAKER_2": self._cluster([0.0, 1.0, 0.0]),
+        }
+        tagged = [
+            (0.0, "You", "the longer direct local turn", "mic", "SPEAKER_0"),
+            (1.0, "Others", "echo", "system", "SPEAKER_0"),
+            (2.0, "__diar__You__SPEAKER_1", "echo", "mic", "SPEAKER_1"),
+            (3.0, "__diar__Others__SPEAKER_2", "the longer direct remote turn", "system", "SPEAKER_2"),
+            (4.0, "__diar__You__SPEAKER_2", "small", "mic", "SPEAKER_2"),
+            (5.0, "__diar__Others__SPEAKER_1", "another longer remote turn", "system", "SPEAKER_1"),
+        ]
+
+        reconciled, mic_out, system_out = _reconcile_cross_channel_speakers(
+            tagged, mic_clusters, system_clusters,
+        )
+
+        self.assertEqual(
+            reconciled,
+            [
+                (0.0, "You", "the longer direct local turn", "mic", "SPEAKER_0"),
+                (1.0, "You", "echo", "mic", "SPEAKER_0"),
+                (2.0, "__diar__Others__SPEAKER_2", "echo", "system", "SPEAKER_2"),
+                (3.0, "__diar__Others__SPEAKER_2", "the longer direct remote turn", "system", "SPEAKER_2"),
+                (4.0, "__diar__Others__SPEAKER_1", "small", "system", "SPEAKER_1"),
+                (5.0, "__diar__Others__SPEAKER_1", "another longer remote turn", "system", "SPEAKER_1"),
+            ],
+        )
+        self.assertEqual(set(mic_out), {"SPEAKER_0"})
+        self.assertEqual(set(system_out), {"SPEAKER_1", "SPEAKER_2"})
+        resolved = _resolve_speaker_placeholders(reconciled)
+        self.assertEqual({turn[1] for turn in resolved}, {"You", "Speaker 2", "Speaker 3"})
+
+    def test_ambiguous_near_ties_are_not_merged(self):
+        mic_clusters = {"SPEAKER_0": self._cluster([1.0, 0.0])}
+        system_clusters = {
+            "SPEAKER_0": self._cluster([1.0, 0.0]),
+            "SPEAKER_1": self._cluster([1.0, 0.0]),
+        }
+        tagged = [
+            (0.0, "You", "mic", "mic", "SPEAKER_0"),
+            (1.0, "Others", "system a", "system", "SPEAKER_0"),
+            (2.0, "__diar__Others__SPEAKER_1", "system b", "system", "SPEAKER_1"),
+        ]
+
+        result = _reconcile_cross_channel_speakers(tagged, mic_clusters, system_clusters)
+
+        self.assertEqual(result, (tagged, mic_clusters, system_clusters))
+
+    def test_unrelated_cross_channel_clusters_are_not_merged(self):
+        mic_clusters = {"SPEAKER_0": self._cluster([1.0, 0.0])}
+        system_clusters = {"SPEAKER_0": self._cluster([0.0, 1.0])}
+        tagged = [
+            (0.0, "You", "mic", "mic", "SPEAKER_0"),
+            (1.0, "Others", "system", "system", "SPEAKER_0"),
+        ]
+
+        result = _reconcile_cross_channel_speakers(tagged, mic_clusters, system_clusters)
+
+        self.assertEqual(result, (tagged, mic_clusters, system_clusters))
 
 
 class AssembleDiarisedTurnsTests(unittest.TestCase):

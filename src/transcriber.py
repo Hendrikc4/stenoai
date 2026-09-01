@@ -45,6 +45,7 @@ from typing import Callable, Optional, Tuple
 
 from src._heartbeat import _emit_heartbeat
 from src.speaker_suggestions import (
+    SAME_MEETING_MERGE_DISTANCE_THRESHOLD,
     SUGGESTION_MIN_AVG_TURN_SECONDS,
     build_clusters_from_diarization,
     determine_recording_type,
@@ -129,6 +130,14 @@ RMS_MAX_WINDOWS = 60
 # misattribution in _assign_asr_segments_to_diar_segments. Matches the value
 # validated against real meeting audio in the research playground.
 STENO_DIARIZE_MERGE_GAP_S = 0.3
+
+# Cross-channel echo can make the same voice appear in both independent
+# diarization runs. Only merge mutual-nearest embedding pairs that are as
+# tight as the already-validated same-meeting fragment threshold, and whose
+# runner-up is clearly worse. The margin prevents two acoustically similar
+# speakers from being joined merely because both fall below the distance
+# cutoff.
+CROSS_CHANNEL_SPEAKER_MATCH_MARGIN = 0.05
 
 # Floor for the steno-diarize subprocess timeout. Real measured runtime
 # varies a lot with recording length: single-digit-to-tens-of-seconds for
@@ -1427,9 +1436,10 @@ def _resolve_speaker_placeholders(
     channels merged and time-sorted — so a reader sees new speakers
     introduced as 2, 3, 4... regardless of which channel they came from.
 
-    No cross-channel identity matching: a mic placeholder and a system
-    placeholder are always treated as different people — telling them
-    apart would need voiceprint embeddings, out of scope here.
+    Cross-channel echo copies have already been conservatively unified by
+    _reconcile_cross_channel_speakers when embeddings made that possible.
+    Any placeholders still distinct here are intentionally numbered as
+    different people.
 
     `channel` and `raw_diarization_speaker_id` pass through untouched —
     only `label` is ever rewritten here.
@@ -1445,6 +1455,141 @@ def _resolve_speaker_placeholders(
             label = numbering[label]
         resolved.append((start, label, text, channel, raw_sid))
     return resolved
+
+
+def _reconcile_cross_channel_speakers(
+    tagged: list[tuple[float, str, str, str, Optional[str]]],
+    mic_clusters: dict,
+    system_clusters: dict,
+) -> tuple[list[tuple[float, str, str, str, Optional[str]]], dict, dict]:
+    """Collapse unambiguous mic/system copies of the same acoustic speaker.
+
+    Bleed correction removes duplicate ASR segments, but acoustic diarization
+    still runs against each complete channel WAV. With speakers playing aloud,
+    Sortformer can therefore discover the same leaked voice independently in
+    both channels. Without this reconciliation, placeholder resolution turns
+    those channel-local IDs into two visible people and speaker review exposes
+    two rows for one person.
+
+    WeSpeaker centroids from the same recording are safe enough for a narrow,
+    conservative merge: require a mutual-nearest pair at or below the existing
+    same-meeting fragment threshold and a clear runner-up margin on both sides.
+    The channel retaining more post-bleed transcript text is canonical. Alias
+    turns inherit its label and provenance, and the duplicate sidecar cluster
+    is removed. Ambiguous, malformed, or unmatched clusters stay untouched.
+    """
+    if not tagged or not mic_clusters or not system_clusters:
+        return tagged, mic_clusters, system_clusters
+
+    from src.voiceprint import cosine_distance
+
+    distances: dict[tuple[str, str], float] = {}
+    for mic_sid, mic_cluster in mic_clusters.items():
+        mic_embedding = mic_cluster.get("embedding") if isinstance(mic_cluster, dict) else None
+        if not mic_embedding:
+            continue
+        for system_sid, system_cluster in system_clusters.items():
+            system_embedding = (
+                system_cluster.get("embedding") if isinstance(system_cluster, dict) else None
+            )
+            if not system_embedding:
+                continue
+            try:
+                distance = cosine_distance(mic_embedding, system_embedding)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(distance):
+                distances[(mic_sid, system_sid)] = distance
+
+    if not distances:
+        return tagged, mic_clusters, system_clusters
+
+    def _confident_nearest(
+        sid: str,
+        *,
+        from_mic: bool,
+    ) -> Optional[tuple[str, float]]:
+        candidates = sorted(
+            (
+                (distance, system_sid if from_mic else mic_sid)
+                for (mic_sid, system_sid), distance in distances.items()
+                if (mic_sid if from_mic else system_sid) == sid
+            ),
+            key=lambda candidate: candidate[0],
+        )
+        if not candidates:
+            return None
+        best_distance, best_sid = candidates[0]
+        if best_distance > SAME_MEETING_MERGE_DISTANCE_THRESHOLD:
+            return None
+        if (
+            len(candidates) > 1
+            and candidates[1][0] - best_distance < CROSS_CHANNEL_SPEAKER_MATCH_MARGIN
+        ):
+            return None
+        return best_sid, best_distance
+
+    matches: list[tuple[str, str, float]] = []
+    for mic_sid in mic_clusters:
+        mic_best = _confident_nearest(mic_sid, from_mic=True)
+        if mic_best is None:
+            continue
+        system_sid, distance = mic_best
+        system_best = _confident_nearest(system_sid, from_mic=False)
+        if system_best is not None and system_best[0] == mic_sid:
+            matches.append((mic_sid, system_sid, distance))
+
+    if not matches:
+        return tagged, mic_clusters, system_clusters
+
+    text_weights: dict[tuple[str, str], int] = {}
+    labels: dict[tuple[str, str], str] = {}
+    for _start, label, text, channel, raw_sid in tagged:
+        if raw_sid is None:
+            continue
+        key = (channel, raw_sid)
+        text_weights[key] = text_weights.get(key, 0) + len((text or "").strip())
+        labels.setdefault(key, label)
+
+    mic_out = dict(mic_clusters)
+    system_out = dict(system_clusters)
+    aliases: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for mic_sid, system_sid, distance in matches:
+        mic_key = ("mic", mic_sid)
+        system_key = ("system", system_sid)
+        mic_weight = text_weights.get(mic_key, 0)
+        system_weight = text_weights.get(system_key, 0)
+        if mic_weight == 0 and system_weight == 0:
+            continue
+
+        if mic_weight >= system_weight:
+            canonical_key, alias_key = mic_key, system_key
+            system_out.pop(system_sid, None)
+        else:
+            canonical_key, alias_key = system_key, mic_key
+            mic_out.pop(mic_sid, None)
+
+        canonical_label = labels.get(canonical_key) or labels.get(alias_key)
+        if canonical_label is None:
+            continue
+        aliases[alias_key] = (*canonical_key, canonical_label)
+        logger.info(
+            "Cross-channel speaker reconciliation: %s/%s -> %s/%s "
+            "(distance=%.3f, retained_chars=%d/%d)",
+            alias_key[0], alias_key[1], canonical_key[0], canonical_key[1],
+            distance, mic_weight, system_weight,
+        )
+
+    if not aliases:
+        return tagged, mic_clusters, system_clusters
+
+    reconciled = []
+    for start, label, text, channel, raw_sid in tagged:
+        canonical = aliases.get((channel, raw_sid)) if raw_sid is not None else None
+        if canonical is not None:
+            channel, raw_sid, label = canonical
+        reconciled.append((start, label, text, channel, raw_sid))
+    return reconciled, mic_out, system_out
 
 
 @dataclass(frozen=True)
@@ -2373,17 +2518,20 @@ class WhisperTranscriber:
                 for start, label, text, raw_sid in _tag_channel_segments(
                     mic_segments, mic_path, duration, "You",
                     allow_self_match=identity_enabled,
-                    clusters_out=mic_clusters if identity_enabled else None,
+                    clusters_out=mic_clusters,
                 )
             )
             tagged.extend(
                 (start, label, text, "system", raw_sid)
                 for start, label, text, raw_sid in _tag_channel_segments(
                     system_segments, system_path, duration, "Others",
-                    clusters_out=system_clusters if identity_enabled else None,
+                    clusters_out=system_clusters,
                 )
             )
             tagged.sort(key=lambda t: t[0])
+            tagged, mic_clusters, system_clusters = _reconcile_cross_channel_speakers(
+                tagged, mic_clusters, system_clusters,
+            )
             tagged = _resolve_speaker_placeholders(tagged)
 
             # Same {"mic"|"system": {"recording_type", "clusters"}} shape
@@ -2395,12 +2543,12 @@ class WhisperTranscriber:
             # non-empty) is included -- a channel that fell back to legacy
             # labeling has no cluster/embedding data to persist.
             speaker_clusters: dict = {}
-            if mic_clusters:
+            if identity_enabled and mic_clusters:
                 speaker_clusters["mic"] = {
                     "recording_type": determine_recording_type("mic", has_audio=True),
                     "clusters": mic_clusters,
                 }
-            if system_clusters:
+            if identity_enabled and system_clusters:
                 speaker_clusters["system"] = {
                     "recording_type": determine_recording_type("system", has_audio=True),
                     "clusters": system_clusters,
@@ -2427,8 +2575,11 @@ class WhisperTranscriber:
                 "engine": engine or self.backend,
                 # {"mic"|"system": {"recording_type", "clusters"}} for
                 # src.speaker_suggestions.write_speakers_sidecar, or {} if
-                # neither channel diarized. See _tag_channel_segments'
-                # clusters_out param.
+            # neither channel diarized. Cross-channel echo aliases were
+            # removed above, so the Speakers panel and exact relabel manifest
+            # share the same canonical cluster ids. See _tag_channel_segments'
+            # clusters_out param. Identity matching off still computes these
+            # transiently for transcript reconciliation, but persists none.
                 "speaker_clusters": speaker_clusters,
                 # list[{"start", "channel", "diarization_speaker_id"}], one
                 # per turn -- see comment above turn_manifest's construction.
