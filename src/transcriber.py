@@ -2234,11 +2234,15 @@ class WhisperTranscriber:
             mic_result: Optional[dict] = None
             sys_result: Optional[dict] = None
 
-            # Split channels are already 16 kHz mono + high-passed by the
-            # split ffmpeg pass above — skip the mono pre-processing pass.
+            # Keep the split files high-pass-only so the cross-channel bleed
+            # heuristics below can compare their original relative levels.
+            # The ASR inputs still need the normal pre-processing pass,
+            # especially per-channel loudness normalisation: a quiet, sparse
+            # microphone channel can otherwise decode as mostly silence even
+            # though it contains real speech.
             if mic_has_audio:
                 logger.info("Transcribing mic channel (You)...")
-                mic_result = self.transcribe_audio(mic_path, language, _preprocessed=True)
+                mic_result = self.transcribe_audio(mic_path, language)
                 if mic_result and mic_result.get("transcription_failed"):
                     channel_failed = True
                     channel_error = channel_error or mic_result.get("error")
@@ -2265,7 +2269,7 @@ class WhisperTranscriber:
 
             if system_has_audio:
                 logger.info("Transcribing system channel (Others)...")
-                sys_result = self.transcribe_audio(system_path, language, _preprocessed=True)
+                sys_result = self.transcribe_audio(system_path, language)
                 if sys_result and sys_result.get("transcription_failed"):
                     channel_failed = True
                     channel_error = channel_error or sys_result.get("error")

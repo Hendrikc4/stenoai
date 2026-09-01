@@ -2,9 +2,9 @@
 
 The contract: pre-processing improves the input when it can and silently
 steps aside when it can't — a missing ffmpeg, a failed run, or a timeout
-must never fail the meeting. Temp files are always cleaned up, and the
-diarised path's split channels (already 16 kHz mono + high-passed) skip
-the mono pass instead of being processed twice.
+must never fail the meeting. Temp files are always cleaned up. Stereo split
+files preserve their relative levels for bleed detection, while separate
+normalised copies are passed to ASR so quiet channels remain transcribable.
 """
 
 import tempfile
@@ -167,7 +167,7 @@ class TranscribeAudioPreprocessIntegrationTests(unittest.TestCase):
                 transcriber.transcribe_audio(audio, language="en", _preprocessed=True)
             prep_mock.assert_not_called()
 
-    def test_diarised_channels_skip_mono_pass(self):
+    def test_diarised_channels_are_normalised_for_asr(self):
         transcriber = _build_transcriber()
         with tempfile.TemporaryDirectory() as tmp_dir:
             mic = _make_audio_file(tmp_dir, "stenoai_ch0_meeting.wav")
@@ -184,12 +184,12 @@ class TranscribeAudioPreprocessIntegrationTests(unittest.TestCase):
                  patch.object(transcriber, "_preprocess_audio") as prep_mock, \
                  patch.object(transcriber, "_run_backend", return_value=dict(_OK_RESULT)):
                 transcriber.transcribe_diarised(Path(tmp_dir) / "meeting.wav", language="en")
-            # Both per-channel calls passed _preprocessed=True and the mono
-            # pre-processing pass never ran.
+            # The split files stay high-pass-only for later relative-RMS bleed
+            # checks, but each ASR call gets its own normalised temp input.
             self.assertEqual(ta_mock.call_count, 2)
             for call in ta_mock.call_args_list:
-                self.assertTrue(call.kwargs.get("_preprocessed"))
-            prep_mock.assert_not_called()
+                self.assertFalse(call.kwargs.get("_preprocessed", False))
+            self.assertEqual(prep_mock.call_count, 2)
 
     def test_split_filter_includes_highpass_no_loudnorm(self):
         """The diarised split applies highpass only — per-channel loudnorm
