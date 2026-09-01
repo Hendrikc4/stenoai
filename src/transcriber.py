@@ -17,7 +17,8 @@ the rest of the codebase doesn't churn:
 
 The stereo channel split, RMS-energy gating, and speaker-bleed collapse
 all stay — they operate on transcript text + audio metadata, not on the
-specific ASR engine.
+specific ASR engine. Split channels keep their original relative volume for
+bleed checks; separate loudness-normalised copies are sent to ASR.
 
 Whisper-era hallucination filtering ("Thank you." / "Bye." on silence)
 is gone: Parakeet doesn't produce those canned phrases on silent or
@@ -727,29 +728,23 @@ def _assign_asr_segments_to_diar_segments(
     return unplaceable
 
 
-# How often to print a HEARTBEAT: line while blocked waiting on
-# steno-diarize. Comfortably under Electron's TRANSCRIBE_INACTIVITY_MS
+# How often to print a HEARTBEAT: line while blocked on work that cannot
+# report its own progress. Comfortably under Electron's TRANSCRIBE_INACTIVITY_MS
 # (8 minutes, app/main.js) -- see _heartbeat_while_waiting's docstring for
 # why this can't just reuse the existing chunk-progress heartbeat registry.
-STENO_DIARIZE_HEARTBEAT_INTERVAL_S = 60.0
+BLOCKING_HEARTBEAT_INTERVAL_S = 60.0
 
 
 @contextlib.contextmanager
-def _heartbeat_while_waiting(label: str, interval_s: float = STENO_DIARIZE_HEARTBEAT_INTERVAL_S):
+def _heartbeat_while_waiting(label: str, interval_s: float = BLOCKING_HEARTBEAT_INTERVAL_S):
     """Print a HEARTBEAT: line every ``interval_s`` seconds on a background
     thread for the duration of the ``with`` block.
 
-    src._heartbeat's chunk-progress registry only works for backends that
-    call back into Python from INSIDE their own per-chunk loop (Parakeet,
-    Whisper.cpp) -- steno-diarize is an opaque external binary invoked via a
-    single blocking subprocess.run() call, with no such checkpoint to hang a
-    callback off of. Without this, a diarization run on an hours-long
-    channel prints nothing for its entire duration, which Electron's
-    inactivity watchdog (app/main.js) can't tell apart from a hung process
-    -- and kills, discarding a real, working meeting (confirmed against a
-    real ~3.5h recording: steno-diarize needed longer than the 8-minute
-    watchdog window and got killed mid-run, losing already-completed
-    transcription work along with it).
+    src._heartbeat's chunk-progress registry only works for code that calls
+    back into Python during its own loop. Opaque subprocess work, including
+    ffmpeg preprocessing and steno-diarize, has no checkpoint for that
+    callback. Without this heartbeat, Electron can mistake a long healthy
+    subprocess for a hang and stop the meeting job after eight minutes.
 
     Never affects the wrapped call's own return value or exceptions --
     the background thread only ever writes heartbeat lines.
@@ -1727,14 +1722,15 @@ class WhisperTranscriber:
             # without this, the terminal goes silent for that whole stretch
             # right after "Saved: ...", which reads as a hang.
             logger.info(f"Pre-processing audio (highpass + loudnorm): {audio_filepath.name}...")
-            result = subprocess.run(
-                [ffmpeg, '-y', '-i', str(audio_filepath),
-                 '-af', _audio_filter_chain(),
-                 '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
-                 str(temp_path)],
-                capture_output=True,
-                timeout=AUDIO_PREPROCESS_TIMEOUT_S,
-            )
+            with _heartbeat_while_waiting("transcribe:preprocess"):
+                result = subprocess.run(
+                    [ffmpeg, '-y', '-i', str(audio_filepath),
+                     '-af', _audio_filter_chain(),
+                     '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
+                     str(temp_path)],
+                    capture_output=True,
+                    timeout=AUDIO_PREPROCESS_TIMEOUT_S,
+                )
             if result.returncode == 0 and temp_path.exists() and temp_path.stat().st_size > 0:
                 logger.info("Audio pre-processed (highpass + loudnorm): %s", temp_path.name)
                 return temp_path, True
@@ -1979,9 +1975,10 @@ class WhisperTranscriber:
         otherwise a dict with ``text`` / ``segments`` / ``duration_seconds`` /
         ``detected_language`` / ``detected_language_probability``.
 
-        ``_preprocessed`` marks input that is already cleaned (the diarised
-        path's split channels are 16 kHz mono + high-passed by the split
-        ffmpeg pass) so the mono pre-processing pass isn't applied twice.
+        ``_preprocessed`` skips the cleaning pass only when the caller has
+        already applied the complete high-pass + loudness-normalisation
+        chain. Stereo split files are high-pass-only, so the diarised path
+        leaves this false and creates normalised copies for ASR.
         """
         if not audio_filepath.exists():
             logger.error(f"Audio file not found: {audio_filepath}")

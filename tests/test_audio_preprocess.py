@@ -107,6 +107,17 @@ class PreprocessAudioTests(unittest.TestCase):
             if out_path.exists():
                 out_path.unlink()
 
+    def test_emits_heartbeats_while_ffmpeg_is_blocking(self):
+        transcriber = _build_transcriber()
+        completed = SimpleNamespace(returncode=1, stderr=b"boom")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = _make_audio_file(tmp_dir)
+            with patch.object(transcriber_mod, "_resolve_ffmpeg", return_value="/fake/ffmpeg"), \
+                 patch.object(transcriber_mod, "_heartbeat_while_waiting") as heartbeat_mock, \
+                 patch.object(transcriber_mod.subprocess, "run", return_value=completed):
+                transcriber._preprocess_audio(audio)
+        heartbeat_mock.assert_called_once_with("transcribe:preprocess")
+
 
 class ConvertTo16khzSkipTests(unittest.TestCase):
     def test_already_16k_mono_pcm_is_not_reconverted(self):
@@ -172,6 +183,12 @@ class TranscribeAudioPreprocessIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             mic = _make_audio_file(tmp_dir, "stenoai_ch0_meeting.wav")
             system = _make_audio_file(tmp_dir, "stenoai_ch1_meeting.wav")
+
+            def fake_preprocess(path):
+                normalised = Path(tmp_dir) / f"normalised_{path.name}"
+                normalised.write_bytes(b"\x00" * 2048)
+                return normalised, True
+
             with patch.object(
                      transcriber, "_split_stereo_to_channels",
                      return_value=(mic, system, 10.0),
@@ -181,15 +198,19 @@ class TranscribeAudioPreprocessIntegrationTests(unittest.TestCase):
                      transcriber, "transcribe_audio",
                      wraps=transcriber.transcribe_audio,
                  ) as ta_mock, \
-                 patch.object(transcriber, "_preprocess_audio") as prep_mock, \
-                 patch.object(transcriber, "_run_backend", return_value=dict(_OK_RESULT)):
-                transcriber.transcribe_diarised(Path(tmp_dir) / "meeting.wav", language="en")
+                 patch.object(transcriber, "_preprocess_audio", side_effect=fake_preprocess) as prep_mock, \
+                 patch.object(transcriber, "_run_backend", return_value=dict(_OK_RESULT)) as run_mock:
+                result = transcriber.transcribe_diarised(
+                    Path(tmp_dir) / "meeting.wav", language="en"
+                )
             # The split files stay high-pass-only for later relative-RMS bleed
             # checks, but each ASR call gets its own normalised temp input.
             self.assertEqual(ta_mock.call_count, 2)
             for call in ta_mock.call_args_list:
                 self.assertFalse(call.kwargs.get("_preprocessed", False))
             self.assertEqual(prep_mock.call_count, 2)
+            self.assertEqual(run_mock.call_count, 2)
+            self.assertFalse(result.get("transcription_failed", False))
 
     def test_split_filter_includes_highpass_no_loudnorm(self):
         """The diarised split applies highpass only — per-channel loudnorm
