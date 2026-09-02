@@ -1711,7 +1711,7 @@ class WhisperTranscriber:
         include_highpass: bool = True,
         timeout_s: int = AUDIO_PREPROCESS_TIMEOUT_S,
     ) -> Tuple[Path, bool]:
-        """Clean mono audio before transcription: high-pass + loudnorm.
+        """Clean mono audio before transcription with loudnorm and optional high-pass.
 
         Returns ``(path_to_transcribe, is_temp)``. On any problem — ffmpeg
         missing, non-zero exit, timeout — falls back to ``(original, False)``
@@ -2003,7 +2003,9 @@ class WhisperTranscriber:
         ``_preprocessed`` skips the cleaning pass only when the caller has
         already applied the complete high-pass + loudness-normalisation
         chain. Stereo split files are high-pass-only, so the diarised path
-        leaves this false and creates normalised copies for ASR.
+        leaves this false and creates loudness-normalised copies for ASR.
+        Its private preprocessing options avoid applying the high-pass twice
+        and scale the subprocess timeout to the known recording duration.
         """
         if not audio_filepath.exists():
             logger.error(f"Audio file not found: {audio_filepath}")
