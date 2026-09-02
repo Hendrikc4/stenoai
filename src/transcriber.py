@@ -1562,17 +1562,63 @@ def _reconcile_cross_channel_speakers(
         if mic_weight == 0 and system_weight == 0:
             continue
 
+        mic_label = labels.get(mic_key)
+        system_label = labels.get(system_key)
+        # Merging the two dominant legacy labels would erase a normal 1:1 call
+        # if unrelated centroids happen to fall below the distance threshold.
+        # For all other pairs, post-bleed text remains the best evidence of
+        # which channel contains the direct signal: minority echo clusters may
+        # have been folded into either channel's legacy label.
+        if mic_label == "You" and system_label == "Others":
+            continue
         if mic_weight >= system_weight:
             canonical_key, alias_key = mic_key, system_key
-            system_out.pop(system_sid, None)
         else:
             canonical_key, alias_key = system_key, mic_key
-            mic_out.pop(mic_sid, None)
 
         canonical_label = labels.get(canonical_key) or labels.get(alias_key)
         if canonical_label is None:
             continue
         aliases[alias_key] = (*canonical_key, canonical_label)
+
+        canonical_out = mic_out if canonical_key[0] == "mic" else system_out
+        alias_out = mic_out if alias_key[0] == "mic" else system_out
+        canonical_cluster = canonical_out.get(canonical_key[1])
+        alias_cluster = alias_out.get(alias_key[1])
+        if isinstance(canonical_cluster, dict) and isinstance(alias_cluster, dict):
+            # Transcript provenance is rewritten to the canonical cluster, so
+            # retain the alias time ranges there as well. This keeps review
+            # clips placeable without double-counting overlapping echo ranges.
+            segments = []
+            for cluster in (canonical_cluster, alias_cluster):
+                for segment in cluster.get("segments") or []:
+                    try:
+                        start = float(segment["start"])
+                        end = float(segment["end"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if math.isfinite(start) and math.isfinite(end) and end > start:
+                        segments.append((start, end))
+            if segments:
+                merged_segments: list[list[float]] = []
+                for start, end in sorted(segments):
+                    if merged_segments and start <= merged_segments[-1][1]:
+                        merged_segments[-1][1] = max(merged_segments[-1][1], end)
+                    else:
+                        merged_segments.append([start, end])
+                canonical_cluster = dict(canonical_cluster)
+                canonical_cluster["segments"] = [
+                    {"start": start, "end": end} for start, end in merged_segments
+                ]
+                canonical_cluster["speech_duration_seconds"] = sum(
+                    end - start for start, end in merged_segments
+                )
+                canonical_cluster["segment_count"] = sum(
+                    int(cluster.get("segment_count") or 0)
+                    for cluster in (canonical_cluster, alias_cluster)
+                )
+                canonical_out[canonical_key[1]] = canonical_cluster
+        alias_out.pop(alias_key[1], None)
         logger.info(
             "Cross-channel speaker reconciliation: %s/%s -> %s/%s "
             "(distance=%.3f, retained_chars=%d/%d)",
@@ -1589,6 +1635,17 @@ def _reconcile_cross_channel_speakers(
         if canonical is not None:
             channel, raw_sid, label = canonical
         reconciled.append((start, label, text, channel, raw_sid))
+    original_labels = {
+        label for _start, label, _text, _channel, _raw_sid
+        in _resolve_speaker_placeholders(tagged)
+    }
+    resolved_labels = {
+        label for _start, label, _text, _channel, _raw_sid
+        in _resolve_speaker_placeholders(reconciled)
+    }
+    if len(original_labels) > 1 and len(resolved_labels) <= 1:
+        logger.info("Cross-channel speaker reconciliation skipped: would erase speaker split")
+        return tagged, mic_clusters, system_clusters
     return reconciled, mic_out, system_out
 
 
@@ -2518,20 +2575,21 @@ class WhisperTranscriber:
                 for start, label, text, raw_sid in _tag_channel_segments(
                     mic_segments, mic_path, duration, "You",
                     allow_self_match=identity_enabled,
-                    clusters_out=mic_clusters,
+                    clusters_out=mic_clusters if identity_enabled else None,
                 )
             )
             tagged.extend(
                 (start, label, text, "system", raw_sid)
                 for start, label, text, raw_sid in _tag_channel_segments(
                     system_segments, system_path, duration, "Others",
-                    clusters_out=system_clusters,
+                    clusters_out=system_clusters if identity_enabled else None,
                 )
             )
             tagged.sort(key=lambda t: t[0])
-            tagged, mic_clusters, system_clusters = _reconcile_cross_channel_speakers(
-                tagged, mic_clusters, system_clusters,
-            )
+            if identity_enabled:
+                tagged, mic_clusters, system_clusters = _reconcile_cross_channel_speakers(
+                    tagged, mic_clusters, system_clusters,
+                )
             tagged = _resolve_speaker_placeholders(tagged)
 
             # Same {"mic"|"system": {"recording_type", "clusters"}} shape
@@ -2575,11 +2633,11 @@ class WhisperTranscriber:
                 "engine": engine or self.backend,
                 # {"mic"|"system": {"recording_type", "clusters"}} for
                 # src.speaker_suggestions.write_speakers_sidecar, or {} if
-            # neither channel diarized. Cross-channel echo aliases were
-            # removed above, so the Speakers panel and exact relabel manifest
-            # share the same canonical cluster ids. See _tag_channel_segments'
-            # clusters_out param. Identity matching off still computes these
-            # transiently for transcript reconciliation, but persists none.
+                # neither channel diarized. Cross-channel echo aliases were
+                # removed above, so the Speakers panel and exact relabel manifest
+                # share the same canonical cluster ids. See _tag_channel_segments'
+                # clusters_out param. Identity matching off neither collects nor
+                # compares embeddings here.
                 "speaker_clusters": speaker_clusters,
                 # list[{"start", "channel", "diarization_speaker_id"}], one
                 # per turn -- see comment above turn_manifest's construction.
