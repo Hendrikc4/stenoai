@@ -296,6 +296,13 @@ def _parse_duration_from_ffmpeg_stderr(stderr: str) -> Optional[float]:
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
 
 
+def _duration_scaled_audio_timeout(duration_seconds: Optional[float], floor_s: int) -> int:
+    """Return a generous bounded timeout for a full-length audio pass."""
+    if duration_seconds and duration_seconds > 0:
+        return max(floor_s, int(duration_seconds * 2))
+    return floor_s
+
+
 def _diarised_split_timeout(duration_seconds: Optional[float]) -> int:
     """Wall-clock cap for one per-channel ffmpeg decode of the full recording.
 
@@ -307,9 +314,7 @@ def _diarised_split_timeout(duration_seconds: Optional[float]) -> int:
     transcript. When duration is unknown (some WebM headers) we fall back to
     the floor, which still comfortably beats the old 120 s.
     """
-    if duration_seconds and duration_seconds > 0:
-        return max(DIARISED_SPLIT_TIMEOUT_S, int(duration_seconds * 2))
-    return DIARISED_SPLIT_TIMEOUT_S
+    return _duration_scaled_audio_timeout(duration_seconds, DIARISED_SPLIT_TIMEOUT_S)
 
 
 def _audio_preprocess_timeout(duration_seconds: Optional[float]) -> int:
@@ -319,9 +324,7 @@ def _audio_preprocess_timeout(duration_seconds: Optional[float]) -> int:
     the same duration-scaled headroom as the preceding channel split. Mono
     callers generally do not know the duration yet and use the fixed floor.
     """
-    if duration_seconds and duration_seconds > 0:
-        return max(AUDIO_PREPROCESS_TIMEOUT_S, int(duration_seconds * 2))
-    return AUDIO_PREPROCESS_TIMEOUT_S
+    return _duration_scaled_audio_timeout(duration_seconds, AUDIO_PREPROCESS_TIMEOUT_S)
 
 
 try:
