@@ -257,9 +257,13 @@ def _resolve_steno_diarize() -> Optional[str]:
         return None
 
 
-def _audio_filter_chain() -> str:
+def _audio_filter_chain(*, include_highpass: bool = True) -> str:
     """The ffmpeg ``-af`` chain applied to mono audio before transcription."""
-    return f"highpass=f={AUDIO_HIGHPASS_HZ},loudnorm={AUDIO_LOUDNORM}"
+    filters = []
+    if include_highpass:
+        filters.append(f"highpass=f={AUDIO_HIGHPASS_HZ}")
+    filters.append(f"loudnorm={AUDIO_LOUDNORM}")
+    return ",".join(filters)
 
 
 def _parse_channels_from_ffmpeg_stderr(stderr: str) -> Optional[int]:
@@ -297,6 +301,18 @@ def _diarised_split_timeout(duration_seconds: Optional[float]) -> int:
     if duration_seconds and duration_seconds > 0:
         return max(DIARISED_SPLIT_TIMEOUT_S, int(duration_seconds * 2))
     return DIARISED_SPLIT_TIMEOUT_S
+
+
+def _audio_preprocess_timeout(duration_seconds: Optional[float]) -> int:
+    """Wall-clock cap for preprocessing one full-length channel.
+
+    Stereo channel copies cover the complete recording, so long meetings need
+    the same duration-scaled headroom as the preceding channel split. Mono
+    callers generally do not know the duration yet and use the fixed floor.
+    """
+    if duration_seconds and duration_seconds > 0:
+        return max(AUDIO_PREPROCESS_TIMEOUT_S, int(duration_seconds * 2))
+    return AUDIO_PREPROCESS_TIMEOUT_S
 
 
 try:
@@ -1688,7 +1704,13 @@ class WhisperTranscriber:
         else:
             logger.warning("ffmpeg not found - stereo diarisation will fall back to mono")
 
-    def _preprocess_audio(self, audio_filepath: Path) -> Tuple[Path, bool]:
+    def _preprocess_audio(
+        self,
+        audio_filepath: Path,
+        *,
+        include_highpass: bool = True,
+        timeout_s: int = AUDIO_PREPROCESS_TIMEOUT_S,
+    ) -> Tuple[Path, bool]:
         """Clean mono audio before transcription: high-pass + loudnorm.
 
         Returns ``(path_to_transcribe, is_temp)``. On any problem — ffmpeg
@@ -1721,18 +1743,19 @@ class WhisperTranscriber:
             # time on a long recording, with zero other output in between --
             # without this, the terminal goes silent for that whole stretch
             # right after "Saved: ...", which reads as a hang.
-            logger.info(f"Pre-processing audio (highpass + loudnorm): {audio_filepath.name}...")
+            filter_description = "highpass + loudnorm" if include_highpass else "loudnorm"
+            logger.info(f"Pre-processing audio ({filter_description}): {audio_filepath.name}...")
             with _heartbeat_while_waiting("transcribe:preprocess"):
                 result = subprocess.run(
                     [ffmpeg, '-y', '-i', str(audio_filepath),
-                     '-af', _audio_filter_chain(),
+                     '-af', _audio_filter_chain(include_highpass=include_highpass),
                      '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
                      str(temp_path)],
                     capture_output=True,
-                    timeout=AUDIO_PREPROCESS_TIMEOUT_S,
+                    timeout=timeout_s,
                 )
             if result.returncode == 0 and temp_path.exists() and temp_path.stat().st_size > 0:
-                logger.info("Audio pre-processed (highpass + loudnorm): %s", temp_path.name)
+                logger.info("Audio pre-processed (%s): %s", filter_description, temp_path.name)
                 return temp_path, True
             logger.warning(
                 "Audio pre-processing failed (rc=%s); using original audio: %s",
@@ -1968,6 +1991,8 @@ class WhisperTranscriber:
         audio_filepath: Path,
         language: str = "en",
         _preprocessed: bool = False,
+        _preprocess_include_highpass: bool = True,
+        _preprocess_timeout_s: int = AUDIO_PREPROCESS_TIMEOUT_S,
     ) -> Optional[dict]:
         """Transcribe a single-channel (or mono-mixed) audio file.
 
@@ -2001,7 +2026,11 @@ class WhisperTranscriber:
 
             transcribe_path = audio_filepath
             if not _preprocessed:
-                transcribe_path, is_temp = self._preprocess_audio(audio_filepath)
+                transcribe_path, is_temp = self._preprocess_audio(
+                    audio_filepath,
+                    include_highpass=_preprocess_include_highpass,
+                    timeout_s=_preprocess_timeout_s,
+                )
                 if is_temp:
                     preprocess_temp = transcribe_path
 
@@ -2129,13 +2158,14 @@ class WhisperTranscriber:
                 # would erase the relative-RMS difference that
                 # _drop_per_segment_bleed uses to tell the direct signal
                 # from its attenuated echo on the other channel.
-                result = subprocess.run(
-                    [ffmpeg, '-y', '-i', str(audio_filepath),
-                     '-af', f'pan=mono|c0=c{ch_idx},highpass=f={AUDIO_HIGHPASS_HZ}',
-                     '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
-                     str(out_path)],
-                    capture_output=True, timeout=split_timeout
-                )
+                with _heartbeat_while_waiting("transcribe:split"):
+                    result = subprocess.run(
+                        [ffmpeg, '-y', '-i', str(audio_filepath),
+                         '-af', f'pan=mono|c0=c{ch_idx},highpass=f={AUDIO_HIGHPASS_HZ}',
+                         '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
+                         str(out_path)],
+                        capture_output=True, timeout=split_timeout
+                    )
                 if result.returncode != 0:
                     logger.error(f"Channel {ch_idx} extraction failed: {result.stderr.decode()}")
                     return None, None, None
@@ -2230,6 +2260,7 @@ class WhisperTranscriber:
             # window-coverage roll-up at the end) can't hit an unbound name.
             mic_result: Optional[dict] = None
             sys_result: Optional[dict] = None
+            preprocess_timeout = _audio_preprocess_timeout(duration)
 
             # Keep the split files high-pass-only so the cross-channel bleed
             # heuristics below can compare their original relative levels.
@@ -2239,7 +2270,12 @@ class WhisperTranscriber:
             # though it contains real speech.
             if mic_has_audio:
                 logger.info("Transcribing mic channel (You)...")
-                mic_result = self.transcribe_audio(mic_path, language)
+                mic_result = self.transcribe_audio(
+                    mic_path,
+                    language,
+                    _preprocess_include_highpass=False,
+                    _preprocess_timeout_s=preprocess_timeout,
+                )
                 if mic_result and mic_result.get("transcription_failed"):
                     channel_failed = True
                     channel_error = channel_error or mic_result.get("error")
@@ -2266,7 +2302,12 @@ class WhisperTranscriber:
 
             if system_has_audio:
                 logger.info("Transcribing system channel (Others)...")
-                sys_result = self.transcribe_audio(system_path, language)
+                sys_result = self.transcribe_audio(
+                    system_path,
+                    language,
+                    _preprocess_include_highpass=False,
+                    _preprocess_timeout_s=preprocess_timeout,
+                )
                 if sys_result and sys_result.get("transcription_failed"):
                     channel_failed = True
                     channel_error = channel_error or sys_result.get("error")
